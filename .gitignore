@@ -1,0 +1,71 @@
+# ════════════════════════════════════════════════════════════════
+#  MAKTech FinFlow — .gitignore
+#  Python · FastAPI · Prisma · Docker · Node · Coolify
+# ════════════════════════════════════════════════════════════════
+
+# ── Secrets & Environment ─────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.hypothesis/
+.tox/
+
+# ── Virtual Environments ──────────────────────────────────────
+.venv/
+venv/
+ENV/
+env/
+
+# ── Node / Prisma CLI ─────────────────────────────────────────
+node_modules/
+npm-debug.log*
+
+# Prisma generated client (regenerated at build/startup time)
+prisma/generated/
+
+# ── Docker ────────────────────────────────────────────────────
+docker-compose.override.yml
+docker-compose.local.yml
+
+# ── Database ──────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Logs ──────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── OS & Editor ───────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# ── Runtime artefacts ─────────────────────────────────────────
+uploads/
+exports/
+reports/

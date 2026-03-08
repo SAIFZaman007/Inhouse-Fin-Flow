@@ -1,0 +1,56 @@
+version: "3.9"
+# ════════════════════════════════════════════════════════════════
+#  MAKTech FinFlow — docker-compose.yml
+#  LOCAL DEVELOPMENT ONLY — Coolify uses the Dockerfile directly
+# ════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── PostgreSQL ───────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: finflow
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-devpassword}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── FastAPI application ───────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production          # matches the actual stage name in Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD:-devpassword}@db:5432/finflow
+      APP_ENV: development
+    # NOTE: No `volumes: .:/app` mount — that overwrites the production image
+    #       and causes "module not found" errors in the container.
+    #       For hot-reload in dev, rebuild the image instead: `docker compose up --build`
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  pgdata:
+    driver: local

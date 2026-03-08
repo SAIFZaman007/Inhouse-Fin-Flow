@@ -1,0 +1,61 @@
+# ════════════════════════════════════════════════════════════════
+#  MAKTech FinFlow — .dockerignore
+#  Keeps the Docker build context lean, fast, and secret-free.
+#  MUST be named exactly `.dockerignore` in the repo root.
+# ════════════════════════════════════════════════════════════════
+
+# ── Secrets — NEVER sent to the Docker daemon ─────────────────
+.env
+.env.*
+!.env.example
+
+# ── Git internals ─────────────────────────────────────────────
+.git/
+.github/
+
+# ── Python runtime cache ──────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ── Virtual environments ──────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Node (managed internally by prisma-client-py via nodeenv) ─
+node_modules/
+npm-debug.log*
+
+# ── Prisma generated client (regenerated at build time) ───────
+prisma/generated/
+
+# ── Docker meta-files ─────────────────────────────────────────
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# ── Editor / OS artifacts ─────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# ── Runtime-generated directories ─────────────────────────────
+logs/
+uploads/
+exports/
+reports/
+tmp/
+temp/
+
+# ── Tests (not needed in production image) ────────────────────
+tests/
+test_*.py
+*_test.py
