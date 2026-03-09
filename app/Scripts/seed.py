@@ -864,7 +864,7 @@ async def main() -> None:
         print("║  Director →  director@maktech.com   /  123456        ║")
         print("║  HR       →  hr@maktech.com         /  123456        ║")
         print("║                                                      ║")
-        print("║  API Docs →  http://localhost:8000/docs              ║")
+        print("║  API Docs →  https://fin-flow.maktechlaravel.cloud   ║")
         print("╚══════════════════════════════════════════════════════╝")
         print()
 
