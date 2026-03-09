@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     EMAILS_FROM_NAME: str = "MAKTech FinFlow"
 
     # ── CORS ──────────────────────────────────────────────────
-    ALLOWED_ORIGINS: str = "https://fin-flow.mtscorporate.com,http://localhost:3000,http://localhost:5173"
+    ALLOWED_ORIGINS: str = "https://fin-flow.maktechlaravel.cloud,http://localhost:3000,http://localhost:5173"
 
     # ── Finance ───────────────────────────────────────────────
     BDT_DEFAULT_RATE: float = 110.0

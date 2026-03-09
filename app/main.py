@@ -2,16 +2,6 @@
 app/main.py
 ============
 Application factory.
-
-FIXES in this version vs previous:
-  1. Health router imported and registered — /health now comes from
-     app/core/router.py, not a closure inside create_app(). This keeps
-     the factory clean and the health endpoints testable in isolation.
-
-  2. validate_security_config() called in lifespan (unchanged from v7) —
-     never at import time.
-
-  3. Root GET / added as a proper welcome/redirect endpoint.
 """
 import sys
 from contextlib import asynccontextmanager

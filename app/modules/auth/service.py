@@ -22,7 +22,7 @@ async def login(db: Prisma, email: str, password: str) -> dict:
     # Always run verify_password even if user not found — prevents timing attacks
     if not user or not verify_password(password, user.passwordHash):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Invalid email or password.",
         )
     if not user.isActive:
