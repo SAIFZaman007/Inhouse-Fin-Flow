@@ -2,6 +2,14 @@
 app/core/dependencies.py
 ==========================
 FastAPI dependency injection — authentication & RBAC.
+
+Role guards (add new guards here as the role matrix grows):
+  CEO_ONLY      → CEO
+  CEO_DIRECTOR  → CEO, DIRECTOR
+  ALL_ROLES     → CEO, DIRECTOR, HR, BDEV
+  HR_AND_ABOVE  → CEO, DIRECTOR, HR          (excludes BDEV)
+  BDEV_AND_ABOVE→ CEO, DIRECTOR, HR, BDEV    (alias: all roles — kept for semantic clarity)
+  PMAK_EDITORS  → CEO, DIRECTOR, HR, BDEV    (any role that may write PMAK)
 """
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -38,14 +46,13 @@ async def get_current_user(
             headers={"WWW-Authenticate": f'{_WWW_BEARER} error="invalid_token"'},
         )
     except (TokenInvalidError, Exception):
-        # Intentionally vague — do not leak why verification failed
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Could not validate credentials.",
             headers={"WWW-Authenticate": _WWW_BEARER},
         )
 
-    # ── 2. Enforce token type (prevents refresh-token-as-access-token attack) ─
+    # ── 2. Enforce token type ─────────────────────────────────────────────────
     if payload.get("type") != "access":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -93,7 +100,12 @@ def require_roles(*roles: str):
     return _role_guard
 
 
-# ─── Convenience Role Guards ──────────────────────────────────────────────────
-CEO_ONLY     = require_roles("CEO")
-CEO_DIRECTOR = require_roles("CEO", "DIRECTOR")
-ALL_ROLES    = require_roles("CEO", "DIRECTOR", "HR")
+# ─── Role Guards (single source of truth) ────────────────────────────────────
+CEO_ONLY      = require_roles("CEO")
+CEO_DIRECTOR  = require_roles("CEO", "DIRECTOR")
+HR_AND_ABOVE  = require_roles("CEO", "DIRECTOR", "HR")          # excludes BDEV
+PMAK_EDITORS  = require_roles("CEO", "DIRECTOR", "HR", "BDEV")  # all PMAK writers
+ALL_ROLES     = require_roles("CEO", "DIRECTOR", "HR", "BDEV")  # every authenticated role
+
+# Legacy alias — kept so existing routers that import ALL_ROLES don't break.
+# HR-only modules should be updated to HR_AND_ABOVE where BDev must be excluded.

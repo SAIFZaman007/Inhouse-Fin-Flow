@@ -16,6 +16,7 @@ enum Role {
   CEO
   DIRECTOR
   HR
+  BDEV
 }
 
 enum OrderStatus {
@@ -172,6 +173,14 @@ model PmakTransaction {
   debit            Decimal     @db.Decimal(12, 2) @default(0)
   credit           Decimal     @db.Decimal(12, 2) @default(0)
   remainingBalance Decimal     @db.Decimal(12, 2)
+
+  // ── Status & remarks (editable by HR and BDev) ──────
+  status           String?     // PENDING | CLEARED | REJECTED | ON_HOLD
+  notes            String?     // internal remarks by BDev or HR
+  // ── Counterparty tracking ────────────────────────────
+  buyer            String?     // name / identifier of the buying party
+  seller           String?     // name / identifier of the selling party
+
   accountId        String
   account          PmakAccount @relation(fields: [accountId], references: [id])
   createdAt        DateTime    @default(now())
@@ -217,6 +226,18 @@ model DollarExchange {
 
   @@map("dollar_exchanges")
 }
+
+model DailyRate {
+  id        String   @id @default(cuid())
+  date      DateTime @db.Date
+  rate      Decimal  @db.Decimal(10, 4)   // BDT per 1 USD (e.g. 110.5000)
+  setBy     String?                        // HR email who set it (audit trail)
+  note      String?                        // optional HR note
+  createdAt DateTime @default(now())
+
+  @@index([date])
+}
+
 
 // ─── CARD SHARING ─────────────────────────────────────
 model CardSharing {

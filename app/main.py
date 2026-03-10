@@ -2,6 +2,9 @@
 app/main.py
 ============
 Application factory.
+
+UPDATED: Added daily_rate_router for the new HR-managed USD→BDT rate module.
+Register it in the same API v1 prefix block alongside all other routers.
 """
 import sys
 from contextlib import asynccontextmanager
@@ -21,6 +24,7 @@ from app.modules.health.router import router as health_router
 from app.modules.auth.router import router as auth_router
 from app.modules.card_sharing.router import router as card_router
 from app.modules.dashboard.router import router as dashboard_router
+from app.modules.daily_rate.router import router as daily_rate_router   # ← NEW
 from app.modules.dollar_exchange.router import router as exchange_router
 from app.modules.export.router import router as export_router
 from app.modules.fiverr.router import router as fiverr_router
@@ -65,9 +69,16 @@ def create_app() -> FastAPI:
             "3. **GET** `/api/v1/auth/verify` — confirms the server accepts your token.\n\n"
             "> **Note:** Swagger's **'Authorized'** badge only means the token is "
             "*stored in the browser*. It does **not** mean the server validated it. "
-            "Always use `/auth/verify` to confirm."
+            "Always use `/auth/verify` to confirm.\n\n"
+            "## Roles\n\n"
+            "| Role | Access |\n"
+            "|------|--------|\n"
+            "| **CEO** | Full access — all modules, all operations |\n"
+            "| **DIRECTOR** | Full access — all modules, all operations |\n"
+            "| **HR** | Fiverr, Upwork, PMAK, HR Expense, Inventory, Outside Orders, **Daily Rate** |\n"
+            "| **BDEV** | PMAK only — read transactions + PATCH status/notes |\n"
         ),
-        version="1.0.0",
+        version="1.1.0",
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_url="/openapi.json",
@@ -77,7 +88,7 @@ def create_app() -> FastAPI:
     setup_middleware(app)
     register_exception_handlers(app)
 
-    # ── Health endpoints (no prefix — must be reachable at /health) ──────────
+    # ── Health endpoints (no prefix) ─────────────────────────────────────────
     app.include_router(health_router)
 
     # ── API v1 endpoints ──────────────────────────────────────────────────────
@@ -86,7 +97,9 @@ def create_app() -> FastAPI:
         auth_router, users_router, dashboard_router,
         fiverr_router, upwork_router, payoneer_router,
         pmak_router, outside_router, exchange_router,
-        card_router, hr_router, inventory_router, export_router,
+        card_router, hr_router, inventory_router,
+        export_router,
+        daily_rate_router,          
     ]:
         app.include_router(router, prefix=API_PREFIX)
 
@@ -95,7 +108,7 @@ def create_app() -> FastAPI:
     async def root():
         return JSONResponse({
             "service": settings.APP_NAME,
-            "version": "1.0.0",
+            "version": "1.1.0",
             "docs":    "/docs",
             "health":  "Healthy!!",
             "ready":   "TRUE. Ready for action!!",
