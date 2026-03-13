@@ -1,16 +1,24 @@
 // prisma/schema.prisma
+// -----------------------------------------------------------------------------
+//  MAKTech Financial Flow -- Production Schema  (v3 -- Enterprise Edition)
+// -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 generator client {
-  provider                     = "prisma-client-py"
-  interface                    = "asyncio"
-  recursive_type_depth         = 5
-  enable_experimental_decimal  = true
+  provider                    = "prisma-client-py"
+  interface                   = "asyncio"
+  recursive_type_depth        = 5
+  enable_experimental_decimal = true
 }
 
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
+
+// ===============================================================================
+//  ENUMS
+// ===============================================================================
 
 enum Role {
   CEO
@@ -31,6 +39,33 @@ enum PaymentStatus {
   DUE
 }
 
+/// Granular status for PMAK ledger and inhouse deal rows
+enum PmakStatus {
+  PENDING
+  CLEARED
+  ON_HOLD
+  REJECTED
+}
+
+/// Lifecycle status for inhouse PMAK deals
+enum InhouseOrderStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
+  CANCELLED
+}
+
+// ===============================================================================
+//  USER & AUTH
+// ===============================================================================
+
 model User {
   id           String   @id @default(cuid())
   name         String
@@ -44,270 +79,13 @@ model User {
   @@map("users")
 }
 
-// ─── FIVERR ───────────────────────────────────────────
-model FiverrProfile {
-  id          String         @id @default(cuid())
-  profileName String         @unique
-  isActive    Boolean        @default(true)
-  entries     FiverrEntry[]
-  orders      FiverrOrder[]
-
-  @@map("fiverr_profiles")
-}
-
-model FiverrEntry {
-  id               String        @id @default(cuid())
-  date             DateTime      @db.Date
-  availableWithdraw Decimal      @db.Decimal(12, 2)
-  notCleared       Decimal       @db.Decimal(12, 2) @default(0)
-  activeOrders     Int           @default(0)
-  submitted        Decimal       @db.Decimal(12, 2) @default(0)
-  withdrawn        Decimal       @db.Decimal(12, 2) @default(0)
-  sellerPlus       Boolean       @default(false)
-  promotion        Decimal       @db.Decimal(12, 2) @default(0)
-  profileId        String
-  profile          FiverrProfile @relation(fields: [profileId], references: [id])
-  createdAt        DateTime      @default(now())
-
-  @@unique([profileId, date])
-  @@map("fiverr_entries")
-}
-
-model FiverrOrder {
-  id          String        @id @default(cuid())
-  date        DateTime      @db.Date
-  buyerName   String
-  orderId     String        @unique
-  amount      Decimal       @db.Decimal(12, 2)
-  profileId   String
-  profile     FiverrProfile @relation(fields: [profileId], references: [id])
-  createdAt   DateTime      @default(now())
-
-  @@map("fiverr_orders")
-}
-
-// ─── UPWORK ───────────────────────────────────────────
-model UpworkProfile {
-  id          String         @id @default(cuid())
-  profileName String         @unique
-  isActive    Boolean        @default(true)
-  entries     UpworkEntry[]
-  orders      UpworkOrder[]
-
-  @@map("upwork_profiles")
-}
-
-model UpworkEntry {
-  id               String        @id @default(cuid())
-  date             DateTime      @db.Date
-  availableWithdraw Decimal      @db.Decimal(12, 2)
-  pending          Decimal       @db.Decimal(12, 2) @default(0)
-  inReview         Decimal       @db.Decimal(12, 2) @default(0)
-  workInProgress   Decimal       @db.Decimal(12, 2) @default(0)
-  withdrawn        Decimal       @db.Decimal(12, 2) @default(0)
-  connects         Int           @default(0)
-  upworkPlus       Boolean       @default(false)
-  profileId        String
-  profile          UpworkProfile @relation(fields: [profileId], references: [id])
-  createdAt        DateTime      @default(now())
-
-  @@unique([profileId, date])
-  @@map("upwork_entries")
-}
-
-model UpworkOrder {
-  id          String        @id @default(cuid())
-  date        DateTime      @db.Date
-  clientName  String
-  orderId     String        @unique
-  amount      Decimal       @db.Decimal(12, 2)
-  profileId   String
-  profile     UpworkProfile @relation(fields: [profileId], references: [id])
-  createdAt   DateTime      @default(now())
-
-  @@map("upwork_orders")
-}
-
-// ─── PAYONEER ─────────────────────────────────────────
-model PayoneerAccount {
-  id           String             @id @default(cuid())
-  accountName  String             @unique
-  isActive     Boolean            @default(true)
-  transactions PayoneerTransaction[]
-
-  @@map("payoneer_accounts")
-}
-
-model PayoneerTransaction {
-  id               String          @id @default(cuid())
-  date             DateTime        @db.Date
-  details          String
-  accountFrom      String?         
-  accountTo        String?         
-  debit            Decimal         @db.Decimal(12, 2) @default(0)
-  credit           Decimal         @db.Decimal(12, 2) @default(0)
-  remainingBalance Decimal         @db.Decimal(12, 2)
-  accountId        String
-  account          PayoneerAccount @relation(fields: [accountId], references: [id])
-  createdAt        DateTime        @default(now())
-
-  @@map("payoneer_transactions")
-}
-
-// ─── PMAK ─────────────────────────────────────────────
-model PmakAccount {
-  id           String             @id @default(cuid())
-  accountName  String             @unique
-  isActive     Boolean            @default(true)
-  transactions PmakTransaction[]
-
-  @@map("pmak_accounts")
-}
-
-model PmakTransaction {
-  id               String      @id @default(cuid())
-  date             DateTime    @db.Date
-  details          String
-  accountFrom      String?         
-  accountTo        String?         
-  debit            Decimal     @db.Decimal(12, 2) @default(0)
-  credit           Decimal     @db.Decimal(12, 2) @default(0)
-  remainingBalance Decimal     @db.Decimal(12, 2)
-
-  // ── Status & remarks (editable by HR and BDev) ──────
-  status           String?     // PENDING | CLEARED | REJECTED | ON_HOLD
-  notes            String?     // internal remarks by BDev or HR
-  // ── Counterparty tracking ────────────────────────────
-  buyer            String?     // name / identifier of the buying party
-  seller           String?     // name / identifier of the selling party
-
-  accountId        String
-  account          PmakAccount @relation(fields: [accountId], references: [id])
-  createdAt        DateTime    @default(now())
-
-  @@map("pmak_transactions")
-}
-
-// ─── OUTSIDE ORDERS ───────────────────────────────────
-model OutsideOrder {
-  id                  String        @id @default(cuid())
-  date                DateTime      @db.Date
-  clientId            String
-  clientName          String
-  clientLink          String?
-  orderDetails        String
-  orderSheet          String?       // file path or URL
-  assignTeam          String?
-  orderStatus         OrderStatus   @default(PENDING)
-  orderAmount         Decimal       @db.Decimal(12, 2)
-  receiveAmount       Decimal       @db.Decimal(12, 2) @default(0)
-  dueAmount           Decimal       @db.Decimal(12, 2) @default(0)
-  paymentMethod       String?
-  paymentMethodDetails String?
-  createdAt           DateTime      @default(now())
-  updatedAt           DateTime      @updatedAt
-
-  @@map("outside_orders")
-}
-
-// ─── DOLLAR EXCHANGE ──────────────────────────────────
-model DollarExchange {
-  id            String        @id @default(cuid())
-  date          DateTime      @db.Date
-  details       String
-  accountFrom   String?       
-  accountTo     String?       
-  debit         Decimal       @db.Decimal(12, 2) @default(0)
-  credit        Decimal       @db.Decimal(12, 2) @default(0)
-  rate          Decimal       @db.Decimal(8, 2)
-  totalBdt      Decimal       @db.Decimal(14, 2)  // rate * exchange amount
-  paymentStatus PaymentStatus @default(DUE)
-  createdAt     DateTime      @default(now())
-
-  @@map("dollar_exchanges")
-}
-
-model DailyRate {
-  id        String   @id @default(cuid())
-  date      DateTime @db.Date
-  rate      Decimal  @db.Decimal(10, 4)   // BDT per 1 USD (e.g. 110.5000)
-  setBy     String?                        // HR email who set it (audit trail)
-  note      String?                        // optional HR note
-  createdAt DateTime @default(now())
-
-  @@index([date])
-}
-
-
-// ─── CARD SHARING ─────────────────────────────────────
-model CardSharing {
-  id               String   @id @default(cuid())
-  serialNo         String   @unique
-  details          String?
-  payoneerAccount  String
-  cardNo           String   // store encrypted
-  cardExpire       String
-  cardCvc          String   // store encrypted
-  cardVendor       String
-  cardLimit        Decimal  @db.Decimal(12, 2)
-  cardPaymentRcv   Decimal  @db.Decimal(12, 2) @default(0)
-  cardRcvBank      String?
-  mailDetails      String?
-  screenshotPath   String?
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
-
-  @@map("card_sharing")
-}
-
-// ─── HR EXPENSE ───────────────────────────────────────
-model HrExpense {
-  id               String   @id @default(cuid())
-  date             DateTime @db.Date
-  details          String
-  accountFrom      String?         
-  accountTo        String?         
-  debit            Decimal  @db.Decimal(12, 2) @default(0)
-  credit           Decimal  @db.Decimal(12, 2) @default(0)
-  remainingBalance Decimal  @db.Decimal(12, 2)
-  createdAt        DateTime @default(now())
-
-  @@map("hr_expenses")
-}
-
-// ─── INVENTORY ────────────────────────────────────────
-model Inventory {
-  id          String   @id @default(cuid())
-  date        DateTime @db.Date
-  itemName    String
-  category    String?
-  quantity    Int      @default(1)
-  unitPrice   Decimal  @db.Decimal(12, 2) @default(0)
-  totalPrice  Decimal  @db.Decimal(12, 2) @default(0)
-  condition   String?
-  assignedTo  String?
-  notes       String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  @@map("inventory")
-}
-
-// ─── INVITATIONS ───────────────────────────────────────────────
-enum InvitationStatus {
-  PENDING
-  ACCEPTED
-  EXPIRED
-  CANCELLED
-}
-
 model Invitation {
   id          String           @id @default(cuid())
   email       String
   role        Role
   inviteToken String           @unique
   status      InvitationStatus @default(PENDING)
-  invitedBy   String
+  invitedBy   String           // User.id of the inviter
   expiresAt   DateTime
   acceptedAt  DateTime?
   createdAt   DateTime         @default(now())
@@ -316,6 +94,349 @@ model Invitation {
   @@index([email])
   @@index([inviteToken])
   @@index([status])
-
   @@map("invitations")
+}
+
+// ===============================================================================
+//  FIVERR
+// ===============================================================================
+
+model FiverrProfile {
+  id          String        @id @default(cuid())
+  profileName String        @unique
+  isActive    Boolean       @default(true)
+  entries     FiverrEntry[]
+  orders      FiverrOrder[]
+
+  @@map("fiverr_profiles")
+}
+
+/// Daily snapshot of a Fiverr profile's financial state.
+/// All monetary values in USD.
+model FiverrEntry {
+  id                  String        @id @default(cuid())
+  date                DateTime      @db.Date
+  availableWithdraw   Decimal       @db.Decimal(12, 2)
+  notCleared          Decimal       @db.Decimal(12, 2) @default(0)
+  activeOrders        Int           @default(0)
+  /// Total $ value of active (in-progress) orders -- NEW
+  activeOrderAmount   Decimal       @db.Decimal(12, 2) @default(0)
+  submitted           Decimal       @db.Decimal(12, 2) @default(0)
+  withdrawn           Decimal       @db.Decimal(12, 2) @default(0)
+  sellerPlus          Boolean       @default(false)
+  promotion           Decimal       @db.Decimal(12, 2) @default(0)
+  profileId           String
+  profile             FiverrProfile @relation(fields: [profileId], references: [id])
+  createdAt           DateTime      @default(now())
+
+  @@unique([profileId, date])
+  @@index([date])
+  @@map("fiverr_entries")
+}
+
+/// Individual Fiverr order log.
+/// afterFiverr is stored (not computed at query time) so historical exports
+/// remain accurate even if the platform fee changes.
+model FiverrOrder {
+  id           String        @id @default(cuid())
+  date         DateTime      @db.Date
+  buyerName    String
+  orderId      String        @unique
+  /// Gross order amount in USD
+  amount       Decimal       @db.Decimal(12, 2)
+  /// amount x 0.80  -- net after Fiverr's 20 % platform fee (stored for audit)
+  afterFiverr  Decimal       @db.Decimal(12, 2)
+  profileId    String
+  profile      FiverrProfile @relation(fields: [profileId], references: [id])
+  createdAt    DateTime      @default(now())
+
+  @@index([date])
+  @@map("fiverr_orders")
+}
+
+// ===============================================================================
+//  UPWORK
+// ===============================================================================
+
+model UpworkProfile {
+  id          String        @id @default(cuid())
+  profileName String        @unique
+  isActive    Boolean       @default(true)
+  entries     UpworkEntry[]
+  orders      UpworkOrder[]
+
+  @@map("upwork_profiles")
+}
+
+/// Daily snapshot of an Upwork profile's financial state.
+/// All monetary values in USD.
+model UpworkEntry {
+  id                String        @id @default(cuid())
+  date              DateTime      @db.Date
+  availableWithdraw Decimal       @db.Decimal(12, 2)
+  pending           Decimal       @db.Decimal(12, 2) @default(0)
+  inReview          Decimal       @db.Decimal(12, 2) @default(0)
+  workInProgress    Decimal       @db.Decimal(12, 2) @default(0)
+  withdrawn         Decimal       @db.Decimal(12, 2) @default(0)
+  connects          Int           @default(0)
+  upworkPlus        Boolean       @default(false)
+  profileId         String
+  profile           UpworkProfile @relation(fields: [profileId], references: [id])
+  createdAt         DateTime      @default(now())
+
+  @@unique([profileId, date])
+  @@index([date])
+  @@map("upwork_entries")
+}
+
+/// Individual Upwork order / contract log.
+/// afterUpwork is stored for the same audit-trail reason as afterFiverr.
+model UpworkOrder {
+  id          String        @id @default(cuid())
+  date        DateTime      @db.Date
+  clientName  String
+  orderId     String        @unique
+  /// Gross order amount in USD
+  amount      Decimal       @db.Decimal(12, 2)
+  /// amount x 0.90  -- net after Upwork's 10 % service fee (stored for audit)
+  afterUpwork Decimal       @db.Decimal(12, 2)
+  profileId   String
+  profile     UpworkProfile @relation(fields: [profileId], references: [id])
+  createdAt   DateTime      @default(now())
+
+  @@index([date])
+  @@map("upwork_orders")
+}
+
+// ===============================================================================
+//  PAYONEER
+// ===============================================================================
+
+model PayoneerAccount {
+  id           String                @id @default(cuid())
+  accountName  String                @unique
+  isActive     Boolean               @default(true)
+  transactions PayoneerTransaction[]
+  cardSharings CardSharing[]
+
+  @@map("payoneer_accounts")
+}
+
+/// All monetary values in USD.
+model PayoneerTransaction {
+  id               String          @id @default(cuid())
+  date             DateTime        @db.Date
+  details          String
+  accountFrom      String?
+  accountTo        String?
+  debit            Decimal         @db.Decimal(12, 2) @default(0)
+  credit           Decimal         @db.Decimal(12, 2) @default(0)
+  remainingBalance Decimal         @db.Decimal(12, 2)
+  accountId        String
+  account          PayoneerAccount @relation(fields: [accountId], references: [id])
+  createdAt        DateTime        @default(now())
+
+  @@index([date])
+  @@map("payoneer_transactions")
+}
+
+// ===============================================================================
+//  PMAK  -- split into two models / two export sheets
+// ===============================================================================
+model PmakAccount {
+  id           String             @id @default(cuid())
+  accountName  String             @unique
+  isActive     Boolean            @default(true)
+  transactions PmakTransaction[]
+  inhouseDeals PmakInhouse[]
+
+  @@map("pmak_accounts")
+}
+
+/// PMAK Ledger sheet -- standard double-entry rows.
+/// All monetary values in USD.
+model PmakTransaction {
+  id               String      @id @default(cuid())
+  date             DateTime    @db.Date
+  details          String
+  accountFrom      String?
+  accountTo        String?
+  debit            Decimal     @db.Decimal(12, 2) @default(0)
+  credit           Decimal     @db.Decimal(12, 2) @default(0)
+  remainingBalance Decimal     @db.Decimal(12, 2)
+  status           PmakStatus  @default(PENDING)
+  accountId        String
+  account          PmakAccount @relation(fields: [accountId], references: [id])
+  createdAt        DateTime    @default(now())
+
+  @@index([date])
+  @@index([status])
+  @@map("pmak_transactions")
+}
+
+/// PMAK Inhouse sheet -- buyer/seller deal tracking.
+/// All monetary values in USD.
+model PmakInhouse {
+  id           String             @id @default(cuid())
+  date         DateTime           @db.Date
+  details      String?
+  buyerName    String
+  sellerName   String
+  orderAmount  Decimal            @db.Decimal(12, 2)
+  orderStatus  InhouseOrderStatus @default(PENDING)
+  accountId    String
+  account      PmakAccount        @relation(fields: [accountId], references: [id])
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  @@index([date])
+  @@index([orderStatus])
+  @@map("pmak_inhouse")
+}
+
+// ===============================================================================
+//  OUTSIDE ORDERS
+// ===============================================================================
+//  orderSheet -> stores a documented order link (URL / cloud doc link)
+//  All monetary values in USD.
+
+model OutsideOrder {
+  id                   String      @id @default(cuid())
+  date                 DateTime    @db.Date
+  clientId             String
+  clientName           String
+  clientLink           String?
+  orderDetails         String
+  /// Documented order link (Google Doc, Drive URL, etc.)
+  orderSheet           String?
+  assignTeam           String?
+  orderStatus          OrderStatus @default(PENDING)
+  /// All amounts in USD
+  orderAmount          Decimal     @db.Decimal(12, 2)
+  receiveAmount        Decimal     @db.Decimal(12, 2) @default(0)
+  dueAmount            Decimal     @db.Decimal(12, 2) @default(0)
+  paymentMethod        String?
+  paymentMethodDetails String?
+  createdAt            DateTime    @default(now())
+  updatedAt            DateTime    @updatedAt
+
+  @@index([date])
+  @@index([orderStatus])
+  @@map("outside_orders")
+}
+
+// ===============================================================================
+//  DOLLAR EXCHANGE
+// ===============================================================================
+//  HR inputs the daily BDT/USD rate directly on each transaction.
+//  DailyRate model is REMOVED -- rate lives here.
+//  totalBdt = rate x exchanged dollar amount (stored for audit trail).
+
+model DollarExchange {
+  id            String        @id @default(cuid())
+  date          DateTime      @db.Date
+  details       String
+  accountFrom   String?
+  accountTo     String?
+  /// Dollar amount exchanged (positive = debit side)
+  debit         Decimal       @db.Decimal(12, 2) @default(0)
+  /// Dollar amount exchanged (positive = credit side)
+  credit        Decimal       @db.Decimal(12, 2) @default(0)
+  /// BDT per 1 USD at the time of this transaction (HR-entered)
+  rate          Decimal       @db.Decimal(8, 2)
+  /// Computed: rate x max(debit, credit) -- stored for immutable audit trail
+  totalBdt      Decimal       @db.Decimal(14, 2)
+  paymentStatus PaymentStatus @default(DUE)
+  createdAt     DateTime      @default(now())
+
+  @@index([date])
+  @@index([paymentStatus])
+  @@map("dollar_exchanges")
+}
+
+// ===============================================================================
+//  CARD SHARING
+// ===============================================================================
+//  Sensitive model -- cardNo and cardCvc are stored encrypted at rest.
+//  cardDetails stores a JSON array of Cloudinary secure_url strings
+//  (card screenshots uploaded via Cloudinary API).
+//  All monetary values in USD.
+
+model CardSharing {
+  id               String          @id @default(cuid())
+  date             DateTime        @db.Date
+  serialNo         String          @unique
+  details          String?
+  /// FK to PayoneerAccount for referential integrity & reporting
+  accountId        String
+  account          PayoneerAccount @relation(fields: [accountId], references: [id])
+  /// Stored encrypted (AES-256 via app layer before write)
+  cardNo           String
+  cardExpire       String
+  /// Stored encrypted (AES-256 via app layer before write)
+  cardCvc          String
+  /// JSON array of Cloudinary secure_url strings, e.g. ["https://res.cloudinary.com/..."]
+  cardDetails      Json            @default("[]")
+  /// Who the card is shared with (vendor / partner name)
+  cardVendor       String
+  /// Maximum spend limit on the card in USD
+  cardLimit        Decimal         @db.Decimal(12, 2)
+  /// Dollar amount received as payment from the vendor
+  cardPaymentReceive Decimal       @db.Decimal(12, 2) @default(0)
+  /// Bank/channel name where the card payment was received (e.g. "bKash", "Payoneer Sub")
+  cardReceiveBank  String          @default("")
+  mailDetails      String?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  @@index([date])
+  @@index([accountId])
+  @@map("card_sharing")
+}
+
+// ===============================================================================
+//  HR EXPENSE
+// ===============================================================================
+//  remarks -- free-text field for CEO judgement / approval notes.
+//  All monetary values in USD.
+
+model HrExpense {
+  id               String   @id @default(cuid())
+  date             DateTime @db.Date
+  details          String
+  accountFrom      String?
+  accountTo        String?
+  debit            Decimal  @db.Decimal(12, 2) @default(0)
+  credit           Decimal  @db.Decimal(12, 2) @default(0)
+  remainingBalance Decimal  @db.Decimal(12, 2)
+  /// CEO comments / approval judgement -- NEW
+  remarks          String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([date])
+  @@map("hr_expenses")
+}
+
+// ===============================================================================
+//  INVENTORY
+// ===============================================================================
+//  All monetary values in USD.
+
+model Inventory {
+  id         String   @id @default(cuid())
+  date       DateTime @db.Date
+  itemName   String
+  category   String?
+  quantity   Int      @default(1)
+  unitPrice  Decimal  @db.Decimal(12, 2) @default(0)
+  totalPrice Decimal  @db.Decimal(12, 2) @default(0)
+  condition  String?
+  assignedTo String?
+  notes      String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([date])
+  @@map("inventory")
 }

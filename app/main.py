@@ -2,9 +2,6 @@
 app/main.py
 ============
 Application factory.
-
-UPDATED: Added daily_rate_router for the new HR-managed USD→BDT rate module.
-Register it in the same API v1 prefix block alongside all other routers.
 """
 import sys
 from contextlib import asynccontextmanager
@@ -24,7 +21,6 @@ from app.modules.health.router import router as health_router
 from app.modules.auth.router import router as auth_router
 from app.modules.card_sharing.router import router as card_router
 from app.modules.dashboard.router import router as dashboard_router
-from app.modules.daily_rate.router import router as daily_rate_router   # ← NEW
 from app.modules.dollar_exchange.router import router as exchange_router
 from app.modules.export.router import router as export_router
 from app.modules.fiverr.router import router as fiverr_router
@@ -98,8 +94,7 @@ def create_app() -> FastAPI:
         fiverr_router, upwork_router, payoneer_router,
         pmak_router, outside_router, exchange_router,
         card_router, hr_router, inventory_router,
-        export_router,
-        daily_rate_router,          
+        export_router,         
     ]:
         app.include_router(router, prefix=API_PREFIX)
 

@@ -2,11 +2,6 @@
 app/core/email.py
 ==================
 Async SMTP email service.
-
-FIX vs previous version:
-  - Uses settings.smtp_from_header (not settings.SMTP_FROM which no longer exists).
-  - Uses settings.smtp_configured guard (not manual SMTP_USER check).
-  - Uses settings.SMTP_TLS flag instead of hardcoded start_tls=True.
 """
 import logging
 import re

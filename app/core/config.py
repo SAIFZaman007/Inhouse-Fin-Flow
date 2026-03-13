@@ -3,13 +3,12 @@ app/core/config.py
 ===================
 Pydantic-settings configuration.
 
-FIXES vs previous version:
-  - SMTP_FROM renamed to EMAILS_FROM_EMAIL + EMAILS_FROM_NAME to match the
-    actual .env variables Coolify injects (EMAILS_FROM_EMAIL, EMAILS_FROM_NAME).
-    The old code used SMTP_FROM which was never in the .env, so it always
-    fell back to the default "noreply@maktech.com" — email From: was wrong.
-  - Added a smtp_from_header computed property that builds the RFC 5322
-    "Name <email>" format expected by aiosmtplib.
+Changes vs previous version:
+  - Added FORCE_HTTPS: bool (default False)
+    When True, ForceHttpsMiddleware rewrites all request schemes to https.
+    Set FORCE_HTTPS=true in .env if your reverse proxy does NOT forward
+    X-Forwarded-Proto headers to the container.
+    See middleware.py for full explanation.
 """
 from functools import lru_cache
 from typing import List
@@ -21,7 +20,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore",  # ignore unknown env-vars (e.g. Coolify metadata)
+        extra="ignore",
     )
 
     # ── Application ───────────────────────────────────────────
@@ -47,15 +46,25 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = ""
     SMTP_TLS: bool = True
 
-    # These match the actual .env variable names set in Coolify
     EMAILS_FROM_EMAIL: str = ""
     EMAILS_FROM_NAME: str = "MAKTech FinFlow"
 
     # ── CORS ──────────────────────────────────────────────────
     ALLOWED_ORIGINS: str = "https://fin-flow.maktechlaravel.cloud,http://localhost:3000,http://localhost:5173"
 
+    # ── HTTPS enforcement ─────────────────────────────────────
+    # Set FORCE_HTTPS=true in .env if your reverse proxy does NOT forward
+    # X-Forwarded-Proto: https to the container.
+    # Coolify + Traefik forward it automatically — leave False by default.
+    FORCE_HTTPS: bool = False
+
     # ── Finance ───────────────────────────────────────────────
     BDT_DEFAULT_RATE: float = 110.0
+
+    # ── Cloudinary ────────────────────────────────────────────
+    CLOUDINARY_CLOUD_NAME: str = ""
+    CLOUDINARY_API_KEY: str = ""
+    CLOUDINARY_API_SECRET: str = ""
 
     # ── Computed properties ───────────────────────────────────
 
@@ -76,10 +85,12 @@ class Settings(BaseSettings):
 
     @property
     def smtp_configured(self) -> bool:
-        """True if SMTP credentials are present and usable."""
         return bool(self.SMTP_USER and self.SMTP_PASSWORD)
 
 
 @lru_cache()
 def get_settings() -> Settings:
     return Settings()
+
+
+settings = get_settings()
