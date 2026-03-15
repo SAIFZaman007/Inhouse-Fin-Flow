@@ -6,8 +6,9 @@ Excel export endpoints — one per module + a combined dashboard export.
 All endpoints return application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
 as a file download (Content-Disposition: attachment).
 
-Period query param: daily | weekly | monthly | yearly
+Period query param: daily | weekly | monthly | yearly | all
 Optional: from / to (date override), export_date, year, month
+          (date range params are silently ignored when period=all)
 
 Role enforcement mirrors the source module:
   Dashboard        → ALL_ROLES

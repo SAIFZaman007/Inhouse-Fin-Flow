@@ -1,19 +1,29 @@
 """
 app/modules/export/service.py
 ════════════════════════════════════════════════════════════════════════════════
-Enterprise-grade Excel export engine — MAKTech Financial Flow  (v3)
+Enterprise-grade Excel export engine — MAKTech Financial Flow  (v4)
 
 ════════════════════════════════════════════════════════════════════════════════
 ARCHITECTURE
 ════════════════════════════════════════════════════════════════════════════════
 
-  resolve_date_range()       → ExportQueryParams → (date_from, date_to, label)
-  _prisma_date_filter()      → date range → Prisma-safe datetime dict
+  resolve_date_range()       → ExportQueryParams → (date_from | None, date_to | None, label)
+  _prisma_date_filter()      → date range → Prisma-safe datetime dict (or None for ALL)
   _get_latest_exchange_rate()→ reads most recent rate from DollarExchange rows
   _xl()                      → openpyxl Workbook factory — full enterprise styling
   _build_kpi_summary()       → writes KPI Summary tab for dashboard export
   _copy_sheet_into()         → merges a single-sheet wb into a multi-sheet wb
   export_<module>()          → fetch DB → build workbook → (bytes, filename)
+
+════════════════════════════════════════════════════════════════════════════════
+v4 CHANGE LOG
+════════════════════════════════════════════════════════════════════════════════
+
+  ExportPeriod.ALL   → NEW: period=all exports the complete dataset with no
+                        date filter applied. resolve_date_range() returns
+                        (None, None, "All Time"). All find_many() calls omit
+                        the date WHERE clause entirely, returning every record.
+                        Filename suffix becomes "all_time".
 
 ════════════════════════════════════════════════════════════════════════════════
 v3 CHANGE LOG
@@ -203,9 +213,23 @@ _WRAP_COLUMNS = {
 #  DATE RANGE RESOLVER
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def resolve_date_range(params: ExportQueryParams) -> tuple[date, date, str]:
+def resolve_date_range(
+    params: ExportQueryParams,
+) -> tuple[date | None, date | None, str]:
+    """
+    Resolve the export period into (date_from, date_to, human_label).
+
+    Returns (None, None, "All Time") for ExportPeriod.ALL — callers must
+    pass the result through _prisma_date_filter() which will return None,
+    and then use _date_where() to build the correct Prisma where-clause.
+    """
     today = date.today()
 
+    # ExportPeriod.ALL — no date bounds; export entire dataset
+    if params.period == ExportPeriod.ALL:
+        return None, None, "All Time"
+
+    # Explicit date override takes precedence over period (not applicable to ALL)
     if params.date_from and params.date_to:
         return params.date_from, params.date_to, f"{params.date_from} to {params.date_to}"
 
@@ -232,18 +256,34 @@ def resolve_date_range(params: ExportQueryParams) -> tuple[date, date, str]:
         y = params.year or today.year
         return date(y, 1, 1), date(y, 12, 31), str(y)
 
-    raise ValueError(f"Unknown period: {period}")
+    raise ValueError(f"Unknown period: {period!r}")
 
 
-def _prisma_date_filter(d_from: date, d_to: date) -> dict:
+def _prisma_date_filter(d_from: date | None, d_to: date | None) -> dict | None:
     """
-    Convert date → datetime for Prisma where-clauses.
+    Convert a date range into a Prisma-safe datetime filter dict.
+
+    Returns **None** when either bound is None (i.e. period=ALL), signalling
+    that the caller should omit the date WHERE clause entirely.
+
     prisma-client-py requires datetime objects (not bare date) in filters.
     """
+    if d_from is None or d_to is None:
+        return None
     return {
         "gte": datetime.combine(d_from, time.min),
         "lte": datetime.combine(d_to,   time.max),
     }
+
+
+def _date_where(df: dict | None) -> dict:
+    """
+    Build the Prisma ``where`` dict for a date filter.
+
+    - If df is a populated dict  -> ``{"date": df}``  (period-filtered)
+    - If df is None              -> ``{}``             (no filter -- ALL period)
+    """
+    return {"date": df} if df is not None else {}
 
 
 async def _get_latest_exchange_rate(db: Prisma) -> tuple[float | None, str, str]:
@@ -538,7 +578,12 @@ def _f(v: Any) -> float:
 
 
 def _safe_label(label: str) -> str:
-    return label.replace(" ", "_").replace("–", "-")
+    return (
+        label.lower()
+             .replace(" ", "_")
+             .replace("–", "-")
+             .replace("/", "-")
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -942,10 +987,10 @@ async def export_fiverr(db: Prisma, params: ExportQueryParams) -> tuple[bytes, s
     df = _prisma_date_filter(d_from, d_to)
 
     entries = await db.fiverrentry.find_many(
-        where={"date": df}, include={"profile": True}, order={"date": "asc"},
+        where=_date_where(df), include={"profile": True}, order={"date": "asc"},
     )
     orders = await db.fiverrorder.find_many(
-        where={"date": df}, include={"profile": True}, order={"date": "asc"},
+        where=_date_where(df), include={"profile": True}, order={"date": "asc"},
     )
 
     wb = openpyxl.Workbook()
@@ -971,10 +1016,10 @@ async def export_upwork(db: Prisma, params: ExportQueryParams) -> tuple[bytes, s
     df = _prisma_date_filter(d_from, d_to)
 
     entries = await db.upworkentry.find_many(
-        where={"date": df}, include={"profile": True}, order={"date": "asc"},
+        where=_date_where(df), include={"profile": True}, order={"date": "asc"},
     )
     orders = await db.upworkorder.find_many(
-        where={"date": df}, include={"profile": True}, order={"date": "asc"},
+        where=_date_where(df), include={"profile": True}, order={"date": "asc"},
     )
 
     wb = openpyxl.Workbook()
@@ -999,7 +1044,7 @@ async def export_payoneer(db: Prisma, params: ExportQueryParams) -> tuple[bytes,
     df = _prisma_date_filter(d_from, d_to)
 
     txns = await db.payoneertransaction.find_many(
-        where={"date": df}, include={"account": True}, order={"date": "asc"},
+        where=_date_where(df), include={"account": True}, order={"date": "asc"},
     )
     return (
         _wb_to_bytes(_xl("Payoneer", _PAYONEER_COLS, _payoneer_rows(txns),
@@ -1015,10 +1060,10 @@ async def export_pmak(db: Prisma, params: ExportQueryParams) -> tuple[bytes, str
     df = _prisma_date_filter(d_from, d_to)
 
     txns   = await db.pmaktransaction.find_many(
-        where={"date": df}, include={"account": True}, order={"date": "asc"},
+        where=_date_where(df), include={"account": True}, order={"date": "asc"},
     )
     inhouse = await db.pmakinhouse.find_many(
-        where={"date": df}, include={"account": True}, order={"date": "asc"},
+        where=_date_where(df), include={"account": True}, order={"date": "asc"},
     )
 
     wb = openpyxl.Workbook()
@@ -1045,7 +1090,7 @@ async def export_outside_orders(db: Prisma, params: ExportQueryParams) -> tuple[
     df = _prisma_date_filter(d_from, d_to)
 
     orders = await db.outsideorder.find_many(
-        where={"date": df}, order={"date": "asc"},
+        where=_date_where(df), order={"date": "asc"},
     )
     return (
         _wb_to_bytes(_xl("Outside Orders", _OUTSIDE_ORDER_COLS, _outside_order_rows(orders),
@@ -1060,7 +1105,7 @@ async def export_dollar_exchange(db: Prisma, params: ExportQueryParams) -> tuple
     d_from, d_to, label = resolve_date_range(params)
     df = _prisma_date_filter(d_from, d_to)
 
-    records = await db.dollarexchange.find_many(where={"date": df}, order={"date": "asc"})
+    records = await db.dollarexchange.find_many(where=_date_where(df), order={"date": "asc"})
     rate, rate_date, rate_label = await _get_latest_exchange_rate(db)
 
     rows    = _dollar_exchange_rows(records, rate)
@@ -1084,7 +1129,7 @@ async def export_card_sharing(db: Prisma, params: ExportQueryParams) -> tuple[by
     df = _prisma_date_filter(d_from, d_to)
 
     cards = await db.cardsharing.find_many(
-        where={"date": df},
+        where=_date_where(df),
         include={"account": True},
         order={"date": "asc"},
     )
@@ -1105,7 +1150,7 @@ async def export_hr_expense(db: Prisma, params: ExportQueryParams) -> tuple[byte
     d_from, d_to, label = resolve_date_range(params)
     df = _prisma_date_filter(d_from, d_to)
 
-    expenses = await db.hrexpense.find_many(where={"date": df}, order={"date": "asc"})
+    expenses = await db.hrexpense.find_many(where=_date_where(df), order={"date": "asc"})
     return (
         _wb_to_bytes(_xl("HR Expense", _HR_EXPENSE_COLS, _hr_expense_rows(expenses),
             {"Module": "HR Expense", "Period": label, "Records": str(len(expenses))},
@@ -1118,7 +1163,7 @@ async def export_inventory(db: Prisma, params: ExportQueryParams) -> tuple[bytes
     d_from, d_to, label = resolve_date_range(params)
     df = _prisma_date_filter(d_from, d_to)
 
-    items = await db.inventory.find_many(where={"date": df}, order={"date": "asc"})
+    items = await db.inventory.find_many(where=_date_where(df), order={"date": "asc"})
     return (
         _wb_to_bytes(_xl("Inventory", _INVENTORY_COLS, _inventory_rows(items),
             {"Module": "Inventory", "Period": label, "Records": str(len(items))},
@@ -1154,53 +1199,63 @@ async def export_dashboard(db: Prisma, params: ExportQueryParams) -> tuple[bytes
     df = _prisma_date_filter(d_from, d_to)
 
     # ── Fetch period-filtered data ─────────────────────────────────────────────
+    # _date_where(df) returns {} when df is None (period=ALL) so that
+    # Prisma performs an unfiltered query and returns the full dataset.
     fiverr_entries  = await db.fiverrentry.find_many(
-        where={"date": df}, include={"profile": True}, order={"date": "asc"},
+        where=_date_where(df), include={"profile": True}, order={"date": "asc"},
     )
     fiverr_orders   = await db.fiverrorder.find_many(
-        where={"date": df}, include={"profile": True}, order={"date": "asc"},
+        where=_date_where(df), include={"profile": True}, order={"date": "asc"},
     )
     upwork_entries  = await db.upworkentry.find_many(
-        where={"date": df}, include={"profile": True}, order={"date": "asc"},
+        where=_date_where(df), include={"profile": True}, order={"date": "asc"},
     )
     upwork_orders   = await db.upworkorder.find_many(
-        where={"date": df}, include={"profile": True}, order={"date": "asc"},
+        where=_date_where(df), include={"profile": True}, order={"date": "asc"},
     )
     payoneer_txns   = await db.payoneertransaction.find_many(
-        where={"date": df}, include={"account": True}, order={"date": "asc"},
+        where=_date_where(df), include={"account": True}, order={"date": "asc"},
     )
     pmak_txns       = await db.pmaktransaction.find_many(
-        where={"date": df}, include={"account": True}, order={"date": "asc"},
+        where=_date_where(df), include={"account": True}, order={"date": "asc"},
     )
     pmak_inhouse    = await db.pmakinhouse.find_many(
-        where={"date": df}, include={"account": True}, order={"date": "asc"},
+        where=_date_where(df), include={"account": True}, order={"date": "asc"},
     )
     outside_orders  = await db.outsideorder.find_many(
-        where={"date": df}, order={"date": "asc"},
+        where=_date_where(df), order={"date": "asc"},
     )
     dollar_records  = await db.dollarexchange.find_many(
-        where={"date": df}, order={"date": "asc"},
+        where=_date_where(df), order={"date": "asc"},
     )
     hr_expenses     = await db.hrexpense.find_many(
-        where={"date": df}, order={"date": "asc"},
+        where=_date_where(df), order={"date": "asc"},
     )
     inventory_items = await db.inventory.find_many(
-        where={"date": df}, order={"date": "asc"},
+        where=_date_where(df), order={"date": "asc"},
     )
     card_sharings   = await db.cardsharing.find_many(
-        where={"date": df}, include={"account": True}, order={"date": "asc"},
+        where=_date_where(df), include={"account": True}, order={"date": "asc"},
     )
 
     # ── All-time fetches for KPI balance calculations ──────────────────────────
     # Ledger modules always show CURRENT (all-time) balances on the KPI sheet.
-    payoneer_all    = await db.payoneertransaction.find_many(
-        include={"account": True}, order={"date": "asc"},
-    )
-    pmak_all        = await db.pmaktransaction.find_many(
-        include={"account": True}, order={"date": "asc"},
-    )
-    hr_all          = await db.hrexpense.find_many(order={"date": "asc"})
-    inventory_all   = await db.inventory.find_many(order={"date": "asc"})
+    # When period=ALL the period-filtered data is already the full dataset,
+    # so we reuse it directly instead of issuing duplicate queries.
+    if params.period == ExportPeriod.ALL:
+        payoneer_all  = payoneer_txns
+        pmak_all      = pmak_txns
+        hr_all        = hr_expenses
+        inventory_all = inventory_items
+    else:
+        payoneer_all  = await db.payoneertransaction.find_many(
+            include={"account": True}, order={"date": "asc"},
+        )
+        pmak_all      = await db.pmaktransaction.find_many(
+            include={"account": True}, order={"date": "asc"},
+        )
+        hr_all        = await db.hrexpense.find_many(order={"date": "asc"})
+        inventory_all = await db.inventory.find_many(order={"date": "asc"})
 
     current_rate, rate_date, rate_label = await _get_latest_exchange_rate(db)
 

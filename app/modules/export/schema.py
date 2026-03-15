@@ -23,21 +23,28 @@ class ExportQueryParams:
       weekly  → requires `export_date` (Monday of that week is computed)
       monthly → requires `year` + `month`
       yearly  → requires `year`
+      all     → no date parameters required; exports the entire dataset
 
     Alternatively, `date_from` / `date_to` can be supplied for any period
     to override the auto-computed range (useful for custom date windows).
+    Note: `date_from` / `date_to` are ignored when period=all.
     """
 
     def __init__(
         self,
         period: ExportPeriod = Query(
             ...,
-            description="Export granularity: daily | weekly | monthly | yearly",
+            description=(
+                "Export granularity: daily | weekly | monthly | yearly | all. "
+                "Use 'all' to export the complete dataset with no date filter."
+            ),
         ),
         export_date: Optional[date] = Query(
             default=None,
-            description="Reference date for daily/weekly exports (YYYY-MM-DD). "
-                        "Defaults to today for daily; week containing this date for weekly.",
+            description=(
+                "Reference date for daily/weekly exports (YYYY-MM-DD). "
+                "Defaults to today for daily; week containing this date for weekly."
+            ),
         ),
         year: Optional[int] = Query(
             default=None,
@@ -54,12 +61,18 @@ class ExportQueryParams:
         date_from: Optional[date] = Query(
             default=None,
             alias="from",
-            description="Override range start (YYYY-MM-DD). Takes precedence over period.",
+            description=(
+                "Override range start (YYYY-MM-DD). "
+                "Takes precedence over period. Ignored when period=all."
+            ),
         ),
         date_to: Optional[date] = Query(
             default=None,
             alias="to",
-            description="Override range end (YYYY-MM-DD). Takes precedence over period.",
+            description=(
+                "Override range end (YYYY-MM-DD). "
+                "Takes precedence over period. Ignored when period=all."
+            ),
         ),
     ):
         self.period = period

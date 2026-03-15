@@ -23,6 +23,7 @@ class ExportPeriod(str, Enum):
     WEEKLY  = "weekly"
     MONTHLY = "monthly"
     YEARLY  = "yearly"
+    ALL     = "all"
 
 class PmakStatus(str, Enum):
     """Lifecycle status for PMAK ledger transactions."""

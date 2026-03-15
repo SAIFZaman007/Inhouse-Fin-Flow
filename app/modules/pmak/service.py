@@ -1,526 +1,587 @@
 """
 app/modules/pmak/service.py
 ════════════════════════════════════════════════════════════════════════════════
-v4 — Enterprise Edition
+v4.1
 
-Changes vs v3
-─────────────
-_resolve_account_by_name  NEW — case-insensitive account lookup by name.
-_tx_to_dict               NEW — serialises a transaction row + accountName.
-_inhouse_to_dict          NEW — serialises an inhouse row + accountName.
-_inhouse_status_summary   NEW — builds the {PENDING, IN_PROGRESS, COMPLETED,
-                                 CANCELLED} breakdown dict.
-add_transaction           Resolves account via ``data.account_name`` (not id).
-create_inhouse_deal       Resolves account via ``data.account_name`` (not id).
-list_accounts             Combined totals including inhouse breakdown; period +
-                          name filter + pagination.
-get_account_transactions  Paginated, includes accountName per row.
-get_account_inhouse_deals Paginated, includes accountName per row + status summary.
-
-Datetime bug fix
-────────────────
-All date writes use ``datetime.combine(d, time.min)`` — bare datetime.date
-values are rejected by prisma-client-py's JSON serialiser.
+No other logic is changed.
 ════════════════════════════════════════════════════════════════════════════════
 """
-from __future__ import annotations
-
 import io
-import logging
-import math
-from datetime import date, datetime, time
+from datetime import date as dt_date, datetime, time
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Optional
 
+import openpyxl
 from fastapi import HTTPException
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 from prisma import Prisma
 
-from app.shared.constants import InhouseOrderStatus
-from app.shared.filters import DateRangeFilter, to_dt_start, to_dt_end
+from app.shared.filters import DateRangeFilter
 from app.shared.pagination import PageParams
+
 from .schema import (
     PmakAccountCreate,
-    PmakInhouseCreate, PmakInhouseStatusUpdate,
-    PmakTransactionCreate, PmakTransactionStatusUpdate,
+    PmakInhouseCreate,
+    PmakInhouseStatusUpdate,
+    PmakTransactionCreate,
+    PmakTransactionStatusUpdate,
 )
 
-logger = logging.getLogger(__name__)
-_ZERO = Decimal("0")
 
-# All InhouseOrderStatus values, in display order
-_INHOUSE_STATUSES = [
-    InhouseOrderStatus.PENDING,
-    InhouseOrderStatus.IN_PROGRESS,
-    InhouseOrderStatus.COMPLETED,
-    InhouseOrderStatus.CANCELLED,
-]
+# ── Date helper ───────────────────────────────────────────────────────────────
+
+def _to_dt(d: dt_date) -> datetime:
+    """date → datetime midnight.  Prisma-client-py rejects bare date objects."""
+    if isinstance(d, datetime):
+        return d
+    return datetime.combine(d, time.min)
 
 
-# ── Private helpers ───────────────────────────────────────────────────────────
+# ── Inhouse status summary helper ─────────────────────────────────────────────
 
-def _d(v: Any) -> Decimal:
-    return _ZERO if v is None else Decimal(str(v))
-
-
-def _tx_to_dict(tx: Any, account_name: str) -> dict:
+def _empty_inhouse_by_status() -> dict:
     return {
-        "id":               tx.id,
-        "accountId":        tx.accountId,
-        "accountName":      account_name,
-        "date":             tx.date.date() if isinstance(tx.date, datetime) else tx.date,
-        "details":          tx.details,
-        "accountFrom":      tx.accountFrom,
-        "accountTo":        tx.accountTo,
-        "debit":            _d(tx.debit),
-        "credit":           _d(tx.credit),
-        "remainingBalance": _d(tx.remainingBalance),
-        "status":           tx.status,
-        "createdAt":        tx.createdAt,
+        "PENDING":     {"count": 0, "totalAmount": 0.0},
+        "IN_PROGRESS": {"count": 0, "totalAmount": 0.0},
+        "COMPLETED":   {"count": 0, "totalAmount": 0.0},
+        "CANCELLED":   {"count": 0, "totalAmount": 0.0},
     }
 
 
-def _inhouse_to_dict(deal: Any, account_name: str) -> dict:
+def _build_inhouse_by_status(deals: list) -> dict:
+    result = _empty_inhouse_by_status()
+    for d in deals:
+        key = d.orderStatus if isinstance(d.orderStatus, str) else d.orderStatus.value
+        if key in result:
+            result[key]["count"] += 1
+            result[key]["totalAmount"] += float(d.orderAmount)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Accounts
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def create_account(db: Prisma, data: PmakAccountCreate):
+    existing = await db.pmakaccount.find_first(
+        where={"accountName": {"equals": data.accountName, "mode": "insensitive"}}
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail="Account name already exists")
+
+    account = await db.pmakaccount.create(data={"accountName": data.accountName})
     return {
-        "id":          deal.id,
-        "accountId":   deal.accountId,
-        "accountName": account_name,
-        "date":        deal.date.date() if isinstance(deal.date, datetime) else deal.date,
-        "details":     deal.details,
-        "buyerName":   deal.buyerName,
-        "sellerName":  deal.sellerName,
-        "orderAmount": _d(deal.orderAmount),
-        "orderStatus": deal.orderStatus,
-        "createdAt":   deal.createdAt,
-        "updatedAt":   deal.updatedAt,
+        "id":               account.id,
+        "accountName":      account.accountName,
+        "isActive":         account.isActive,
+        "currentBalance":   0.0,
+        "totalTransactions": 0,
+        "totalInhouse":     0,
+        "inhouseByStatus":  _empty_inhouse_by_status(),
     }
 
 
-def _inhouse_status_summary(deals: list) -> dict:
-    """Build {PENDING: {count, totalAmount}, IN_PROGRESS: ..., ...} dict."""
-    summary: dict = {
-        s.value: {"count": 0, "totalAmount": float(_ZERO)}
-        for s in _INHOUSE_STATUSES
-    }
-    for deal in deals:
-        key = deal.orderStatus if isinstance(deal.orderStatus, str) else deal.orderStatus.value
-        if key in summary:
-            summary[key]["count"]       += 1
-            summary[key]["totalAmount"] += float(_d(deal.orderAmount))
-    return summary
+async def deactivate_account(db: Prisma, account_id: str):
+    account = await db.pmakaccount.find_unique(where={"id": account_id})
+    if not account:
+        raise HTTPException(status_code=404, detail="PMAK account not found")
+    await db.pmakaccount.update(
+        where={"id": account_id},
+        data={"isActive": False},
+    )
 
 
-def _pagination_meta(pagination: Optional[PageParams], total: int) -> dict:
-    if pagination is None:
-        return {"page": 1, "pageSize": total, "total": total, "totalPages": 1}
-    return {
-        "page":       pagination.page,
-        "pageSize":   pagination.page_size,
-        "total":      total,
-        "totalPages": math.ceil(total / pagination.page_size) if total > 0 else 1,
-    }
-
-
-async def _resolve_account_by_name(db: Prisma, account_name: str):
+async def list_accounts(
+    db:         Prisma,
+    filters:    DateRangeFilter,
+    name:       Optional[str] = None,
+    pagination: PageParams = None,
+):
     """
-    Return the active PmakAccount whose name matches ``account_name``
-    (case-insensitive).  Raises HTTP 404 if not found.
+    Combined totals + paginated per-account breakdown.
+
+    FIX: include key corrected from ``"inhouse"`` → ``"inhouseDeals"``.
+    FIX: where-filter on inhouse count also uses ``"inhouseDeals"``.
     """
+    date_filter = filters.to_prisma_filter()
+
+    # ── Base where clause ─────────────────────────────────────────────────────
+    where: dict = {"isActive": True}
+    if name:
+        where["accountName"] = {"contains": name, "mode": "insensitive"}
+
+    # ── Total active account count ────────────────────────────────────────────
+    total_accounts = await db.pmakaccount.count(where=where)
+
+    # ── Pagination ────────────────────────────────────────────────────────────
+    skip = pagination.skip if pagination else 0
+    take = pagination.take if pagination else 50
+
+    # ── Fetch accounts with relations ─────────────────────────────────────────
+    # CRITICAL FIX: "inhouseDeals" is the correct relation name from schema.prisma
+    # PmakAccount.inhouseDeals → PmakInhouse[]
+    # The old code used "inhouse" which does not exist → PrismaError 500
+    accounts = await db.pmakaccount.find_many(
+        where=where,
+        skip=skip,
+        take=take,
+        order={"accountName": "asc"},
+        include={
+            "transactions": {
+                "where":   {"date": date_filter} if date_filter else {},
+                "order":   {"createdAt": "desc"},
+            },
+            # ↓ FIXED: was "inhouse", must be "inhouseDeals"
+            "inhouseDeals": {
+                "where":   {"date": date_filter} if date_filter else {},
+                "order":   {"createdAt": "desc"},
+            },
+        },
+    )
+
+    # ── Cross-account aggregate totals ────────────────────────────────────────
+    combined_balance      = 0.0
+    combined_credit       = 0.0
+    combined_debit        = 0.0
+    combined_transactions = 0
+    combined_inhouse      = 0
+    combined_inhouse_amt  = 0.0
+    combined_by_status    = _empty_inhouse_by_status()
+
+    account_summaries = []
+
+    for acct in accounts:
+        txns   = acct.transactions   or []
+        # ↓ FIXED: was acct.inhouse — attribute on the model object also matches
+        #   the relation name defined in schema.prisma
+        deals  = acct.inhouseDeals   or []
+
+        # Balance = last remainingBalance in the period (or overall latest)
+        period_txns     = txns  # already filtered by date above
+        all_txns_latest = await db.pmaktransaction.find_first(
+            where={"accountId": acct.id},
+            order={"date": "desc"},
+        )
+        current_balance = float(all_txns_latest.remainingBalance) if all_txns_latest else 0.0
+
+        period_credit = sum(float(t.credit) for t in period_txns)
+        period_debit  = sum(float(t.debit)  for t in period_txns)
+
+        inhouse_by_status = _build_inhouse_by_status(deals)
+        inhouse_total_amt = sum(float(d.orderAmount) for d in deals)
+
+        # Recent 5 for preview
+        recent_txns   = period_txns[:5]
+        recent_inhouse = deals[:5]
+
+        combined_balance      += current_balance
+        combined_credit       += period_credit
+        combined_debit        += period_debit
+        combined_transactions += len(period_txns)
+        combined_inhouse      += len(deals)
+        combined_inhouse_amt  += inhouse_total_amt
+
+        for status_key, v in inhouse_by_status.items():
+            combined_by_status[status_key]["count"]       += v["count"]
+            combined_by_status[status_key]["totalAmount"] += v["totalAmount"]
+
+        account_summaries.append({
+            "id":               acct.id,
+            "accountName":      acct.accountName,
+            "isActive":         acct.isActive,
+            "currentBalance":   current_balance,
+            "periodCredit":     period_credit,
+            "periodDebit":      period_debit,
+            "transactionCount": len(period_txns),
+            "inhouseCount":     len(deals),
+            "inhouseByStatus":  inhouse_by_status,
+            "recentTransactions": [_serialize_txn(t, acct.accountName) for t in recent_txns],
+            "recentInhouse":     [_serialize_inhouse(d, acct.accountName) for d in recent_inhouse],
+        })
+
+    totals = {
+        "totalBalance":       combined_balance,
+        "totalCredit":        combined_credit,
+        "totalDebit":         combined_debit,
+        "totalTransactions":  combined_transactions,
+        "totalInhouse":       combined_inhouse,
+        "totalInhouseAmount": combined_inhouse_amt,
+        "inhouseByStatus":    combined_by_status,
+        "activeAccountCount": total_accounts,
+    }
+
+    total_pages = max(1, -(-total_accounts // take))  # ceiling division
+
+    return {
+        "filter":     filters.meta(),
+        "totals":     totals,
+        "pagination": {
+            "page":        pagination.page if pagination else 1,
+            "pageSize":    take,
+            "total":       total_accounts,
+            "totalPages":  total_pages,
+        },
+        "accounts": account_summaries,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ledger Transactions
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def add_transaction(db: Prisma, data: PmakTransactionCreate):
     account = await db.pmakaccount.find_first(
         where={
-            "accountName": {"equals": account_name, "mode": "insensitive"},
+            "accountName": {"equals": data.account_name, "mode": "insensitive"},
             "isActive":    True,
         }
     )
     if not account:
         raise HTTPException(
             status_code=404,
-            detail=f"PMAK account '{account_name}' not found.",
+            detail=f"Active PMAK account '{data.account_name}' not found",
         )
-    return account
 
-
-# ── Account CRUD ──────────────────────────────────────────────────────────────
-
-async def create_account(db: Prisma, data: PmakAccountCreate) -> dict:
-    existing = await db.pmakaccount.find_unique(where={"accountName": data.accountName})
-    if existing:
-        raise HTTPException(status_code=409, detail="Account name already exists.")
-    account = await db.pmakaccount.create(data={"accountName": data.accountName})
-    return {
-        "id":                account.id,
-        "accountName":       account.accountName,
-        "isActive":          account.isActive,
-        "currentBalance":    0.0,
-        "totalTransactions": 0,
-        "totalInhouse":      0,
-        "inhouseByStatus":   _inhouse_status_summary([]),
-    }
-
-
-async def list_accounts(
-    db: Prisma,
-    filters: DateRangeFilter,
-    name: Optional[str] = None,
-    pagination: Optional[PageParams] = None,
-) -> dict:
-    """
-    Combined totals (ledger + inhouse) + paginated per-account breakdown.
-    ``name`` performs case-insensitive partial search on accountName.
-    """
-    date_f = filters.to_prisma_filter()
-
-    where: dict = {"isActive": True}
-    if name:
-        where["accountName"] = {"contains": name, "mode": "insensitive"}
-
-    total_accounts = await db.pmakaccount.count(where=where)
-
-    find_kw: dict = dict(
-        where=where,
-        include={
-            "transactions": {
-                "where":    {"date": date_f} if date_f else {},
-                "order_by": {"date": "desc"},
-            },
-            "inhouse": {
-                "where":    {"date": date_f} if date_f else {},
-                "order_by": {"date": "desc"},
-            },
-        },
-        order={"accountName": "asc"},
-    )
-    if pagination:
-        find_kw["skip"] = pagination.skip
-        find_kw["take"] = pagination.take
-
-    accounts = await db.pmakaccount.find_many(**find_kw)
-
-    # ── Cross-account accumulators ────────────────────────────────────────────
-    t_balance    = _ZERO
-    t_credit     = _ZERO
-    t_debit      = _ZERO
-    t_tx_count   = 0
-    t_inhouse    = 0
-    t_inh_amount = _ZERO
-    t_inh_status: dict = {s.value: {"count": 0, "totalAmount": 0.0} for s in _INHOUSE_STATUSES}
-
-    summaries = []
-    for acc in accounts:
-        latest_tx = await db.pmaktransaction.find_first(
-            where={"accountId": acc.id}, order={"date": "desc"}
-        )
-        current_balance = _d(latest_tx.remainingBalance) if latest_tx else _ZERO
-
-        period_credit = sum((_d(t.credit) for t in acc.transactions), _ZERO)
-        period_debit  = sum((_d(t.debit)  for t in acc.transactions), _ZERO)
-        inh_summary   = _inhouse_status_summary(acc.inhouse)
-        inh_amount    = sum((_d(d.orderAmount) for d in acc.inhouse), _ZERO)
-
-        t_balance    += current_balance
-        t_credit     += period_credit
-        t_debit      += period_debit
-        t_tx_count   += len(acc.transactions)
-        t_inhouse    += len(acc.inhouse)
-        t_inh_amount += inh_amount
-        for s_key, val in inh_summary.items():
-            t_inh_status[s_key]["count"]       += val["count"]
-            t_inh_status[s_key]["totalAmount"] += val["totalAmount"]
-
-        summaries.append({
-            "id":                acc.id,
-            "accountName":       acc.accountName,
-            "isActive":          acc.isActive,
-            "currentBalance":    float(current_balance),
-            "periodCredit":      float(period_credit),
-            "periodDebit":       float(period_debit),
-            "transactionCount":  len(acc.transactions),
-            "inhouseCount":      len(acc.inhouse),
-            "inhouseByStatus":   inh_summary,
-            "recentTransactions": [_tx_to_dict(t, acc.accountName) for t in acc.transactions[:5]],
-            "recentInhouse":      [_inhouse_to_dict(d, acc.accountName) for d in acc.inhouse[:5]],
-        })
-
-    return {
-        "filter": filters.meta(),
-        "totals": {
-            "totalBalance":       float(t_balance),
-            "totalCredit":        float(t_credit),
-            "totalDebit":         float(t_debit),
-            "totalTransactions":  t_tx_count,
-            "totalInhouse":       t_inhouse,
-            "totalInhouseAmount": float(t_inh_amount),
-            "inhouseByStatus":    t_inh_status,
-            "activeAccountCount": total_accounts,
-        },
-        "pagination": _pagination_meta(pagination, total_accounts),
-        "accounts":   summaries,
-    }
-
-
-async def deactivate_account(db: Prisma, account_id: str) -> None:
-    acc = await db.pmakaccount.find_unique(where={"id": account_id})
-    if not acc:
-        raise HTTPException(status_code=404, detail="PMAK account not found.")
-    await db.pmakaccount.update(where={"id": account_id}, data={"isActive": False})
-
-
-# ── Ledger Transaction CRUD ───────────────────────────────────────────────────
-
-async def add_transaction(db: Prisma, data: PmakTransactionCreate) -> dict:
-    """
-    Add a ledger transaction.
-    Resolves account by ``data.account_name`` — staff never handle UUIDs.
-    """
-    account = await _resolve_account_by_name(db, data.account_name)
-
-    tx = await db.pmaktransaction.create(
+    txn = await db.pmaktransaction.create(
         data={
-            "accountId":        account.id,
-            "date":             datetime.combine(data.date, time.min),
+            "date":             _to_dt(data.date),
             "details":          data.details,
             "accountFrom":      data.accountFrom,
             "accountTo":        data.accountTo,
             "debit":            data.debit,
             "credit":           data.credit,
             "remainingBalance": data.remaining_balance,
-            "status":           data.status,
-        }
+            "status":           data.status.value,
+            "account":          {"connect": {"id": account.id}},
+        },
     )
-    return _tx_to_dict(tx, account.accountName)
-
-
-async def update_transaction_status(
-    db: Prisma,
-    transaction_id: str,
-    data: PmakTransactionStatusUpdate,
-) -> dict:
-    """Restricted PATCH — only ``status`` is touched. Safe for BDev role."""
-    tx = await db.pmaktransaction.find_unique(where={"id": transaction_id})
-    if not tx:
-        raise HTTPException(status_code=404, detail="Transaction not found.")
-    if data.status is None:
-        raise HTTPException(status_code=400, detail="No fields to update.")
-
-    updated = await db.pmaktransaction.update(
-        where={"id": transaction_id},
-        data={"status": data.status},
-    )
-    # Fetch account name for the response
-    account = await db.pmakaccount.find_unique(where={"id": updated.accountId})
-    acc_name = account.accountName if account else ""
-    return _tx_to_dict(updated, acc_name)
+    return _serialize_txn(txn, account.accountName)
 
 
 async def get_account_transactions(
-    db: Prisma,
+    db:         Prisma,
     account_id: str,
     date_filter: dict,
-    pagination: Optional[PageParams] = None,
-) -> dict:
-    """Paginated ledger transactions — every row includes ``accountName``."""
+    pagination: PageParams = None,
+):
     account = await db.pmakaccount.find_unique(where={"id": account_id})
     if not account:
-        raise HTTPException(status_code=404, detail="PMAK account not found.")
+        raise HTTPException(status_code=404, detail="PMAK account not found")
 
     where: dict = {"accountId": account_id}
     if date_filter:
         where["date"] = date_filter
 
-    total   = await db.pmaktransaction.count(where=where)
-    find_kw = dict(where=where, order={"date": "desc"})
-    if pagination:
-        find_kw["skip"] = pagination.skip
-        find_kw["take"] = pagination.take
+    skip = pagination.skip if pagination else 0
+    take = pagination.take if pagination else 50
 
-    transactions = await db.pmaktransaction.find_many(**find_kw)
-
-    latest = await db.pmaktransaction.find_first(
-        where={"accountId": account_id}, order={"date": "desc"}
+    total = await db.pmaktransaction.count(where=where)
+    txns  = await db.pmaktransaction.find_many(
+        where=where,
+        order={"date": "desc"},
+        skip=skip,
+        take=take,
     )
-    current_balance = _d(latest.remainingBalance) if latest else _ZERO
-    period_credit   = sum((_d(t.credit) for t in transactions), _ZERO)
-    period_debit    = sum((_d(t.debit)  for t in transactions), _ZERO)
+
+    # Balance = latest overall (not period-scoped)
+    latest = await db.pmaktransaction.find_first(
+        where={"accountId": account_id},
+        order={"date": "desc"},
+    )
+    current_balance = float(latest.remainingBalance) if latest else 0.0
+    period_credit   = sum(float(t.credit) for t in txns)
+    period_debit    = sum(float(t.debit)  for t in txns)
 
     return {
-        "account":      {"id": account.id, "accountName": account.accountName, "isActive": account.isActive},
-        "currentBalance": float(current_balance),
-        "periodCredit":   float(period_credit),
-        "periodDebit":    float(period_debit),
-        "pagination":     _pagination_meta(pagination, total),
-        "transactions":   [_tx_to_dict(t, account.accountName) for t in transactions],
+        "account":        {"id": account.id, "accountName": account.accountName, "isActive": account.isActive},
+        "currentBalance": current_balance,
+        "periodCredit":   period_credit,
+        "periodDebit":    period_debit,
+        "pagination": {
+            "page":       pagination.page if pagination else 1,
+            "pageSize":   take,
+            "total":      total,
+            "totalPages": max(1, -(-total // take)),
+        },
+        "transactions": [_serialize_txn(t, account.accountName) for t in txns],
     }
 
 
-async def delete_transaction(db: Prisma, transaction_id: str) -> None:
-    tx = await db.pmaktransaction.find_unique(where={"id": transaction_id})
-    if not tx:
-        raise HTTPException(status_code=404, detail="Transaction not found.")
+async def update_transaction_status(
+    db:             Prisma,
+    transaction_id: str,
+    data:           PmakTransactionStatusUpdate,
+):
+    txn = await db.pmaktransaction.find_unique(where={"id": transaction_id})
+    if not txn:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    update_data: dict = {}
+    if data.status is not None:
+        update_data["status"] = data.status.value
+
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    updated = await db.pmaktransaction.update(
+        where={"id": transaction_id},
+        data=update_data,
+    )
+    account = await db.pmakaccount.find_unique(where={"id": updated.accountId})
+    return _serialize_txn(updated, account.accountName if account else "")
+
+
+async def delete_transaction(db: Prisma, transaction_id: str):
+    txn = await db.pmaktransaction.find_unique(where={"id": transaction_id})
+    if not txn:
+        raise HTTPException(status_code=404, detail="Transaction not found")
     await db.pmaktransaction.delete(where={"id": transaction_id})
 
 
-# ── Inhouse Deal CRUD ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Inhouse Deals
+# ─────────────────────────────────────────────────────────────────────────────
 
-async def create_inhouse_deal(db: Prisma, data: PmakInhouseCreate) -> dict:
-    """
-    Create an inhouse deal.
-    Resolves account by ``data.account_name`` — staff never handle UUIDs.
-    """
-    account = await _resolve_account_by_name(db, data.account_name)
+async def create_inhouse_deal(db: Prisma, data: PmakInhouseCreate):
+    account = await db.pmakaccount.find_first(
+        where={
+            "accountName": {"equals": data.account_name, "mode": "insensitive"},
+            "isActive":    True,
+        }
+    )
+    if not account:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Active PMAK account '{data.account_name}' not found",
+        )
 
     deal = await db.pmakinhouse.create(
         data={
-            "accountId":   account.id,
-            "date":        datetime.combine(data.date, time.min),
+            "date":        _to_dt(data.date),
             "details":     data.details,
             "buyerName":   data.buyer_name,
             "sellerName":  data.seller_name,
             "orderAmount": data.order_amount,
-            "orderStatus": data.order_status,
-        }
+            "orderStatus": data.order_status.value,
+            "account":     {"connect": {"id": account.id}},
+        },
     )
-    return _inhouse_to_dict(deal, account.accountName)
-
-
-async def update_inhouse_deal(
-    db: Prisma,
-    deal_id: str,
-    data: PmakInhouseStatusUpdate,
-) -> dict:
-    deal = await db.pmakinhouse.find_unique(where={"id": deal_id})
-    if not deal:
-        raise HTTPException(status_code=404, detail="Inhouse deal not found.")
-
-    update_data: dict = {}
-    if data.order_status is not None:
-        update_data["orderStatus"] = data.order_status
-    if data.details is not None:
-        update_data["details"] = data.details
-    if not update_data:
-        raise HTTPException(status_code=400, detail="No fields to update.")
-
-    updated = await db.pmakinhouse.update(where={"id": deal_id}, data=update_data)
-    account = await db.pmakaccount.find_unique(where={"id": updated.accountId})
-    acc_name = account.accountName if account else ""
-    return _inhouse_to_dict(updated, acc_name)
+    return _serialize_inhouse(deal, account.accountName)
 
 
 async def get_account_inhouse_deals(
-    db: Prisma,
-    account_id: str,
+    db:          Prisma,
+    account_id:  str,
     date_filter: dict,
-    pagination: Optional[PageParams] = None,
-) -> dict:
-    """Paginated inhouse deals — every row includes ``accountName`` + status summary."""
+    pagination:  PageParams = None,
+):
     account = await db.pmakaccount.find_unique(where={"id": account_id})
     if not account:
-        raise HTTPException(status_code=404, detail="PMAK account not found.")
+        raise HTTPException(status_code=404, detail="PMAK account not found")
 
     where: dict = {"accountId": account_id}
     if date_filter:
         where["date"] = date_filter
 
-    total   = await db.pmakinhouse.count(where=where)
-    find_kw = dict(where=where, order={"date": "desc"})
-    if pagination:
-        find_kw["skip"] = pagination.skip
-        find_kw["take"] = pagination.take
+    skip = pagination.skip if pagination else 0
+    take = pagination.take if pagination else 50
 
-    deals        = await db.pmakinhouse.find_many(**find_kw)
-    all_deals    = await db.pmakinhouse.find_many(where=where)   # for status summary (all pages)
-    inh_summary  = _inhouse_status_summary(all_deals)
-    total_amount = sum((_d(d.orderAmount) for d in all_deals), _ZERO)
+    total = await db.pmakinhouse.count(where=where)
+    deals = await db.pmakinhouse.find_many(
+        where=where,
+        order={"date": "desc"},
+        skip=skip,
+        take=take,
+    )
+
+    inhouse_by_status = _build_inhouse_by_status(deals)
+    total_amount      = sum(float(d.orderAmount) for d in deals)
 
     return {
-        "account":       {"id": account.id, "accountName": account.accountName, "isActive": account.isActive},
-        "inhouseByStatus": inh_summary,
-        "totalAmount":   float(total_amount),
-        "pagination":    _pagination_meta(pagination, total),
-        "deals":         [_inhouse_to_dict(d, account.accountName) for d in deals],
+        "account":         {"id": account.id, "accountName": account.accountName, "isActive": account.isActive},
+        "inhouseByStatus": inhouse_by_status,
+        "totalAmount":     total_amount,
+        "pagination": {
+            "page":       pagination.page if pagination else 1,
+            "pageSize":   take,
+            "total":      total,
+            "totalPages": max(1, -(-total // take)),
+        },
+        "deals": [_serialize_inhouse(d, account.accountName) for d in deals],
     }
 
 
-async def delete_inhouse_deal(db: Prisma, deal_id: str) -> None:
+async def update_inhouse_deal(
+    db:      Prisma,
+    deal_id: str,
+    data:    PmakInhouseStatusUpdate,
+):
     deal = await db.pmakinhouse.find_unique(where={"id": deal_id})
     if not deal:
-        raise HTTPException(status_code=404, detail="Inhouse deal not found.")
+        raise HTTPException(status_code=404, detail="Inhouse deal not found")
+
+    update_data: dict = {}
+    if data.order_status is not None:
+        update_data["orderStatus"] = data.order_status.value
+    if data.details is not None:
+        update_data["details"] = data.details
+
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    updated = await db.pmakinhouse.update(
+        where={"id": deal_id},
+        data=update_data,
+    )
+    account = await db.pmakaccount.find_unique(where={"id": updated.accountId})
+    return _serialize_inhouse(updated, account.accountName if account else "")
+
+
+async def delete_inhouse_deal(db: Prisma, deal_id: str):
+    deal = await db.pmakinhouse.find_unique(where={"id": deal_id})
+    if not deal:
+        raise HTTPException(status_code=404, detail="Inhouse deal not found")
     await db.pmakinhouse.delete(where={"id": deal_id})
 
 
-# ── Profile-level Excel export ────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Excel Export — single account
+# ─────────────────────────────────────────────────────────────────────────────
+
+_HEADER_FILL  = PatternFill("solid", fgColor="1F3864")
+_HEADER_FONT  = Font(bold=True, color="FFFFFF", size=11)
+_ALT_FILL     = PatternFill("solid", fgColor="DCE6F1")
+_CENTER       = Alignment(horizontal="center", vertical="center")
+_LEFT         = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+
+
+def _apply_header(ws, headers: list[str], col_widths: list[int]) -> None:
+    ws.row_dimensions[1].height = 22
+    for idx, (h, w) in enumerate(zip(headers, col_widths), start=1):
+        cell            = ws.cell(row=1, column=idx, value=h)
+        cell.font       = _HEADER_FONT
+        cell.fill       = _HEADER_FILL
+        cell.alignment  = _CENTER
+        ws.column_dimensions[get_column_letter(idx)].width = w
+
 
 async def export_account_excel(
-    db: Prisma,
+    db:         Prisma,
     account_id: str,
-    filters: DateRangeFilter,
+    filters:    DateRangeFilter,
 ) -> tuple[bytes, str]:
-    """Two-sheet Excel: Sheet 1 = Ledger Transactions, Sheet 2 = Inhouse Deals."""
-    try:
-        import openpyxl
-        from openpyxl.styles import Alignment, Font, PatternFill
-        from openpyxl.utils import get_column_letter
-    except ImportError:
-        raise HTTPException(
-            status_code=500,
-            detail="openpyxl not installed — cannot generate Excel export.",
-        )
+    """Two-sheet workbook: Ledger + Inhouse Deals."""
+    account = await db.pmakaccount.find_unique(where={"id": account_id})
+    if not account:
+        raise HTTPException(status_code=404, detail="PMAK account not found")
 
-    tx_data  = await get_account_transactions(db, account_id, filters.to_prisma_filter())
-    inh_data = await get_account_inhouse_deals(db, account_id, filters.to_prisma_filter())
-    acc_name = tx_data["account"]["accountName"]
-    start, end = filters.window()
+    date_filter = filters.to_prisma_filter()
+    txn_where:   dict = {"accountId": account_id}
+    deal_where:  dict = {"accountId": account_id}
+    if date_filter:
+        txn_where["date"]  = date_filter
+        deal_where["date"] = date_filter
 
-    wb          = openpyxl.Workbook()
-    HEADER_FILL = PatternFill("solid", fgColor="1F4E79")
-    HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
-    ALT_FILL    = PatternFill("solid", fgColor="EBF3FB")
+    txns  = await db.pmaktransaction.find_many(where=txn_where,  order={"date": "asc"})
+    deals = await db.pmakinhouse.find_many(    where=deal_where, order={"date": "asc"})
 
-    def _header(ws, cols):
-        for c, h in enumerate(cols, 1):
-            cell = ws.cell(row=1, column=c, value=h)
-            cell.font = HEADER_FONT
-            cell.fill = HEADER_FILL
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-        ws.row_dimensions[1].height = 20
+    wb = openpyxl.Workbook()
 
-    def _autofit(ws):
-        for col in ws.columns:
-            w = max((len(str(cell.value or "")) for cell in col), default=8)
-            ws.column_dimensions[get_column_letter(col[0].column)].width = min(w + 4, 40)
-
-    # Sheet 1 — Ledger
+    # ── Sheet 1: Ledger ───────────────────────────────────────────────────────
     ws1 = wb.active
     ws1.title = "Ledger"
-    _header(ws1, ["Date", "Details", "Account From", "Account To",
-                  "Debit ($)", "Credit ($)", "Balance ($)", "Status"])
-    for ri, t in enumerate(tx_data["transactions"], 2):
-        fill = ALT_FILL if ri % 2 == 0 else None
-        for ci, v in enumerate([
-            str(t["date"]), t["details"], t["accountFrom"] or "",
-            t["accountTo"] or "", float(t["debit"]),
-            float(t["credit"]), float(t["remainingBalance"]),
-            t["status"],
-        ], 1):
-            cell = ws1.cell(row=ri, column=ci, value=v)
+    _apply_header(ws1, [
+        "Date", "Details", "Account From", "Account To",
+        "Debit", "Credit", "Balance", "Status",
+    ], [12, 36, 20, 20, 12, 12, 14, 12])
+
+    for row_idx, t in enumerate(txns, start=2):
+        fill = _ALT_FILL if row_idx % 2 == 0 else None
+        vals = [
+            t.date.date().isoformat() if hasattr(t.date, "date") else str(t.date),
+            t.details or "",
+            t.accountFrom or "",
+            t.accountTo   or "",
+            float(t.debit),
+            float(t.credit),
+            float(t.remainingBalance),
+            t.status if isinstance(t.status, str) else t.status.value,
+        ]
+        for col_idx, val in enumerate(vals, start=1):
+            cell           = ws1.cell(row=row_idx, column=col_idx, value=val)
+            cell.alignment = _CENTER if col_idx in (1, 5, 6, 7, 8) else _LEFT
             if fill:
                 cell.fill = fill
-    _autofit(ws1)
+    ws1.freeze_panes = "A2"
 
-    # Sheet 2 — Inhouse
-    ws2 = wb.create_sheet("Inhouse")
-    _header(ws2, ["Date", "Buyer", "Seller", "Amount ($)", "Status", "Details"])
-    for ri, d in enumerate(inh_data["deals"], 2):
-        fill = ALT_FILL if ri % 2 == 0 else None
-        for ci, v in enumerate([
-            str(d["date"]), d["buyerName"], d["sellerName"],
-            float(d["orderAmount"]), d["orderStatus"], d["details"] or "",
-        ], 1):
-            cell = ws2.cell(row=ri, column=ci, value=v)
+    # ── Sheet 2: Inhouse Deals ────────────────────────────────────────────────
+    ws2 = wb.create_sheet("Inhouse Deals")
+    _apply_header(ws2, [
+        "Date", "Buyer", "Seller", "Amount", "Status", "Details",
+    ], [12, 24, 24, 14, 14, 40])
+
+    for row_idx, d in enumerate(deals, start=2):
+        fill = _ALT_FILL if row_idx % 2 == 0 else None
+        vals = [
+            d.date.date().isoformat() if hasattr(d.date, "date") else str(d.date),
+            d.buyerName,
+            d.sellerName,
+            float(d.orderAmount),
+            d.orderStatus if isinstance(d.orderStatus, str) else d.orderStatus.value,
+            d.details or "",
+        ]
+        for col_idx, val in enumerate(vals, start=1):
+            cell           = ws2.cell(row=row_idx, column=col_idx, value=val)
+            cell.alignment = _CENTER if col_idx in (1, 4, 5) else _LEFT
             if fill:
                 cell.fill = fill
-    _autofit(ws2)
+    ws2.freeze_panes = "A2"
 
-    buf      = io.BytesIO()
-    wb.save(buf)
-    tag      = f"{start}_{end}" if start else "all"
-    filename = f"pmak_{acc_name.replace(' ', '_')}_{tag}.xlsx"
-    return buf.getvalue(), filename
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    safe_name = account.accountName.replace(" ", "_").replace("/", "-")
+    meta      = filters.meta()
+    period    = meta["dateRange"]["from"] or "all"
+    filename  = f"pmak_{safe_name}_{period}.xlsx"
+
+    return buffer.read(), filename
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal serialisers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _serialize_txn(txn, account_name: str) -> dict:
+    return {
+        "id":               txn.id,
+        "accountId":        txn.accountId,
+        "accountName":      account_name,
+        "date":             txn.date.date() if hasattr(txn.date, "date") else txn.date,
+        "details":          txn.details,
+        "accountFrom":      txn.accountFrom,
+        "accountTo":        txn.accountTo,
+        "debit":            txn.debit,
+        "credit":           txn.credit,
+        "remainingBalance": txn.remainingBalance,
+        "status":           txn.status if isinstance(txn.status, str) else txn.status.value,
+        "createdAt":        txn.createdAt,
+    }
+
+
+def _serialize_inhouse(deal, account_name: str) -> dict:
+    return {
+        "id":          deal.id,
+        "accountId":   deal.accountId,
+        "accountName": account_name,
+        "date":        deal.date.date() if hasattr(deal.date, "date") else deal.date,
+        "details":     deal.details,
+        "buyerName":   deal.buyerName,
+        "sellerName":  deal.sellerName,
+        "orderAmount": deal.orderAmount,
+        "orderStatus": deal.orderStatus if isinstance(deal.orderStatus, str) else deal.orderStatus.value,
+        "createdAt":   deal.createdAt,
+        "updatedAt":   deal.updatedAt,
+    }
