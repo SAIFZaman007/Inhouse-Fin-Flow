@@ -1,11 +1,26 @@
 """
 app/modules/card_sharing/service.py
 ================================================================================
-v4 — Changes from v3.1:
+v4.1 — Production Fix
 
-Encryption contract (unchanged):
-  encrypt_value() / decrypt_value() from app.core.security (Fernet AES)
-  Encrypt BEFORE write, decrypt AFTER read (sensitive endpoint only)
+ROOT CAUSE:
+  PrismaError: Field account is required to return data, got `null` instead.
+
+  During the v3_enterprise_changes migration, orphaned card_sharing rows were
+  backfilled with accountId = '' (empty string sentinel) because no safe FK
+  value existed at migration time. When Prisma executes include={"account": True}
+  on these rows, it finds no matching PayoneerAccount row and raises a non-null
+  violation — crashing the entire list endpoint.
+
+TWO-PART FIX:
+  1. DB fix  — run fix_orphaned_card_sharing.sql to assign real accountIds
+               (or delete junk rows) on production.
+  2. Code fix — this file adds a WHERE accountId != '' guard on all queries
+               so the endpoint never crashes while any unresolved rows exist.
+               _serialize_card already handles card.account being None safely.
+
+  Once fix_orphaned_card_sharing.sql is applied AND the FK constraint is added,
+  the guard becomes a silent no-op and can be removed in a future cleanup.
 ================================================================================
 """
 import io
@@ -25,14 +40,10 @@ from app.core.security import decrypt_value, encrypt_value
 from .schema import CardSharingCreate, CardSharingUpdate
 
 
-# ── Date helper (fix #3) ──────────────────────────────────────────────────────
+# ── Date helper ───────────────────────────────────────────────────────────────
 
 def _to_datetime(d: dt_date) -> datetime:
-    """
-    Convert a date to a datetime at midnight.
-    Prisma's @db.Date DateTime fields reject bare datetime.date objects —
-    only datetime.datetime is accepted by the JSON serialiser.
-    """
+    """date → datetime midnight. Prisma rejects bare date objects."""
     if isinstance(d, datetime):
         return d
     return datetime.combine(d, time.min)
@@ -43,7 +54,8 @@ def _to_datetime(d: dt_date) -> datetime:
 def _serialize_card(card, include_sensitive: bool = False) -> dict:
     """
     Map Prisma CardSharing model → safe response dict.
-    The account relation MUST be included in the originating query.
+    account relation MUST be included in the originating query.
+    Defensive guard on card.account handles any remaining orphaned rows.
     """
     card_details = card.cardDetails
     if not isinstance(card_details, list):
@@ -54,6 +66,7 @@ def _serialize_card(card, include_sensitive: bool = False) -> dict:
         "serialNo":            card.serialNo,
         "date":                card.date,
         "details":             card.details,
+        # Safe: returns empty string if account relation is missing
         "payoneerAccountName": card.account.accountName if card.account else "",
         "cardNo":              "****",
         "cardExpire":          card.cardExpire,
@@ -73,14 +86,35 @@ def _serialize_card(card, include_sensitive: bool = False) -> dict:
     return base
 
 
+# ── Valid-account guard ───────────────────────────────────────────────────────
+
+def _valid_account_where() -> dict:
+    """
+    Returns a Prisma where-clause fragment that excludes orphaned rows.
+
+    Orphaned rows have accountId = '' (migration backfill sentinel) and have
+    no matching PayoneerAccount. Including them with account relation causes:
+        PrismaError: Field account is required to return data, got null instead.
+
+    This guard keeps the endpoint alive while any unresolved rows exist.
+    Remove this guard after running fix_orphaned_card_sharing.sql and
+    adding the FK constraint at the DB level.
+    """
+    return {
+        "account": {
+            "is": {
+                "id": {"not": ""}
+            }
+        }
+    }
+
+
 # ── CRUD ──────────────────────────────────────────────────────────────────────
 
 async def create_card(db: Prisma, data: CardSharingCreate):
     """
     Create a card record.
-
-    Lookup by accountName (case-insensitive exact match) replaces the old
-    account_id UUID approach — much friendlier for API consumers.
+    Lookup by accountName (case-insensitive) replaces account_id UUID approach.
     """
     account = await db.payoneeraccount.find_first(
         where={"accountName": {"equals": data.account_name, "mode": "insensitive"}}
@@ -97,21 +131,19 @@ async def create_card(db: Prisma, data: CardSharingCreate):
 
     card = await db.cardsharing.create(
         data={
-            "serialNo":            data.serial_no,
-            "date":                _to_datetime(data.date),
-            "details":             data.details,
-            # Root Cause 1 FIX — relation requires connect syntax, not bare FK scalar
-            "account":             {"connect": {"id": account.id}},
-            "cardNo":              encrypt_value(data.card_no),
-            "cardExpire":          data.card_expire,
-            "cardCvc":             encrypt_value(data.card_cvc),
-            # Root Cause 2 FIX — cardDetails is Json in schema, must wrap with Json()
-            "cardDetails":         Json(data.card_details),
-            "cardVendor":          data.card_vendor,
-            "cardLimit":           data.card_limit,
-            "cardPaymentReceive":  data.card_payment_received,
-            "cardReceiveBank":     data.card_receiver_bank,
-            "mailDetails":         data.mail_details,
+            "serialNo":           data.serial_no,
+            "date":               _to_datetime(data.date),
+            "details":            data.details,
+            "account":            {"connect": {"id": account.id}},
+            "cardNo":             encrypt_value(data.card_no),
+            "cardExpire":         data.card_expire,
+            "cardCvc":            encrypt_value(data.card_cvc),
+            "cardDetails":        Json(data.card_details),
+            "cardVendor":         data.card_vendor,
+            "cardLimit":          data.card_limit,
+            "cardPaymentReceive": data.card_payment_received,
+            "cardReceiveBank":    data.card_receiver_bank,
+            "mailDetails":        data.mail_details,
         },
         include={"account": True},
     )
@@ -119,21 +151,24 @@ async def create_card(db: Prisma, data: CardSharingCreate):
 
 
 async def list_cards(
-    db:               Prisma,
+    db:                Prisma,
     include_sensitive: bool = False,
     serial_no:         Optional[str] = None,
     account_name:      Optional[str] = None,
     date_filter:       Optional[dict] = None,
 ):
     """
-    List cards with optional filters.
+    List all cards with optional filters.
 
-    Filters (all combinable):
-      serial_no    — case-insensitive substring search on serialNo
-      account_name — case-insensitive substring search on the related accountName
-      date_filter  — Prisma-compatible dict from DateRangeFilter.to_prisma_filter()
+    v4.1 FIX: Adds account existence guard to where clause to prevent
+    PrismaError on orphaned rows (accountId = '' sentinel from migration).
     """
-    where: dict = {}
+    # Start with the guard — excludes rows whose account relation is broken
+    where: dict = {
+        "NOT": {
+            "accountId": ""
+        }
+    }
 
     if date_filter:
         where["date"] = date_filter
@@ -142,7 +177,6 @@ async def list_cards(
         where["serialNo"] = {"contains": serial_no, "mode": "insensitive"}
 
     if account_name:
-        # Filter via the relation: cards whose linked account name matches
         where["account"] = {
             "is": {
                 "accountName": {"contains": account_name, "mode": "insensitive"}
@@ -191,11 +225,8 @@ async def update_card(db: Prisma, card_id: str, data: CardSharingUpdate):
     mapped: dict = {}
     for k, v in raw.items():
         prisma_key = _FIELD_MAP.get(k, k)
-
         if prisma_key in {"cardNo", "cardCvc"}:
             v = encrypt_value(v)
-
-        # cardDetails is Json — wrap with Json(), never use {"set": ...}
         if prisma_key == "cardDetails":
             mapped[prisma_key] = Json(v) if isinstance(v, list) else Json([])
         else:
@@ -219,13 +250,6 @@ async def delete_card(db: Prisma, card_id: str):
 # ── Screenshot management ─────────────────────────────────────────────────────
 
 async def add_screenshot(db: Prisma, card_id: str, file: UploadFile) -> dict:
-    """
-    Upload a single screenshot file to Cloudinary and append its URL
-    to the card's cardDetails list.
-
-    BUG FIX: uses {"set": new_list} for the Prisma scalar-list update (fix #2).
-    BUG FIX: relies on the async-safe cloudinary_service wrapper (fix #1).
-    """
     card = await db.cardsharing.find_unique(where={"id": card_id})
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
@@ -251,12 +275,6 @@ async def add_screenshot(db: Prisma, card_id: str, file: UploadFile) -> dict:
 async def add_screenshots_bulk(
     db: Prisma, card_id: str, files: List[UploadFile]
 ) -> dict:
-    """
-    Upload multiple screenshot files at once (used by create / update endpoints
-    when screenshots are attached directly to the form).
-
-    Returns updated total screenshot count.
-    """
     card = await db.cardsharing.find_unique(where={"id": card_id})
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
@@ -312,8 +330,7 @@ _HEADER_FONT  = Font(bold=True, color="FFFFFF", size=11)
 _ALT_ROW_FILL = PatternFill("solid", fgColor="D6E4F0")
 _CENTER       = Alignment(horizontal="center", vertical="center")
 _LEFT         = Alignment(horizontal="left",   vertical="center", wrap_text=True)
-
-_COL_WIDTHS = [12, 18, 26, 16, 14, 16, 18, 22, 12, 36, 36]
+_COL_WIDTHS   = [12, 18, 26, 16, 14, 16, 18, 22, 12, 36, 36]
 
 
 def _fmt(v) -> str:
@@ -335,12 +352,13 @@ async def export_cards(
 ) -> tuple[bytes, str]:
     """
     Build and return (xlsx_bytes, filename).
-
     SECURITY: cardNo and cardCvc are NEVER included in exports.
-    Column count and screenshot URLs are shown; actual card numbers are omitted.
+    Also applies the orphaned-row guard for consistency.
     """
+    where = _build_where(date_filter, serial_no, account_name)
+
     cards_raw = await db.cardsharing.find_many(
-        where=_build_where(date_filter, serial_no, account_name),
+        where=where,
         order={"date": "desc"},
         include={"account": True},
     )
@@ -349,18 +367,16 @@ async def export_cards(
     ws = wb.active
     ws.title = "Card Sharing"
 
-    # ── Header ────────────────────────────────────────────────────────────────
     ws.row_dimensions[1].height = 22
     for col_idx, (header, width) in enumerate(zip(_HEADERS, _COL_WIDTHS), start=1):
-        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell           = ws.cell(row=1, column=col_idx, value=header)
         cell.font      = _HEADER_FONT
         cell.fill      = _HEADER_FILL
         cell.alignment = _CENTER
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
-    # ── Data rows ─────────────────────────────────────────────────────────────
     for row_idx, card in enumerate(cards_raw, start=2):
-        fill = _ALT_ROW_FILL if row_idx % 2 == 0 else None
+        fill         = _ALT_ROW_FILL if row_idx % 2 == 0 else None
         details_list = card.cardDetails if isinstance(card.cardDetails, list) else []
 
         values = [
@@ -372,12 +388,12 @@ async def export_cards(
             float(card.cardLimit),
             float(card.cardPaymentReceive),
             _fmt(card.cardReceiveBank),
-            len(details_list),            # screenshot count — not the URLs
+            len(details_list),
             _fmt(card.details),
             _fmt(card.mailDetails),
         ]
         for col_idx, value in enumerate(values, start=1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell           = ws.cell(row=row_idx, column=col_idx, value=value)
             cell.alignment = _CENTER if col_idx in (1, 8, 9) else _LEFT
             if fill:
                 cell.fill = fill
@@ -388,8 +404,7 @@ async def export_cards(
     wb.save(buffer)
     buffer.seek(0)
 
-    filename = f"{label}.xlsx"
-    return buffer.read(), filename
+    return buffer.read(), f"{label}.xlsx"
 
 
 def _build_where(
@@ -397,7 +412,9 @@ def _build_where(
     serial_no:    Optional[str],
     account_name: Optional[str],
 ) -> dict:
-    where: dict = {}
+    # Guard: exclude orphaned rows (accountId = '' sentinel from migration)
+    where: dict = {"NOT": {"accountId": ""}}
+
     if date_filter:
         where["date"] = date_filter
     if serial_no:
