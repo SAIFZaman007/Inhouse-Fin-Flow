@@ -1,27 +1,12 @@
 """
 app/modules/pmak/service.py
 ════════════════════════════════════════════════════════════════════════════════
-v4.2 — Bug Fix
+v4.3 — New Endpoint: GET /pmak/inhouse
 
-ROOT CAUSE FIX (this version):
-  PrismaError: Could not find field at `findManyPmakAccount.transactions.order`
-
-  prisma-client-py does NOT support `order` inside a nested `include` block.
-  The `order` / `order_by` key is only valid at the TOP-LEVEL `find_many`.
-  Nested includes return all matching rows — sorting must be done in Python
-  after the data is returned.
-
-  REMOVED from include blocks:
-    "order": {"createdAt": "desc"}   ← invalid in nested include → PrismaError
-
-  ADDED after fetch:
-    txns.sort(key=lambda t: t.createdAt, reverse=True)
-    deals.sort(key=lambda d: d.createdAt, reverse=True)
-
-SECONDARY FIX:
-  Eliminated N+1 query pattern in list_accounts.
-  Previously: 1 find_many + 1 find_first PER ACCOUNT for the balance lookup.
-  Now: all latest transactions fetched in a single query, keyed by accountId.
+Added:
+  list_all_inhouse_deals() — cross-account flat deal list with combined totals,
+  full filter support (period, account_name, buyer_name, seller_name, order_status),
+  and pagination.
 ════════════════════════════════════════════════════════════════════════════════
 """
 import io
@@ -77,6 +62,23 @@ def _build_inhouse_by_status(deals: list) -> dict:
     return result
 
 
+def _serialize_inhouse_with_account(d) -> dict:
+    """Serialise a PmakInhouse row that was fetched with include={"account": True}."""
+    return {
+        "id":          d.id,
+        "accountId":   d.accountId,
+        "accountName": d.account.accountName if d.account else "",
+        "date":        d.date.date() if hasattr(d.date, "date") else d.date,
+        "details":     d.details,
+        "buyerName":   d.buyerName,
+        "sellerName":  d.sellerName,
+        "orderAmount": d.orderAmount,
+        "orderStatus": d.orderStatus if isinstance(d.orderStatus, str) else d.orderStatus.value,
+        "createdAt":   d.createdAt,
+        "updatedAt":   d.updatedAt,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Accounts
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,34 +121,26 @@ async def list_accounts(
     """
     Combined totals + paginated per-account breakdown.
 
-    v4.2 fixes:
-    1. Removed `order` from nested `include` blocks — not supported by
-       prisma-client-py. Sorting is now done in Python after the fetch.
-    2. Eliminated N+1 query: balance lookup is now a single query for all
-       accounts, not one query per account.
+    v4.2: Removed `order` from nested includes (not supported by prisma-client-py).
+          Eliminated N+1 query for balance lookups.
     """
     date_filter = filters.to_prisma_filter()
 
-    # ── Base where clause ─────────────────────────────────────────────────────
     where: dict = {"isActive": True}
     if name:
         where["accountName"] = {"contains": name, "mode": "insensitive"}
 
-    # ── Total active account count (for pagination metadata) ──────────────────
     total_accounts = await db.pmakaccount.count(where=where)
 
-    # ── Pagination ────────────────────────────────────────────────────────────
     skip = pagination.skip if pagination else 0
     take = pagination.take if pagination else 50
 
-    # ── Build nested include where (no `order` — not supported in includes) ───
-    txn_include:    dict = {}
+    txn_include:     dict = {}
     inhouse_include: dict = {}
     if date_filter:
-        txn_include    = {"where": {"date": date_filter}}
+        txn_include     = {"where": {"date": date_filter}}
         inhouse_include = {"where": {"date": date_filter}}
 
-    # ── Single query: accounts + all their period transactions + inhouse deals ─
     accounts = await db.pmakaccount.find_many(
         where=where,
         skip=skip,
@@ -154,30 +148,22 @@ async def list_accounts(
         order={"accountName": "asc"},
         include={
             "transactions": txn_include if txn_include else True,
-            # FIXED: relation name is "inhouseDeals" (matches schema.prisma)
             "inhouseDeals": inhouse_include if inhouse_include else True,
         },
     )
 
-    # ── N+1 FIX: fetch latest transaction per account in ONE query ─────────────
-    # We need the most recent remainingBalance for each account (all-time, not
-    # period-scoped). Instead of one find_first per account, we fetch all latest
-    # transactions for all accounts on this page at once, then key by accountId.
+    # N+1 FIX: single query for latest balance across all accounts on page
     account_ids = [a.id for a in accounts]
     latest_balance_map: dict[str, float] = {}
-
     if account_ids:
-        # Fetch latest transaction for each account on this page
         all_latest = await db.pmaktransaction.find_many(
             where={"accountId": {"in": account_ids}},
             order={"date": "desc"},
         )
-        # Keep only the first (latest) per accountId
         for txn in all_latest:
             if txn.accountId not in latest_balance_map:
                 latest_balance_map[txn.accountId] = float(txn.remainingBalance)
 
-    # ── Build response ────────────────────────────────────────────────────────
     combined_balance      = 0.0
     combined_credit       = 0.0
     combined_debit        = 0.0
@@ -188,17 +174,8 @@ async def list_accounts(
     account_summaries     = []
 
     for acct in accounts:
-        # Sort in Python — prisma-client-py does not support order inside include
-        txns  = sorted(
-            acct.transactions or [],
-            key=lambda t: t.createdAt,
-            reverse=True,
-        )
-        deals = sorted(
-            acct.inhouseDeals or [],
-            key=lambda d: d.createdAt,
-            reverse=True,
-        )
+        txns  = sorted(acct.transactions or [], key=lambda t: t.createdAt, reverse=True)
+        deals = sorted(acct.inhouseDeals or [], key=lambda d: d.createdAt, reverse=True)
 
         current_balance   = latest_balance_map.get(acct.id, 0.0)
         period_credit     = sum(float(t.credit)      for t in txns)
@@ -227,12 +204,11 @@ async def list_accounts(
             "transactionCount": len(txns),
             "inhouseCount":     len(deals),
             "inhouseByStatus":  inhouse_by_status,
-            # Most recent 5 — already sorted newest-first by Python sort above
             "recentTransactions": [_serialize_txn(t, acct.accountName) for t in txns[:5]],
             "recentInhouse":      [_serialize_inhouse(d, acct.accountName) for d in deals[:5]],
         })
 
-    total_pages = max(1, -(-total_accounts // take))  # ceiling division
+    total_pages = max(1, -(-total_accounts // take))
 
     return {
         "filter": filters.meta(),
@@ -314,7 +290,6 @@ async def get_account_transactions(
         take=take,
     )
 
-    # Overall latest balance (not period-scoped)
     latest = await db.pmaktransaction.find_first(
         where={"accountId": account_id},
         order={"date": "desc"},
@@ -324,11 +299,7 @@ async def get_account_transactions(
     period_debit    = sum(float(t.debit)  for t in txns)
 
     return {
-        "account":        {
-            "id":          account.id,
-            "accountName": account.accountName,
-            "isActive":    account.isActive,
-        },
+        "account":        {"id": account.id, "accountName": account.accountName, "isActive": account.isActive},
         "currentBalance": current_balance,
         "periodCredit":   period_credit,
         "periodDebit":    period_debit,
@@ -354,7 +325,6 @@ async def update_transaction_status(
     update_data: dict = {}
     if data.status is not None:
         update_data["status"] = data.status.value
-
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
@@ -374,7 +344,7 @@ async def delete_transaction(db: Prisma, transaction_id: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Inhouse Deals
+# Inhouse Deals — per-account
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def create_inhouse_deal(db: Prisma, data: PmakInhouseCreate):
@@ -433,11 +403,7 @@ async def get_account_inhouse_deals(
     total_amount      = sum(float(d.orderAmount) for d in deals)
 
     return {
-        "account": {
-            "id":          account.id,
-            "accountName": account.accountName,
-            "isActive":    account.isActive,
-        },
+        "account":         {"id": account.id, "accountName": account.accountName, "isActive": account.isActive},
         "inhouseByStatus": inhouse_by_status,
         "totalAmount":     total_amount,
         "pagination": {
@@ -447,6 +413,110 @@ async def get_account_inhouse_deals(
             "totalPages": max(1, -(-total // take)),
         },
         "deals": [_serialize_inhouse(d, account.accountName) for d in deals],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inhouse Deals — ALL accounts (NEW endpoint: GET /pmak/inhouse)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def list_all_inhouse_deals(
+    db:           Prisma,
+    filters:      DateRangeFilter,
+    pagination:   PageParams,
+    account_name: Optional[str] = None,
+    buyer_name:   Optional[str] = None,
+    seller_name:  Optional[str] = None,
+    order_status: Optional[str] = None,
+):
+    """
+    Cross-account flat deal list with combined totals.
+
+    Returns:
+      filter    — period metadata
+      totals    — totalDeals, totalAmount, byStatus (all 4 statuses with count + totalAmount)
+      pagination — page, pageSize, total, totalPages
+      deals     — paginated flat list, each row includes accountName
+
+    Filters (all combinable):
+      account_name  — case-insensitive substring on PmakAccount.accountName
+      buyer_name    — case-insensitive substring on PmakInhouse.buyerName
+      seller_name   — case-insensitive substring on PmakInhouse.sellerName
+      order_status  — exact enum: PENDING | IN_PROGRESS | COMPLETED | CANCELLED
+      period / from / to / year / month — standard DateRangeFilter
+    """
+    date_filter = filters.to_prisma_filter()
+
+    # ── Build WHERE clause ────────────────────────────────────────────────────
+    where: dict = {}
+
+    if date_filter:
+        where["date"] = date_filter
+
+    if buyer_name:
+        where["buyerName"] = {"contains": buyer_name, "mode": "insensitive"}
+
+    if seller_name:
+        where["sellerName"] = {"contains": seller_name, "mode": "insensitive"}
+
+    if order_status:
+        # Validate against known enum values — return 400 for garbage input
+        valid = {"PENDING", "IN_PROGRESS", "COMPLETED", "CANCELLED"}
+        normalised = order_status.upper()
+        if normalised not in valid:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid order_status '{order_status}'. "
+                       f"Valid values: {', '.join(sorted(valid))}",
+            )
+        where["orderStatus"] = normalised
+
+    # Always scope to active accounts; optionally filter by name
+    account_filter: dict = {"isActive": True}
+    if account_name:
+        account_filter["accountName"] = {"contains": account_name, "mode": "insensitive"}
+    where["account"] = {"is": account_filter}
+
+    # ── Count for pagination ──────────────────────────────────────────────────
+    total = await db.pmakinhouse.count(where=where)
+
+    # ── Paginated fetch ───────────────────────────────────────────────────────
+    deals = await db.pmakinhouse.find_many(
+        where=where,
+        order={"date": "desc"},
+        skip=pagination.skip,
+        take=pagination.take,
+        include={"account": True},
+    )
+
+    # ── Totals: fetch all matching deals (no pagination) for accurate sums ────
+    # We only need orderAmount + orderStatus — a lightweight projection.
+    # prisma-client-py doesn't support select projections on find_many for
+    # related models, but the fields are small scalars so this is efficient.
+    all_for_totals = await db.pmakinhouse.find_many(where=where)
+
+    total_amount       = sum(float(d.orderAmount) for d in all_for_totals)
+    combined_by_status = _empty_inhouse_by_status()
+    for d in all_for_totals:
+        key = d.orderStatus if isinstance(d.orderStatus, str) else d.orderStatus.value
+        if key in combined_by_status:
+            combined_by_status[key]["count"]       += 1
+            combined_by_status[key]["totalAmount"] += float(d.orderAmount)
+
+    return {
+        "filter": filters.meta(),
+        "totals": {
+            "totalDeals":  total,
+            "totalAmount": round(total_amount, 2),
+            "byStatus":    combined_by_status,
+        },
+        "pagination": {
+            "page":       pagination.page,
+            "pageSize":   pagination.take,
+            "total":      total,
+            "totalPages": max(1, -(-total // pagination.take)),
+        },
+        "deals": [_serialize_inhouse_with_account(d) for d in deals],
     }
 
 
@@ -464,7 +534,6 @@ async def update_inhouse_deal(
         update_data["orderStatus"] = data.order_status.value
     if data.details is not None:
         update_data["details"] = data.details
-
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
