@@ -1,9 +1,27 @@
 """
 app/modules/pmak/service.py
 ════════════════════════════════════════════════════════════════════════════════
-v4.1
+v4.2 — Bug Fix
 
-No other logic is changed.
+ROOT CAUSE FIX (this version):
+  PrismaError: Could not find field at `findManyPmakAccount.transactions.order`
+
+  prisma-client-py does NOT support `order` inside a nested `include` block.
+  The `order` / `order_by` key is only valid at the TOP-LEVEL `find_many`.
+  Nested includes return all matching rows — sorting must be done in Python
+  after the data is returned.
+
+  REMOVED from include blocks:
+    "order": {"createdAt": "desc"}   ← invalid in nested include → PrismaError
+
+  ADDED after fetch:
+    txns.sort(key=lambda t: t.createdAt, reverse=True)
+    deals.sort(key=lambda d: d.createdAt, reverse=True)
+
+SECONDARY FIX:
+  Eliminated N+1 query pattern in list_accounts.
+  Previously: 1 find_many + 1 find_first PER ACCOUNT for the balance lookup.
+  Now: all latest transactions fetched in a single query, keyed by accountId.
 ════════════════════════════════════════════════════════════════════════════════
 """
 import io
@@ -38,7 +56,7 @@ def _to_dt(d: dt_date) -> datetime:
     return datetime.combine(d, time.min)
 
 
-# ── Inhouse status summary helper ─────────────────────────────────────────────
+# ── Inhouse status summary helpers ────────────────────────────────────────────
 
 def _empty_inhouse_by_status() -> dict:
     return {
@@ -72,13 +90,13 @@ async def create_account(db: Prisma, data: PmakAccountCreate):
 
     account = await db.pmakaccount.create(data={"accountName": data.accountName})
     return {
-        "id":               account.id,
-        "accountName":      account.accountName,
-        "isActive":         account.isActive,
-        "currentBalance":   0.0,
+        "id":                account.id,
+        "accountName":       account.accountName,
+        "isActive":          account.isActive,
+        "currentBalance":    0.0,
         "totalTransactions": 0,
-        "totalInhouse":     0,
-        "inhouseByStatus":  _empty_inhouse_by_status(),
+        "totalInhouse":      0,
+        "inhouseByStatus":   _empty_inhouse_by_status(),
     }
 
 
@@ -101,8 +119,11 @@ async def list_accounts(
     """
     Combined totals + paginated per-account breakdown.
 
-    FIX: include key corrected from ``"inhouse"`` → ``"inhouseDeals"``.
-    FIX: where-filter on inhouse count also uses ``"inhouseDeals"``.
+    v4.2 fixes:
+    1. Removed `order` from nested `include` blocks — not supported by
+       prisma-client-py. Sorting is now done in Python after the fetch.
+    2. Eliminated N+1 query: balance lookup is now a single query for all
+       accounts, not one query per account.
     """
     date_filter = filters.to_prisma_filter()
 
@@ -111,36 +132,52 @@ async def list_accounts(
     if name:
         where["accountName"] = {"contains": name, "mode": "insensitive"}
 
-    # ── Total active account count ────────────────────────────────────────────
+    # ── Total active account count (for pagination metadata) ──────────────────
     total_accounts = await db.pmakaccount.count(where=where)
 
     # ── Pagination ────────────────────────────────────────────────────────────
     skip = pagination.skip if pagination else 0
     take = pagination.take if pagination else 50
 
-    # ── Fetch accounts with relations ─────────────────────────────────────────
-    # CRITICAL FIX: "inhouseDeals" is the correct relation name from schema.prisma
-    # PmakAccount.inhouseDeals → PmakInhouse[]
-    # The old code used "inhouse" which does not exist → PrismaError 500
+    # ── Build nested include where (no `order` — not supported in includes) ───
+    txn_include:    dict = {}
+    inhouse_include: dict = {}
+    if date_filter:
+        txn_include    = {"where": {"date": date_filter}}
+        inhouse_include = {"where": {"date": date_filter}}
+
+    # ── Single query: accounts + all their period transactions + inhouse deals ─
     accounts = await db.pmakaccount.find_many(
         where=where,
         skip=skip,
         take=take,
         order={"accountName": "asc"},
         include={
-            "transactions": {
-                "where":   {"date": date_filter} if date_filter else {},
-                "order":   {"createdAt": "desc"},
-            },
-            # ↓ FIXED: was "inhouse", must be "inhouseDeals"
-            "inhouseDeals": {
-                "where":   {"date": date_filter} if date_filter else {},
-                "order":   {"createdAt": "desc"},
-            },
+            "transactions": txn_include if txn_include else True,
+            # FIXED: relation name is "inhouseDeals" (matches schema.prisma)
+            "inhouseDeals": inhouse_include if inhouse_include else True,
         },
     )
 
-    # ── Cross-account aggregate totals ────────────────────────────────────────
+    # ── N+1 FIX: fetch latest transaction per account in ONE query ─────────────
+    # We need the most recent remainingBalance for each account (all-time, not
+    # period-scoped). Instead of one find_first per account, we fetch all latest
+    # transactions for all accounts on this page at once, then key by accountId.
+    account_ids = [a.id for a in accounts]
+    latest_balance_map: dict[str, float] = {}
+
+    if account_ids:
+        # Fetch latest transaction for each account on this page
+        all_latest = await db.pmaktransaction.find_many(
+            where={"accountId": {"in": account_ids}},
+            order={"date": "desc"},
+        )
+        # Keep only the first (latest) per accountId
+        for txn in all_latest:
+            if txn.accountId not in latest_balance_map:
+                latest_balance_map[txn.accountId] = float(txn.remainingBalance)
+
+    # ── Build response ────────────────────────────────────────────────────────
     combined_balance      = 0.0
     combined_credit       = 0.0
     combined_debit        = 0.0
@@ -148,37 +185,31 @@ async def list_accounts(
     combined_inhouse      = 0
     combined_inhouse_amt  = 0.0
     combined_by_status    = _empty_inhouse_by_status()
-
-    account_summaries = []
+    account_summaries     = []
 
     for acct in accounts:
-        txns   = acct.transactions   or []
-        # ↓ FIXED: was acct.inhouse — attribute on the model object also matches
-        #   the relation name defined in schema.prisma
-        deals  = acct.inhouseDeals   or []
-
-        # Balance = last remainingBalance in the period (or overall latest)
-        period_txns     = txns  # already filtered by date above
-        all_txns_latest = await db.pmaktransaction.find_first(
-            where={"accountId": acct.id},
-            order={"date": "desc"},
+        # Sort in Python — prisma-client-py does not support order inside include
+        txns  = sorted(
+            acct.transactions or [],
+            key=lambda t: t.createdAt,
+            reverse=True,
         )
-        current_balance = float(all_txns_latest.remainingBalance) if all_txns_latest else 0.0
+        deals = sorted(
+            acct.inhouseDeals or [],
+            key=lambda d: d.createdAt,
+            reverse=True,
+        )
 
-        period_credit = sum(float(t.credit) for t in period_txns)
-        period_debit  = sum(float(t.debit)  for t in period_txns)
-
+        current_balance   = latest_balance_map.get(acct.id, 0.0)
+        period_credit     = sum(float(t.credit)      for t in txns)
+        period_debit      = sum(float(t.debit)       for t in txns)
         inhouse_by_status = _build_inhouse_by_status(deals)
         inhouse_total_amt = sum(float(d.orderAmount) for d in deals)
-
-        # Recent 5 for preview
-        recent_txns   = period_txns[:5]
-        recent_inhouse = deals[:5]
 
         combined_balance      += current_balance
         combined_credit       += period_credit
         combined_debit        += period_debit
-        combined_transactions += len(period_txns)
+        combined_transactions += len(txns)
         combined_inhouse      += len(deals)
         combined_inhouse_amt  += inhouse_total_amt
 
@@ -193,34 +224,33 @@ async def list_accounts(
             "currentBalance":   current_balance,
             "periodCredit":     period_credit,
             "periodDebit":      period_debit,
-            "transactionCount": len(period_txns),
+            "transactionCount": len(txns),
             "inhouseCount":     len(deals),
             "inhouseByStatus":  inhouse_by_status,
-            "recentTransactions": [_serialize_txn(t, acct.accountName) for t in recent_txns],
-            "recentInhouse":     [_serialize_inhouse(d, acct.accountName) for d in recent_inhouse],
+            # Most recent 5 — already sorted newest-first by Python sort above
+            "recentTransactions": [_serialize_txn(t, acct.accountName) for t in txns[:5]],
+            "recentInhouse":      [_serialize_inhouse(d, acct.accountName) for d in deals[:5]],
         })
-
-    totals = {
-        "totalBalance":       combined_balance,
-        "totalCredit":        combined_credit,
-        "totalDebit":         combined_debit,
-        "totalTransactions":  combined_transactions,
-        "totalInhouse":       combined_inhouse,
-        "totalInhouseAmount": combined_inhouse_amt,
-        "inhouseByStatus":    combined_by_status,
-        "activeAccountCount": total_accounts,
-    }
 
     total_pages = max(1, -(-total_accounts // take))  # ceiling division
 
     return {
-        "filter":     filters.meta(),
-        "totals":     totals,
+        "filter": filters.meta(),
+        "totals": {
+            "totalBalance":       combined_balance,
+            "totalCredit":        combined_credit,
+            "totalDebit":         combined_debit,
+            "totalTransactions":  combined_transactions,
+            "totalInhouse":       combined_inhouse,
+            "totalInhouseAmount": combined_inhouse_amt,
+            "inhouseByStatus":    combined_by_status,
+            "activeAccountCount": total_accounts,
+        },
         "pagination": {
-            "page":        pagination.page if pagination else 1,
-            "pageSize":    take,
-            "total":       total_accounts,
-            "totalPages":  total_pages,
+            "page":       pagination.page if pagination else 1,
+            "pageSize":   take,
+            "total":      total_accounts,
+            "totalPages": total_pages,
         },
         "accounts": account_summaries,
     }
@@ -260,10 +290,10 @@ async def add_transaction(db: Prisma, data: PmakTransactionCreate):
 
 
 async def get_account_transactions(
-    db:         Prisma,
-    account_id: str,
+    db:          Prisma,
+    account_id:  str,
     date_filter: dict,
-    pagination: PageParams = None,
+    pagination:  PageParams = None,
 ):
     account = await db.pmakaccount.find_unique(where={"id": account_id})
     if not account:
@@ -284,7 +314,7 @@ async def get_account_transactions(
         take=take,
     )
 
-    # Balance = latest overall (not period-scoped)
+    # Overall latest balance (not period-scoped)
     latest = await db.pmaktransaction.find_first(
         where={"accountId": account_id},
         order={"date": "desc"},
@@ -294,7 +324,11 @@ async def get_account_transactions(
     period_debit    = sum(float(t.debit)  for t in txns)
 
     return {
-        "account":        {"id": account.id, "accountName": account.accountName, "isActive": account.isActive},
+        "account":        {
+            "id":          account.id,
+            "accountName": account.accountName,
+            "isActive":    account.isActive,
+        },
         "currentBalance": current_balance,
         "periodCredit":   period_credit,
         "periodDebit":    period_debit,
@@ -399,7 +433,11 @@ async def get_account_inhouse_deals(
     total_amount      = sum(float(d.orderAmount) for d in deals)
 
     return {
-        "account":         {"id": account.id, "accountName": account.accountName, "isActive": account.isActive},
+        "account": {
+            "id":          account.id,
+            "accountName": account.accountName,
+            "isActive":    account.isActive,
+        },
         "inhouseByStatus": inhouse_by_status,
         "totalAmount":     total_amount,
         "pagination": {
@@ -449,20 +487,20 @@ async def delete_inhouse_deal(db: Prisma, deal_id: str):
 # Excel Export — single account
 # ─────────────────────────────────────────────────────────────────────────────
 
-_HEADER_FILL  = PatternFill("solid", fgColor="1F3864")
-_HEADER_FONT  = Font(bold=True, color="FFFFFF", size=11)
-_ALT_FILL     = PatternFill("solid", fgColor="DCE6F1")
-_CENTER       = Alignment(horizontal="center", vertical="center")
-_LEFT         = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+_HEADER_FILL = PatternFill("solid", fgColor="1F3864")
+_HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
+_ALT_FILL    = PatternFill("solid", fgColor="DCE6F1")
+_CENTER      = Alignment(horizontal="center", vertical="center")
+_LEFT        = Alignment(horizontal="left",   vertical="center", wrap_text=True)
 
 
 def _apply_header(ws, headers: list[str], col_widths: list[int]) -> None:
     ws.row_dimensions[1].height = 22
     for idx, (h, w) in enumerate(zip(headers, col_widths), start=1):
-        cell            = ws.cell(row=1, column=idx, value=h)
-        cell.font       = _HEADER_FONT
-        cell.fill       = _HEADER_FILL
-        cell.alignment  = _CENTER
+        cell           = ws.cell(row=1, column=idx, value=h)
+        cell.font      = _HEADER_FONT
+        cell.fill      = _HEADER_FILL
+        cell.alignment = _CENTER
         ws.column_dimensions[get_column_letter(idx)].width = w
 
 
@@ -477,8 +515,8 @@ async def export_account_excel(
         raise HTTPException(status_code=404, detail="PMAK account not found")
 
     date_filter = filters.to_prisma_filter()
-    txn_where:   dict = {"accountId": account_id}
-    deal_where:  dict = {"accountId": account_id}
+    txn_where:  dict = {"accountId": account_id}
+    deal_where: dict = {"accountId": account_id}
     if date_filter:
         txn_where["date"]  = date_filter
         deal_where["date"] = date_filter
@@ -486,9 +524,7 @@ async def export_account_excel(
     txns  = await db.pmaktransaction.find_many(where=txn_where,  order={"date": "asc"})
     deals = await db.pmakinhouse.find_many(    where=deal_where, order={"date": "asc"})
 
-    wb = openpyxl.Workbook()
-
-    # ── Sheet 1: Ledger ───────────────────────────────────────────────────────
+    wb  = openpyxl.Workbook()
     ws1 = wb.active
     ws1.title = "Ledger"
     _apply_header(ws1, [
@@ -515,7 +551,6 @@ async def export_account_excel(
                 cell.fill = fill
     ws1.freeze_panes = "A2"
 
-    # ── Sheet 2: Inhouse Deals ────────────────────────────────────────────────
     ws2 = wb.create_sheet("Inhouse Deals")
     _apply_header(ws2, [
         "Date", "Buyer", "Seller", "Amount", "Status", "Details",
@@ -543,10 +578,8 @@ async def export_account_excel(
     buffer.seek(0)
 
     safe_name = account.accountName.replace(" ", "_").replace("/", "-")
-    meta      = filters.meta()
-    period    = meta["dateRange"]["from"] or "all"
+    period    = filters.meta()["dateRange"]["from"] or "all"
     filename  = f"pmak_{safe_name}_{period}.xlsx"
-
     return buffer.read(), filename
 
 
