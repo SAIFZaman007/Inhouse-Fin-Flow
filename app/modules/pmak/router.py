@@ -1,26 +1,26 @@
 """
 app/modules/pmak/router.py
 ════════════════════════════════════════════════════════════════════════════════
-v4.3 — Added: GET /inhouse  (all-accounts cross-account inhouse deal list)
+v4.3 — Enterprise Edition
 
 Endpoint matrix
 ───────────────────────────────────────────────────────────────────────────────
 GET    /accounts                        PMAK_EDITORS  Combined totals + all accounts
 POST   /accounts                        CEO_DIRECTOR  Create account
-DELETE /accounts/{id}                   CEO_DIRECTOR  Soft-delete
+DELETE /accounts/{id}                   CEO_DIRECTOR  Soft-delete (isActive → false)
 
-POST   /transactions                    HR_AND_ABOVE  Add transaction
-GET    /accounts/{id}/transactions      PMAK_EDITORS  Paginated transactions
-PATCH  /transactions/{id}/status        PMAK_EDITORS  Status-only PATCH
+POST   /transactions                    HR_AND_ABOVE  Add ledger transaction
+GET    /accounts/{id}/transactions      PMAK_EDITORS  Paginated transactions per account
+PATCH  /transactions/{id}/status        PMAK_EDITORS  Status-only update
 DELETE /transactions/{id}               CEO_DIRECTOR  Hard delete
 
 POST   /inhouse                         HR_AND_ABOVE  Add inhouse deal
-GET    /inhouse                         PMAK_EDITORS  ← NEW: All deals, cross-account
-GET    /accounts/{id}/inhouse           PMAK_EDITORS  Paginated deals for one account
+GET    /inhouse                         PMAK_EDITORS  All deals, cross-account + totals
+GET    /accounts/{id}/inhouse           PMAK_EDITORS  Paginated deals per account
 PATCH  /inhouse/{id}                    PMAK_EDITORS  Update status / details
 DELETE /inhouse/{id}                    CEO_DIRECTOR  Hard delete
 
-GET    /export                          PMAK_EDITORS  All-accounts Excel
+GET    /export                          PMAK_EDITORS  All-accounts Excel (multi-sheet)
 GET    /export/{account_id}             CEO_DIRECTOR  Single-account Excel
 ════════════════════════════════════════════════════════════════════════════════
 """
@@ -39,8 +39,10 @@ from app.modules.export.service import export_pmak
 
 from .schema import (
     PmakAccountCreate,
-    PmakInhouseCreate, PmakInhouseStatusUpdate,
-    PmakTransactionCreate, PmakTransactionStatusUpdate,
+    PmakInhouseCreate,
+    PmakInhouseStatusUpdate,
+    PmakTransactionCreate,
+    PmakTransactionStatusUpdate,
 )
 from .service import (
     add_transaction,
@@ -53,7 +55,7 @@ from .service import (
     get_account_inhouse_deals,
     get_account_transactions,
     list_accounts,
-    list_all_inhouse_deals,   # ← NEW
+    list_all_inhouse_deals,
     update_inhouse_deal,
     update_transaction_status,
 )
@@ -80,29 +82,23 @@ def _xlsx(data: bytes, filename: str) -> Response:
 @router.get(
     "/accounts",
     summary="All PMAK accounts — combined totals + per-account breakdown",
-    description="""
-Returns a **single response** containing:
-
-- **Combined totals** across all active accounts:
-  `totalBalance`, `totalCredit`, `totalDebit`, `totalTransactions`,
-  `totalInhouse`, `totalInhouseAmount`, `inhouseByStatus`
-  (`PENDING`, `IN_PROGRESS`, `COMPLETED`, `CANCELLED` — each with `count`
-  and `totalAmount`), `activeAccountCount`.
-- **Paginated per-account breakdown** (50 accounts per page by default),
-  each including current balance, period credit/debit, transaction + inhouse
-  counts, status breakdown, and the 5 most recent items per type.
-
-Use `?name=` for a case-insensitive partial search on account name.
-
-Period params: `daily` | `weekly` | `monthly` | `yearly` | `all` (default).
-    """,
+    description=(
+        "Returns combined totals across all active accounts "
+        "(`totalBalance`, `totalCredit`, `totalDebit`, `totalTransactions`, "
+        "`totalInhouse`, `totalInhouseAmount`, `inhouseByStatus`, `activeAccountCount`) "
+        "together with a paginated per-account breakdown. "
+        "Each account includes its current balance, period credit/debit, "
+        "transaction and inhouse counts, status breakdown, and the 5 most recent items. "
+        "Use `?name=` for a case-insensitive partial search on account name. "
+        "Supported periods: `daily` | `weekly` | `monthly` | `yearly` | `all`."
+    ),
 )
 async def get_accounts(
     filters:    DateRangeFilter = Depends(),
     pagination: PageParams      = Depends(),
     name: Annotated[
         Optional[str],
-        Query(description="Case-insensitive partial search on account name."),
+        Query(description="Case-insensitive partial match on account name."),
     ] = None,
     db: Prisma = Depends(get_db),
     _=Depends(PMAK_EDITORS),
@@ -114,11 +110,13 @@ async def get_accounts(
     "/accounts",
     status_code=201,
     summary="Create a PMAK account",
-    description="""
-Creates a new PMAK ledger account.
-
-**Required:** `accountName`  |  **Access:** CEO and Director only.
-    """,
+    description=(
+        "Creates a new PMAK ledger account. "
+        "The response includes a zero-balance breakdown "
+        "(`currentBalance`, `totalTransactions`, `totalInhouse`, `inhouseByStatus`) "
+        "ready for data entry. "
+        "**Required:** `accountName` — **Access:** CEO and Director only."
+    ),
 )
 async def add_account(
     body: PmakAccountCreate,
@@ -131,7 +129,13 @@ async def add_account(
 @router.delete(
     "/accounts/{account_id}",
     status_code=204,
-    summary="Soft-delete a PMAK account (sets isActive = false)",
+    summary="Soft-delete a PMAK account",
+    description=(
+        "Sets `isActive = false` on the account. "
+        "All transactions and inhouse deals are preserved. "
+        "The account is excluded from all future list and totals queries. "
+        "**Access:** CEO and Director only."
+    ),
 )
 async def remove_account(
     account_id: str,
@@ -149,11 +153,11 @@ async def remove_account(
     "/transactions",
     status_code=201,
     summary="Add a PMAK ledger transaction",
-    description="""
-**`account_name`** — human-readable account name (case-insensitive lookup).
-
-**Access:** HR and above (BDev may NOT create transactions).
-    """,
+    description=(
+        "Adds a double-entry ledger row to the specified PMAK account. "
+        "`account_name` is resolved case-insensitively — staff never handle internal UUIDs. "
+        "**Access:** HR and above. BDev may not create transactions."
+    ),
 )
 async def add_transaction_entry(
     body: PmakTransactionCreate,
@@ -165,12 +169,13 @@ async def add_transaction_entry(
 
 @router.get(
     "/accounts/{account_id}/transactions",
-    summary="Transactions for one PMAK account (period-aware, paginated)",
-    description="""
-Returns paginated ledger transactions for a single account.
-Each row includes **`accountName`**. Response also contains `currentBalance`,
-`periodCredit`, `periodDebit`. Default: 50 per page, newest first.
-    """,
+    summary="Transactions for one PMAK account",
+    description=(
+        "Returns paginated ledger transactions for a single account, newest first. "
+        "Each row includes `accountName` for client convenience. "
+        "Response envelope also contains `currentBalance`, `periodCredit`, and `periodDebit`. "
+        "Default page size: 50. Supports all standard period filters."
+    ),
 )
 async def account_transactions(
     account_id: str,
@@ -186,11 +191,13 @@ async def account_transactions(
 
 @router.patch(
     "/transactions/{transaction_id}/status",
-    summary="Update transaction status — BDev, HR, CEO, Director",
-    description="""
-Restricted PATCH — only `status` may be updated.
-BDev entry-point: can mark CLEARED / ON_HOLD / REJECTED / PENDING.
-    """,
+    summary="Update transaction status",
+    description=(
+        "Restricted PATCH — only the `status` field may be changed. "
+        "This is the BDev entry-point; no financial fields are exposed. "
+        "Valid values: `PENDING` | `CLEARED` | `ON_HOLD` | `REJECTED`. "
+        "**Access:** All PMAK roles (BDev, HR, CEO, Director)."
+    ),
 )
 async def patch_transaction_status(
     transaction_id: str,
@@ -204,7 +211,11 @@ async def patch_transaction_status(
 @router.delete(
     "/transactions/{transaction_id}",
     status_code=204,
-    summary="Delete a PMAK transaction (hard delete — CEO/Director only)",
+    summary="Delete a PMAK transaction (hard delete)",
+    description=(
+        "Permanently removes the transaction. This action is irreversible. "
+        "**Access:** CEO and Director only."
+    ),
 )
 async def remove_transaction(
     transaction_id: str,
@@ -222,13 +233,11 @@ async def remove_transaction(
     "/inhouse",
     status_code=201,
     summary="Add a PMAK inhouse deal",
-    description="""
-Creates a new buyer/seller inhouse deal for the specified PMAK account.
-
-**`account_name`** — human-readable account name (case-insensitive lookup).
-
-**Access:** HR and above (BDev may NOT create inhouse deals).
-    """,
+    description=(
+        "Creates a new buyer/seller inhouse deal for the specified PMAK account. "
+        "`account_name` is resolved case-insensitively — staff never need internal UUIDs. "
+        "**Access:** HR and above. BDev may not create inhouse deals."
+    ),
 )
 async def add_inhouse_deal(
     body: PmakInhouseCreate,
@@ -241,79 +250,39 @@ async def add_inhouse_deal(
 @router.get(
     "/inhouse",
     summary="All PMAK inhouse deals — combined totals + cross-account deal list",
-    description="""
-Returns **all inhouse deals across every active PMAK account** in a single,
-paginated response — mirroring the structure of the Excel export image.
-
-**Response shape:**
-
-```
-{
-  "filter":     { "period": "all", "dateRange": { "from": null, "to": null } },
-  "totals": {
-    "totalDeals":  8,
-    "totalAmount": 208000.00,
-    "byStatus": {
-      "PENDING":     { "count": 1, "totalAmount": 9500.00  },
-      "IN_PROGRESS": { "count": 3, "totalAmount": 43500.00 },
-      "COMPLETED":   { "count": 4, "totalAmount": 155000.00 },
-      "CANCELLED":   { "count": 0, "totalAmount": 0.00     }
-    }
-  },
-  "pagination": { "page": 1, "pageSize": 50, "total": 8, "totalPages": 1 },
-  "deals": [
-    {
-      "id": "...", "accountId": "...", "accountName": "PMAK Main",
-      "date": "2026-03-11", "details": "WordPress plugin dev -- CLT-008",
-      "buyerName": "DevShop Ltd", "sellerName": "maktech_dev",
-      "orderAmount": "9500.00", "orderStatus": "PENDING",
-      "createdAt": "...", "updatedAt": "..."
-    },
-    ...
-  ]
-}
-```
-
-**Filters (all combinable):**
-
-| Parameter      | Type   | Description |
-|----------------|--------|-------------|
-| `period`       | string | `daily` \\| `weekly` \\| `monthly` \\| `yearly` \\| `all` |
-| `from`         | date   | Range start (YYYY-MM-DD) — overrides period |
-| `to`           | date   | Range end (YYYY-MM-DD) — overrides period |
-| `year`         | int    | Year for monthly/yearly period |
-| `month`        | int    | Month (1–12) for monthly period |
-| `account_name` | string | Case-insensitive substring search on PMAK account name |
-| `buyer_name`   | string | Case-insensitive substring search on buyer |
-| `seller_name`  | string | Case-insensitive substring search on seller |
-| `order_status` | string | `PENDING` \\| `IN_PROGRESS` \\| `COMPLETED` \\| `CANCELLED` |
-| `page`         | int    | Page number (default: 1) |
-| `page_size`    | int    | Items per page (default: 50, max: 100) |
-
-**Totals are always computed across ALL matching deals** — not just the current page.
-
-**Access:** All PMAK roles (BDev, HR, CEO, Director).
-    """,
+    description=(
+        "Returns all inhouse deals across every active PMAK account "
+        "in a single paginated response. "
+        "The `totals` block covers `totalDeals`, `totalAmount`, and a `byStatus` "
+        "breakdown (`PENDING`, `IN_PROGRESS`, `COMPLETED`, `CANCELLED` — "
+        "each with `count` and `totalAmount`). "
+        "Totals are always computed across **all** matching deals, not just the current page. "
+        "Each deal row includes `accountName`, `date`, `details`, "
+        "`buyerName`, `sellerName`, `orderAmount`, and `orderStatus`. "
+        "**Filters:** `period`, `from`, `to`, `year`, `month`, "
+        "`account_name`, `buyer_name`, `seller_name`, `order_status` — all combinable. "
+        "**Access:** All PMAK roles (BDev, HR, CEO, Director)."
+    ),
 )
 async def get_all_inhouse_deals(
     filters:    DateRangeFilter = Depends(),
     pagination: PageParams      = Depends(),
     account_name: Annotated[
         Optional[str],
-        Query(description="Case-insensitive substring search on PMAK account name."),
+        Query(description="Case-insensitive substring match on PMAK account name."),
     ] = None,
     buyer_name: Annotated[
         Optional[str],
-        Query(description="Case-insensitive substring search on buyer name."),
+        Query(description="Case-insensitive substring match on buyer name."),
     ] = None,
     seller_name: Annotated[
         Optional[str],
-        Query(description="Case-insensitive substring search on seller name."),
+        Query(description="Case-insensitive substring match on seller name."),
     ] = None,
     order_status: Annotated[
         Optional[str],
         Query(
-            description="Filter by deal status: PENDING | IN_PROGRESS | COMPLETED | CANCELLED",
+            description="Exact status filter: PENDING | IN_PROGRESS | COMPLETED | CANCELLED",
             pattern="^(PENDING|IN_PROGRESS|COMPLETED|CANCELLED)$",
         ),
     ] = None,
@@ -333,13 +302,14 @@ async def get_all_inhouse_deals(
 
 @router.get(
     "/accounts/{account_id}/inhouse",
-    summary="Inhouse deals for one PMAK account (period-aware, paginated)",
-    description="""
-Returns paginated inhouse deals for a single account.
-
-Each row includes **`accountName`**. Response also contains a full
-`inhouseByStatus` breakdown. Default: 50 deals per page, newest first.
-    """,
+    summary="Inhouse deals for one PMAK account",
+    description=(
+        "Returns paginated inhouse deals for a single account, newest first. "
+        "Each row includes `accountName`. "
+        "Response envelope includes a full `inhouseByStatus` breakdown "
+        "and `totalAmount` for the selected period. "
+        "Default page size: 50. Supports all standard period filters."
+    ),
 )
 async def account_inhouse_deals(
     account_id: str,
@@ -355,7 +325,12 @@ async def account_inhouse_deals(
 
 @router.patch(
     "/inhouse/{deal_id}",
-    summary="Update inhouse deal status / details — BDev, HR, CEO, Director",
+    summary="Update inhouse deal status or details",
+    description=(
+        "Partial update — only `order_status` and/or `details` may be changed. "
+        "Valid statuses: `PENDING` | `IN_PROGRESS` | `COMPLETED` | `CANCELLED`. "
+        "**Access:** All PMAK roles (BDev, HR, CEO, Director)."
+    ),
 )
 async def patch_inhouse_deal(
     deal_id: str,
@@ -369,7 +344,11 @@ async def patch_inhouse_deal(
 @router.delete(
     "/inhouse/{deal_id}",
     status_code=204,
-    summary="Delete a PMAK inhouse deal (hard delete — CEO/Director only)",
+    summary="Delete a PMAK inhouse deal (hard delete)",
+    description=(
+        "Permanently removes the inhouse deal. This action is irreversible. "
+        "**Access:** CEO and Director only."
+    ),
 )
 async def remove_inhouse_deal(
     deal_id: str,
@@ -385,14 +364,14 @@ async def remove_inhouse_deal(
 
 @router.get(
     "/export",
-    summary="Export all PMAK accounts to Excel (period-aware, multi-sheet)",
-    description="""
-Downloads a multi-sheet Excel workbook covering all active PMAK accounts.
-
-Supports `period` / `from` / `to` / `year` / `month` / `export_date`.
-
-**Access:** All PMAK roles (PMAK_EDITORS).
-    """,
+    summary="Export all PMAK accounts to Excel",
+    description=(
+        "Downloads a multi-sheet Excel workbook covering all active PMAK accounts "
+        "for the selected period. One sheet per account — each containing "
+        "its ledger transactions and inhouse deals. "
+        "Supports `period`, `from`, `to`, `year`, `month`, and `export_date` params. "
+        "**Access:** All PMAK roles (BDev, HR, CEO, Director)."
+    ),
 )
 async def export_all_accounts(
     params: ExportQueryParams = Depends(),
@@ -405,14 +384,14 @@ async def export_all_accounts(
 
 @router.get(
     "/export/{account_id}",
-    summary="Export a single PMAK account to Excel (period-aware)",
-    description="""
-Downloads a two-sheet Excel workbook for **one account**:
-- **Sheet 1** — Ledger Transactions
-- **Sheet 2** — Inhouse Deals
-
-**Access:** CEO and Director only.
-    """,
+    summary="Export a single PMAK account to Excel",
+    description=(
+        "Downloads a two-sheet Excel workbook for one account: "
+        "**Sheet 1** — Ledger Transactions (date, details, account from/to, debit, credit, balance, status). "
+        "**Sheet 2** — Inhouse Deals (date, buyer, seller, amount, status, details). "
+        "Supports all standard period filters. "
+        "**Access:** CEO and Director only."
+    ),
 )
 async def export_single_account(
     account_id: str,

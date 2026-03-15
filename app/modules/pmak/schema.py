@@ -1,31 +1,17 @@
 """
 app/modules/pmak/schema.py
 ════════════════════════════════════════════════════════════════════════════════
-v4 — Enterprise Edition
+v4.3 — Enterprise Edition
 
-Changes vs v3
-─────────────
-PmakTransactionCreate
-  • ``account_id`` → ``account_name``  (case-insensitive server-side lookup).
+Request/response contracts for all PMAK endpoints.
 
-PmakInhouseCreate
-  • ``account_id`` → ``account_name``  (same rationale).
-
-PmakTransactionResponse
-  • ``accountName`` field added.
-
-PmakInhouseResponse
-  • ``accountName`` field added.
-
-PmakAccountTotals / PmakListResponse  (NEW)
-  • Top-level combined-totals envelope for GET /accounts.
-  • Includes ledger balance, inhouse deal counts + amounts by status.
-
-Security design (unchanged)
-────────────────────────────
-• PmakTransactionStatusUpdate — the ONLY payload BDev may PATCH.
-  Deliberately narrow: no financial fields exposed to BDev role.
-• status uses typed PmakStatus enum; orderStatus uses InhouseOrderStatus.
+Key design decisions
+────────────────────
+• ``account_name`` (not ``account_id``) — server resolves to internal ID.
+  Staff never handle UUIDs in API payloads.
+• ``PmakTransactionStatusUpdate`` is deliberately narrow (status only) —
+  the BDev role may PATCH status but must never touch financial fields.
+• ``PmakAllInhouseResponse`` — new envelope for GET /inhouse (cross-account).
 ════════════════════════════════════════════════════════════════════════════════
 """
 from datetime import date, datetime
@@ -38,11 +24,17 @@ from app.shared.constants import InhouseOrderStatus, PmakStatus
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Account
+# Accounts
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PmakAccountCreate(BaseModel):
-    accountName: str = Field(..., min_length=1, max_length=100)
+    accountName: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Unique display name for this PMAK ledger account.",
+        examples=["PMAK Main", "PMAK Operations"],
+    )
 
 
 class PmakAccountResponse(BaseModel):
@@ -55,42 +47,78 @@ class PmakAccountResponse(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ledger Transaction
+# Ledger Transactions
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PmakTransactionCreate(BaseModel):
-    """
-    Full transaction creation — HR_AND_ABOVE.
+    """Full transaction creation payload — HR and above only."""
 
-    ``account_name`` replaced ``account_id`` in v4 for user-friendliness.
-    """
-    account_name:      str            = Field(
-        ..., min_length=1, max_length=100,
-        description="Exact PMAK account name (case-insensitive match).",
+    account_name: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="PMAK account name (case-insensitive). Resolved to ID server-side.",
+        examples=["PMAK Main"],
     )
-    date:              date
-    details:           str
-    accountFrom:       Optional[str]  = None
-    accountTo:         Optional[str]  = None
-    debit:             Decimal        = Field(default=Decimal("0"), ge=0)
-    credit:            Decimal        = Field(default=Decimal("0"), ge=0)
-    remaining_balance: Decimal
-    status:            PmakStatus     = PmakStatus.PENDING
+    date: date = Field(
+        ...,
+        description="Transaction date (YYYY-MM-DD).",
+        examples=["2026-03-15"],
+    )
+    details: str = Field(
+        ...,
+        description="Free-text description of this ledger entry.",
+        examples=["Payment received from client – INV-042"],
+    )
+    accountFrom: Optional[str] = Field(
+        None,
+        description="Source account or entity name.",
+        examples=["Payoneer Main"],
+    )
+    accountTo: Optional[str] = Field(
+        None,
+        description="Destination account or entity name.",
+        examples=["PMAK Operations"],
+    )
+    debit: Decimal = Field(
+        default=Decimal("0"),
+        ge=0,
+        description="Debit amount in USD. Defaults to 0.",
+        examples=[500.00],
+    )
+    credit: Decimal = Field(
+        default=Decimal("0"),
+        ge=0,
+        description="Credit amount in USD. Defaults to 0.",
+        examples=[1200.00],
+    )
+    remaining_balance: Decimal = Field(
+        ...,
+        description="Running balance after this entry, in USD.",
+        examples=[8750.00],
+    )
+    status: PmakStatus = Field(
+        default=PmakStatus.PENDING,
+        description="Initial transaction status. Defaults to PENDING.",
+    )
 
 
 class PmakTransactionStatusUpdate(BaseModel):
     """
-    Restricted PATCH — the ONLY payload BDev may PATCH.
-    Deliberately narrow: BDev cannot touch financial figures.
+    Restricted PATCH payload — BDev entry-point.
+    Only `status` is exposed. Financial fields are intentionally absent.
     """
-    status: Optional[PmakStatus] = None
+
+    status: Optional[PmakStatus] = Field(
+        None,
+        description="New status: PENDING | CLEARED | ON_HOLD | REJECTED.",
+    )
 
 
 class PmakTransactionResponse(BaseModel):
-    """Full transaction row — includes ``accountName`` for client convenience."""
     id:               str
     accountId:        str
-    accountName:      str           # ← v4
+    accountName:      str
     date:             date
     details:          str
     accountFrom:      Optional[str]
@@ -106,38 +134,69 @@ class PmakTransactionResponse(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Inhouse Deal
+# Inhouse Deals
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PmakInhouseCreate(BaseModel):
-    """
-    Inhouse deal creation — HR_AND_ABOVE.
+    """Inhouse deal creation payload — HR and above only."""
 
-    ``account_name`` replaced ``account_id`` in v4.
-    """
-    account_name: str            = Field(
-        ..., min_length=1, max_length=100,
-        description="Exact PMAK account name (case-insensitive match).",
+    account_name: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="PMAK account name (case-insensitive). Resolved to ID server-side.",
+        examples=["PMAK Main"],
     )
-    date:         date
-    details:      Optional[str]  = None
-    buyer_name:   str
-    seller_name:  str
-    order_amount: Decimal        = Field(..., gt=0)
-    order_status: InhouseOrderStatus = InhouseOrderStatus.PENDING
+    date: date = Field(
+        ...,
+        description="Deal date (YYYY-MM-DD).",
+        examples=["2026-03-15"],
+    )
+    details: Optional[str] = Field(
+        None,
+        description="Optional notes or reference code for this deal.",
+        examples=["UI/UX design package – CLT-001"],
+    )
+    buyer_name: str = Field(
+        ...,
+        description="Name of the buyer in this deal.",
+        examples=["Rahim Textiles"],
+    )
+    seller_name: str = Field(
+        ...,
+        description="Name of the seller / service provider in this deal.",
+        examples=["maktech_design"],
+    )
+    order_amount: Decimal = Field(
+        ...,
+        gt=0,
+        description="Deal value in USD. Must be greater than 0.",
+        examples=[18000.00],
+    )
+    order_status: InhouseOrderStatus = Field(
+        default=InhouseOrderStatus.PENDING,
+        description="Initial deal status. Defaults to PENDING.",
+    )
 
 
 class PmakInhouseStatusUpdate(BaseModel):
-    """Update deal status / details — PMAK_EDITORS (BDev + HR + CEO + DIRECTOR)."""
-    order_status: Optional[InhouseOrderStatus] = None
-    details:      Optional[str]                = None
+    """Partial update payload for an inhouse deal — all PMAK roles."""
+
+    order_status: Optional[InhouseOrderStatus] = Field(
+        None,
+        description="New status: PENDING | IN_PROGRESS | COMPLETED | CANCELLED.",
+    )
+    details: Optional[str] = Field(
+        None,
+        description="Updated notes or reference code.",
+        examples=["SEO audit + 3-month plan – CLT-003"],
+    )
 
 
 class PmakInhouseResponse(BaseModel):
-    """Full inhouse deal row — includes ``accountName``."""
     id:          str
     accountId:   str
-    accountName: str           # ← v4
+    accountName: str
     date:        date
     details:     Optional[str]
     buyerName:   str
@@ -152,12 +211,37 @@ class PmakInhouseResponse(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Combined-totals envelope  GET /accounts
+# GET /inhouse — cross-account deal list
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PmakInhouseStatusBreakdown(BaseModel):
+    """Count and total amount for one order status."""
+    count:       int
+    totalAmount: float
+
+
+class PmakInhouseTotals(BaseModel):
+    """Aggregate totals across all matching inhouse deals."""
+    totalDeals:  int
+    totalAmount: float
+    byStatus: Dict[str, PmakInhouseStatusBreakdown]  # keys: PENDING | IN_PROGRESS | COMPLETED | CANCELLED
+
+
+class PmakAllInhouseResponse(BaseModel):
+    """Envelope returned by GET /pmak/inhouse."""
+    filter:     Dict[str, Any]
+    totals:     PmakInhouseTotals
+    pagination: Dict[str, Any]
+    deals:      List[PmakInhouseResponse]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /accounts — combined account list
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PmakInhouseByStatus(BaseModel):
-    """Inhouse deal counts + amounts grouped by order status."""
-    PENDING:     Dict[str, Any]   # {count, totalAmount}
+    """Inhouse deal counts and amounts grouped by order status."""
+    PENDING:     Dict[str, Any]
     IN_PROGRESS: Dict[str, Any]
     COMPLETED:   Dict[str, Any]
     CANCELLED:   Dict[str, Any]
@@ -165,18 +249,18 @@ class PmakInhouseByStatus(BaseModel):
 
 class PmakTotals(BaseModel):
     """Cross-account aggregate for the selected period."""
-    totalBalance:       float   # Σ latest remainingBalance per account
-    totalCredit:        float   # Σ credit transactions in period
-    totalDebit:         float   # Σ debit transactions in period
+    totalBalance:       float
+    totalCredit:        float
+    totalDebit:         float
     totalTransactions:  int
-    totalInhouse:       int     # total inhouse deals in period
-    totalInhouseAmount: float   # Σ orderAmount in period
+    totalInhouse:       int
+    totalInhouseAmount: float
     inhouseByStatus:    PmakInhouseByStatus
     activeAccountCount: int
 
 
 class PmakAccountSummary(BaseModel):
-    """Per-account row in the list response."""
+    """Per-account row inside the GET /accounts response."""
     id:                  str
     accountName:         str
     isActive:            bool
@@ -203,7 +287,7 @@ class PmakListResponse(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PmakAccountTransactionResponse(BaseModel):
-    """Paginated transactions for one account with metadata."""
+    """Envelope for GET /accounts/{id}/transactions."""
     account:        PmakAccountResponse
     currentBalance: float
     periodCredit:   float
@@ -213,9 +297,9 @@ class PmakAccountTransactionResponse(BaseModel):
 
 
 class PmakAccountInhouseResponse(BaseModel):
-    """Paginated inhouse deals for one account with status summary."""
-    account:          PmakAccountResponse
-    inhouseByStatus:  PmakInhouseByStatus
-    totalAmount:      float
-    pagination:       Dict[str, Any]
-    deals:            List[PmakInhouseResponse]
+    """Envelope for GET /accounts/{id}/inhouse."""
+    account:         PmakAccountResponse
+    inhouseByStatus: PmakInhouseByStatus
+    totalAmount:     float
+    pagination:      Dict[str, Any]
+    deals:           List[PmakInhouseResponse]
