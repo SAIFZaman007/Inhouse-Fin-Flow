@@ -147,7 +147,7 @@ class PayoneerTransactionUpdate(BaseModel):
     Sending an empty body ``{}`` is accepted and returns the current row unchanged
     (idempotent).
     """
-    date:              Optional[date]    = Field(default=None)   # v4 fix: was incorrectly required
+    date:              date
     details:           Optional[str]     = Field(default=None, min_length=1)
     accountFrom:       Optional[str]     = None
     accountTo:         Optional[str]     = None

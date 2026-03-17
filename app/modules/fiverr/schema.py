@@ -196,7 +196,7 @@ class FiverrOrderUpdate(BaseModel):
 
     Sending an empty body ``{}`` returns the current order unchanged (idempotent).
     """
-    date:       Optional[date]    = Field(default=None)   # v7 fix: was incorrectly required
+    date:       date
     buyer_name: Optional[str]     = Field(default=None, min_length=1)
     order_id:   Optional[str]     = Field(default=None, min_length=1)
     amount:     Optional[Decimal] = Field(default=None, gt=0)
