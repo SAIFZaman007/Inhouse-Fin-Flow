@@ -1,11 +1,19 @@
 """
 app/modules/pmak/schema.py
 ════════════════════════════════════════════════════════════════════════════════
-v4.4 — Enterprise Edition  (Pydantic v2 compatibility fix)
+v4.5 — Enterprise Edition
 
+Fix: `datetime.date` is now imported as `Date` to prevent Pydantic v2 from
+     confusing the *field name* ``date`` with the *type annotation* ``date``
+     during class construction (PydanticUserError / unevaluable-type-annotation).
+     All four affected classes are patched:
+       • PmakTransactionCreate   (field: date)
+       • PmakTransactionResponse (field: date)
+       • PmakInhouseCreate       (field: date)
+       • PmakInhouseResponse     (field: date)
 ════════════════════════════════════════════════════════════════════════════════
 """
-from datetime import date, datetime
+from datetime import date as Date, datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
@@ -14,7 +22,7 @@ from pydantic import BaseModel, Field
 # ── Enum imports — always use the prisma-generated source directly ────────────
 # prisma-client-py generates these from schema.prisma into prisma/enums.py.
 # Never re-export them through app.shared.constants — that indirection was the
-# root cause of the PydanticUserError crash.
+# root cause of the previous PydanticUserError crash.
 from prisma.enums import InhouseOrderStatus, PmakStatus
 
 
@@ -37,8 +45,7 @@ class PmakAccountResponse(BaseModel):
     accountName: str
     isActive:    bool
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,7 +62,7 @@ class PmakTransactionCreate(BaseModel):
         description="PMAK account name (case-insensitive). Resolved to ID server-side.",
         examples=["PMAK Main"],
     )
-    date: date = Field(
+    date: Date = Field(                          # ← `Date` alias; field name safe
         ...,
         description="Transaction date (YYYY-MM-DD).",
         examples=["2026-03-15"],
@@ -114,7 +121,7 @@ class PmakTransactionResponse(BaseModel):
     id:               str
     accountId:        str
     accountName:      str
-    date:             date
+    date:             Date                       # ← `Date` alias
     details:          str
     accountFrom:      Optional[str]
     accountTo:        Optional[str]
@@ -124,8 +131,7 @@ class PmakTransactionResponse(BaseModel):
     status:           PmakStatus
     createdAt:        datetime
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -142,7 +148,7 @@ class PmakInhouseCreate(BaseModel):
         description="PMAK account name (case-insensitive). Resolved to ID server-side.",
         examples=["PMAK Main"],
     )
-    date: date = Field(
+    date: Date = Field(                          # ← `Date` alias
         ...,
         description="Deal date (YYYY-MM-DD).",
         examples=["2026-03-15"],
@@ -192,7 +198,7 @@ class PmakInhouseResponse(BaseModel):
     id:          str
     accountId:   str
     accountName: str
-    date:        date
+    date:        Date                            # ← `Date` alias
     details:     Optional[str]
     buyerName:   str
     sellerName:  str
@@ -201,8 +207,7 @@ class PmakInhouseResponse(BaseModel):
     createdAt:   datetime
     updatedAt:   datetime
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
