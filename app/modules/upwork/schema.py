@@ -147,7 +147,7 @@ class UpworkOrderUpdate(BaseModel):
     server-side (amount × 0.90) — clients must never send ``afterUpwork``.
     ``order_id`` uniqueness is enforced server-side on rename.
     """
-    date:        Optional[date]    = None
+    date:        date
     client_name: Optional[str]     = Field(default=None, min_length=1)
     order_id:    Optional[str]     = Field(default=None, min_length=1)
     amount:      Optional[Decimal] = Field(default=None, gt=0)

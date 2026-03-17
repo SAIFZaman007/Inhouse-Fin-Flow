@@ -152,7 +152,7 @@ class FiverrOrderUpdate(BaseModel):
     server-side (amount × 0.80) — clients must never send ``afterFiverr``.
     ``order_id`` uniqueness is enforced server-side on rename.
     """
-    date:       Optional[date]    = None
+    date:       date
     buyer_name: Optional[str]     = Field(default=None, min_length=1)
     order_id:   Optional[str]     = Field(default=None, min_length=1)
     amount:     Optional[Decimal] = Field(default=None, gt=0)

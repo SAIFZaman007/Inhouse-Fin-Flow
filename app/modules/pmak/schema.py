@@ -1,17 +1,8 @@
 """
 app/modules/pmak/schema.py
 ════════════════════════════════════════════════════════════════════════════════
-v4.3 — Enterprise Edition
+v4.4 — Enterprise Edition  (Pydantic v2 compatibility fix)
 
-Request/response contracts for all PMAK endpoints.
-
-Key design decisions
-────────────────────
-• ``account_name`` (not ``account_id``) — server resolves to internal ID.
-  Staff never handle UUIDs in API payloads.
-• ``PmakTransactionStatusUpdate`` is deliberately narrow (status only) —
-  the BDev role may PATCH status but must never touch financial fields.
-• ``PmakAllInhouseResponse`` — new envelope for GET /inhouse (cross-account).
 ════════════════════════════════════════════════════════════════════════════════
 """
 from datetime import date, datetime
@@ -20,7 +11,11 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from app.shared.constants import InhouseOrderStatus, PmakStatus
+# ── Enum imports — always use the prisma-generated source directly ────────────
+# prisma-client-py generates these from schema.prisma into prisma/enums.py.
+# Never re-export them through app.shared.constants — that indirection was the
+# root cause of the PydanticUserError crash.
+from prisma.enums import InhouseOrderStatus, PmakStatus
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,12 +66,12 @@ class PmakTransactionCreate(BaseModel):
         examples=["Payment received from client – INV-042"],
     )
     accountFrom: Optional[str] = Field(
-        None,
+        default=None,
         description="Source account or entity name.",
         examples=["Payoneer Main"],
     )
     accountTo: Optional[str] = Field(
-        None,
+        default=None,
         description="Destination account or entity name.",
         examples=["PMAK Operations"],
     )
@@ -106,11 +101,11 @@ class PmakTransactionCreate(BaseModel):
 class PmakTransactionStatusUpdate(BaseModel):
     """
     Restricted PATCH payload — BDev entry-point.
-    Only `status` is exposed. Financial fields are intentionally absent.
+    Only ``status`` is exposed. Financial fields are intentionally absent.
     """
 
     status: Optional[PmakStatus] = Field(
-        None,
+        default=None,
         description="New status: PENDING | CLEARED | ON_HOLD | REJECTED.",
     )
 
@@ -153,7 +148,7 @@ class PmakInhouseCreate(BaseModel):
         examples=["2026-03-15"],
     )
     details: Optional[str] = Field(
-        None,
+        default=None,
         description="Optional notes or reference code for this deal.",
         examples=["UI/UX design package – CLT-001"],
     )
@@ -183,11 +178,11 @@ class PmakInhouseStatusUpdate(BaseModel):
     """Partial update payload for an inhouse deal — all PMAK roles."""
 
     order_status: Optional[InhouseOrderStatus] = Field(
-        None,
+        default=None,
         description="New status: PENDING | IN_PROGRESS | COMPLETED | CANCELLED.",
     )
     details: Optional[str] = Field(
-        None,
+        default=None,
         description="Updated notes or reference code.",
         examples=["SEO audit + 3-month plan – CLT-003"],
     )
@@ -224,7 +219,7 @@ class PmakInhouseTotals(BaseModel):
     """Aggregate totals across all matching inhouse deals."""
     totalDeals:  int
     totalAmount: float
-    byStatus: Dict[str, PmakInhouseStatusBreakdown]  # keys: PENDING | IN_PROGRESS | COMPLETED | CANCELLED
+    byStatus:    Dict[str, PmakInhouseStatusBreakdown]  # keys: PENDING | IN_PROGRESS | COMPLETED | CANCELLED
 
 
 class PmakAllInhouseResponse(BaseModel):
