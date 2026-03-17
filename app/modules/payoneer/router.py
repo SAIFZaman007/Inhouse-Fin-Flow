@@ -1,14 +1,15 @@
 """
 app/modules/payoneer/router.py
 ════════════════════════════════════════════════════════════════════════════════
-v3 — Enterprise Edition
+v4 — Enterprise Edition
 
 Endpoint matrix
 ───────────────────────────────────────────────────────────────────────────────
 GET    /accounts                        CEO_DIRECTOR  Combined totals + all accounts
                                                       Period + ?name= filter. Paginated.
 POST   /accounts                        CEO_DIRECTOR  Create + optional opening balance
-PATCH  /accounts/{id}                   CEO_DIRECTOR  Partial update (rename / isActive)
+PATCH  /accounts/{id}                   CEO_DIRECTOR  Partial update (rename / isActive /
+                                                      balance-adjustment — all optional)
 DELETE /accounts/{id}                   CEO_DIRECTOR  Soft-delete (isActive → false)
 
 POST   /transactions                    CEO_DIRECTOR  Add transaction (by accountName)
@@ -129,16 +130,33 @@ async def add_account(
 
 @router.patch(
     "/accounts/{account_id}",
-    summary="Partially update a Payoneer account (rename / toggle active status)",
+    summary="Partially update a Payoneer account (metadata + optional balance adjustment)",
     description="""
 Performs a **partial update** on an existing Payoneer account.
 
-All fields are optional — only supplied fields are changed:
+All fields are optional — only supplied fields are changed.
+
+### Account metadata
 
 | Field | Effect |
 |---|---|
 | `accountName` | Renames the account; uniqueness enforced (409 on conflict). |
 | `isActive` | `false` soft-deletes the account; `true` restores a deactivated one. |
+
+### Balance-adjustment fields *(v4 addition)*
+
+When `initial_balance` is supplied the service **appends a credit transaction**
+to the account's ledger immediately, so the balance can be corrected or topped-up
+without a separate POST /transactions call.
+
+| Field | Description |
+|---|---|
+| `description` | Free-text note; used as the transaction `details` text when `initial_balance` is set. |
+| `initial_balance` | Amount of the credit adjustment (must be > 0). The new `remainingBalance` is computed as *current latest balance + initial_balance*. |
+| `opening_note` | Fallback details text if `description` is not provided. Defaults to `"Balance adjustment"`. |
+
+> **Ledger integrity:** `remainingBalance` is auto-computed from the latest
+> transaction — you do not need to supply it manually.
 
 Sending an empty body `{}` is accepted and returns the current account state
 unchanged (idempotent).

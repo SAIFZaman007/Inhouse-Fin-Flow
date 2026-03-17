@@ -1,15 +1,23 @@
 """
 app/modules/fiverr/schema.py
 ════════════════════════════════════════════════════════════════════════════════
-v6 — Enterprise Edition
+v7 — Enterprise Edition
 
-Changes vs v5
+Changes vs v6
 ─────────────
-FiverrProfileUpdate   NEW — PATCH /profiles/{id}  (all fields optional)
-FiverrOrderUpdate     NEW — PATCH /orders/{id}     (all fields optional;
-                            afterFiverr re-computed server-side if amount changes)
+FiverrProfileUpdate   EXTENDED — PATCH /profiles/{id}
+                        Now accepts the full snapshot field set so a single
+                        PATCH call can rename/toggle the profile AND update
+                        its latest-day snapshot in one round-trip.
+                        New optional fields (all default None → left unchanged):
+                          available_withdraw, not_cleared, active_orders,
+                          active_order_amount, submitted, withdrawn,
+                          seller_plus, promotion, snapshot_date
 
-Everything else is unchanged from v5.
+FiverrOrderUpdate     FIXED — ``date`` is now Optional (was incorrectly
+                        required in v6; an empty PATCH body must be idempotent).
+
+Everything else is unchanged from v6.
 ════════════════════════════════════════════════════════════════════════════════
 """
 from datetime import date, datetime
@@ -53,15 +61,49 @@ class FiverrProfileUpdate(BaseModel):
     """
     PATCH /profiles/{id} — partial update for a Fiverr profile.
 
-    Only supplied fields are written; omitted fields are left unchanged.
-    Sending ``profileName`` renames the profile (uniqueness enforced server-side).
-    Sending ``isActive = true`` re-activates a previously soft-deleted profile.
+    All fields are optional — only supplied fields are written.
+
+    Profile identity fields
+    ───────────────────────
+    ``profileName``  Renames the profile (uniqueness enforced server-side).
+    ``isActive``     ``false`` soft-deletes; ``true`` restores a deactivated profile.
+
+    Snapshot fields  (v7 addition)
+    ──────────────────────────────
+    When any snapshot field is supplied the service performs an **upsert** on
+    today's snapshot (or ``snapshot_date`` if provided), so a single PATCH
+    keeps both profile metadata and the current-day balance in sync.
+
+    ``snapshot_date``       Target date for the upsert (defaults to today).
+    ``available_withdraw``  Current available-withdraw balance.
+    ``not_cleared``         Funds not yet cleared.
+    ``active_orders``       Number of active orders.
+    ``active_order_amount`` Total value of active orders.
+    ``submitted``           Total submitted amount.
+    ``withdrawn``           Total withdrawn amount.
+    ``seller_plus``         Seller Plus subscription flag.
+    ``promotion``           Promotion balance.
     """
+    # ── Profile metadata ─────────────────────────────────────────────────────
     profileName: Optional[str]  = Field(default=None, min_length=1, max_length=100)
     isActive:    Optional[bool] = Field(
         default=None,
         description="Set false to soft-delete; true to restore a deactivated profile.",
     )
+
+    # ── Snapshot fields (v7) ─────────────────────────────────────────────────
+    snapshot_date:       Optional[date]    = Field(
+        default=None,
+        description="Date for the snapshot upsert. Defaults to today when any snapshot field is supplied.",
+    )
+    available_withdraw:  Optional[Decimal] = Field(default=None, ge=0)
+    not_cleared:         Optional[Decimal] = Field(default=None, ge=0)
+    active_orders:       Optional[int]     = Field(default=None, ge=0)
+    active_order_amount: Optional[Decimal] = Field(default=None, ge=0)
+    submitted:           Optional[Decimal] = Field(default=None, ge=0)
+    withdrawn:           Optional[Decimal] = Field(default=None, ge=0)
+    seller_plus:         Optional[bool]    = Field(default=None)
+    promotion:           Optional[Decimal] = Field(default=None, ge=0)
 
 
 class FiverrProfileResponse(BaseModel):
@@ -147,12 +189,14 @@ class FiverrOrderUpdate(BaseModel):
     """
     PATCH /orders/{id} — partial update for a logged Fiverr order.
 
-    Only supplied fields are written; omitted fields are left unchanged.
+    All fields are optional — only supplied fields are written.
     If ``amount`` is updated, ``afterFiverr`` is automatically re-computed
     server-side (amount × 0.80) — clients must never send ``afterFiverr``.
     ``order_id`` uniqueness is enforced server-side on rename.
+
+    Sending an empty body ``{}`` returns the current order unchanged (idempotent).
     """
-    date:       date
+    date:       Optional[date]    = Field(default=None)   # v7 fix: was incorrectly required
     buyer_name: Optional[str]     = Field(default=None, min_length=1)
     order_id:   Optional[str]     = Field(default=None, min_length=1)
     amount:     Optional[Decimal] = Field(default=None, gt=0)

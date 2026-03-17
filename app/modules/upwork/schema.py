@@ -1,15 +1,23 @@
 """
 app/modules/upwork/schema.py
 ════════════════════════════════════════════════════════════════════════════════
-v6 — Enterprise Edition
+v7 — Enterprise Edition
 
-Changes vs v5
+Changes vs v6
 ─────────────
-UpworkProfileUpdate   NEW — PATCH /profiles/{id}  (all fields optional)
-UpworkOrderUpdate     NEW — PATCH /orders/{id}     (all fields optional;
-                            afterUpwork re-computed server-side if amount changes)
+UpworkProfileUpdate   EXTENDED — PATCH /profiles/{id}
+                        Now accepts the full snapshot field set so a single
+                        PATCH call can rename/toggle the profile AND update
+                        its latest-day snapshot in one round-trip.
+                        New optional fields (all default None → left unchanged):
+                          available_withdraw, pending, in_review,
+                          work_in_progress, withdrawn, connects,
+                          upwork_plus, snapshot_date
 
-Everything else is unchanged from v5.
+UpworkOrderUpdate     FIXED — ``date`` is now Optional (was incorrectly
+                        required in v6; an empty PATCH body must be idempotent).
+
+Everything else is unchanged from v6.
 ════════════════════════════════════════════════════════════════════════════════
 """
 from datetime import date, datetime
@@ -51,15 +59,47 @@ class UpworkProfileUpdate(BaseModel):
     """
     PATCH /profiles/{id} — partial update for an Upwork profile.
 
-    Only supplied fields are written; omitted fields are left unchanged.
-    Sending ``profileName`` renames the profile (uniqueness enforced server-side).
-    Sending ``isActive = true`` re-activates a previously soft-deleted profile.
+    All fields are optional — only supplied fields are written.
+
+    Profile identity fields
+    ───────────────────────
+    ``profileName``  Renames the profile (uniqueness enforced server-side).
+    ``isActive``     ``false`` soft-deletes; ``true`` restores a deactivated profile.
+
+    Snapshot fields  (v7 addition)
+    ──────────────────────────────
+    When any snapshot field is supplied the service performs an **upsert** on
+    today's snapshot (or ``snapshot_date`` if provided), so a single PATCH
+    keeps both profile metadata and the current-day balance in sync.
+
+    ``snapshot_date``    Target date for the upsert (defaults to today).
+    ``available_withdraw`` Current available-withdraw balance.
+    ``pending``          Funds pending clearance.
+    ``in_review``        Funds currently in review.
+    ``work_in_progress`` Active contract work-in-progress value.
+    ``withdrawn``        Total withdrawn amount.
+    ``connects``         Available Connects count.
+    ``upwork_plus``      Upwork Plus subscription flag.
     """
+    # ── Profile metadata ─────────────────────────────────────────────────────
     profileName: Optional[str]  = Field(default=None, min_length=1, max_length=100)
     isActive:    Optional[bool] = Field(
         default=None,
         description="Set false to soft-delete; true to restore a deactivated profile.",
     )
+
+    # ── Snapshot fields (v7) ─────────────────────────────────────────────────
+    snapshot_date:      Optional[date]    = Field(
+        default=None,
+        description="Date for the snapshot upsert. Defaults to today when any snapshot field is supplied.",
+    )
+    available_withdraw: Optional[Decimal] = Field(default=None, ge=0)
+    pending:            Optional[Decimal] = Field(default=None, ge=0)
+    in_review:          Optional[Decimal] = Field(default=None, ge=0)
+    work_in_progress:   Optional[Decimal] = Field(default=None, ge=0)
+    withdrawn:          Optional[Decimal] = Field(default=None, ge=0)
+    connects:           Optional[int]     = Field(default=None, ge=0)
+    upwork_plus:        Optional[bool]    = Field(default=None)
 
 
 class UpworkProfileResponse(BaseModel):
@@ -142,12 +182,14 @@ class UpworkOrderUpdate(BaseModel):
     """
     PATCH /orders/{id} — partial update for a logged Upwork order.
 
-    Only supplied fields are written; omitted fields are left unchanged.
+    All fields are optional — only supplied fields are written.
     If ``amount`` is updated, ``afterUpwork`` is automatically re-computed
     server-side (amount × 0.90) — clients must never send ``afterUpwork``.
     ``order_id`` uniqueness is enforced server-side on rename.
+
+    Sending an empty body ``{}`` returns the current order unchanged (idempotent).
     """
-    date:        date
+    date:        Optional[date]    = Field(default=None)   # v7 fix: was incorrectly required
     client_name: Optional[str]     = Field(default=None, min_length=1)
     order_id:    Optional[str]     = Field(default=None, min_length=1)
     amount:      Optional[Decimal] = Field(default=None, gt=0)

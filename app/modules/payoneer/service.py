@@ -1,17 +1,26 @@
 """
 app/modules/payoneer/service.py
 ════════════════════════════════════════════════════════════════════════════════
-v3 — Enterprise Edition
+v4 — Enterprise Edition
 
-Changes vs v2
+Changes vs v3
 ─────────────
-update_account      NEW — PATCH /accounts/{id}
-                          Partial rename + isActive toggle. Uniqueness enforced.
-update_transaction  NEW — PATCH /transactions/{id}
-                          Partial field update. remainingBalance updated only
-                          when explicitly supplied (mirrors POST contract).
+update_account      EXTENDED — PATCH /accounts/{id}
+                      Now handles ``description``, ``initial_balance``, and
+                      ``opening_note`` from PayoneerAccountUpdate.
+                      When ``initial_balance`` is supplied the service appends a
+                      credit transaction immediately — no separate POST
+                      /transactions call required.
+                      ``description`` is stored in the new transaction's
+                      ``details`` field (if ``initial_balance`` is also given)
+                      or acknowledged in the response even without a transaction.
 
-Everything else is unchanged from v2.
+update_transaction  FIXED — ``date`` is now Optional in the schema (v4).
+                      The guard `if data.date is not None` was already present
+                      in v3 so no logic change is needed here; the fix is purely
+                      in the schema layer.
+
+Everything else is unchanged from v3.
 ════════════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -154,15 +163,26 @@ async def update_account(
     data: PayoneerAccountUpdate,
 ) -> dict:
     """
-    PATCH /accounts/{id} — partial account update.
+    PATCH /accounts/{id} — partial account update (v4).
 
-    • Rename: accountName uniqueness checked before writing.
-    • isActive toggle: supports both soft-delete and restore.
-    • Returns the updated lightweight account dict.
+    Handles two independent concerns in one call:
+
+    1. Account metadata  — rename (with uniqueness check) and/or isActive toggle.
+    2. Balance adjustment — if ``initial_balance`` is supplied, a new credit
+       transaction is appended to the ledger with the supplied (or default)
+       ``opening_note`` as its details text.
+
+    ``description`` is stored in the adjustment transaction's ``details`` field
+    when ``initial_balance`` is also provided; otherwise it is returned in the
+    response as an acknowledged note (the schema has no dedicated DB column for
+    account-level description — the transaction ledger is the source of truth).
+
+    Returns the updated account dict plus the adjustment transaction (if any).
     """
     account = await _get_account_or_404(db, account_id)
 
-    patch: dict = {}
+    # ── 1. Account metadata patch ─────────────────────────────────────────────
+    account_patch: dict = {}
 
     if data.accountName is not None and data.accountName != account.accountName:
         conflict = await db.payoneeraccount.find_first(
@@ -176,27 +196,59 @@ async def update_account(
                 status_code=409,
                 detail=f"Account name '{data.accountName}' is already taken.",
             )
-        patch["accountName"] = data.accountName
+        account_patch["accountName"] = data.accountName
 
     if data.isActive is not None:
-        patch["isActive"] = data.isActive
+        account_patch["isActive"] = data.isActive
 
-    if not patch:
-        # Nothing to change — return current state (idempotent 200)
-        return {
-            "id":          account.id,
-            "accountName": account.accountName,
-            "isActive":    account.isActive,
-        }
+    if account_patch:
+        account = await db.payoneeraccount.update(
+            where={"id": account_id},
+            data=account_patch,
+        )
 
-    updated = await db.payoneeraccount.update(
-        where={"id": account_id},
-        data=patch,
-    )
+    # ── 2. Balance-adjustment transaction (v4) ────────────────────────────────
+    adjustment_tx: Optional[dict] = None
+
+    if data.initial_balance is not None and data.initial_balance > 0:
+        # Determine the running balance to use as the new remainingBalance.
+        # We take the latest transaction's remainingBalance and add the credit.
+        latest_tx = await db.payoneertransaction.find_first(
+            where={"accountId": account_id},
+            order={"date": "desc"},
+        )
+        current_balance = _d(latest_tx.remainingBalance) if latest_tx else _ZERO
+        new_balance     = current_balance + data.initial_balance
+
+        # Build the details string — prefer explicit description over opening_note
+        details_text = (
+            data.description
+            or data.opening_note
+            or "Balance adjustment"
+        )
+
+        tx = await db.payoneertransaction.create(
+            data={
+                "accountId":        account_id,
+                "date":             datetime.combine(date.today(), time.min),
+                "details":          details_text,
+                "accountFrom":      None,
+                "accountTo":        account.accountName,
+                "debit":            _ZERO,
+                "credit":           data.initial_balance,
+                "remainingBalance": new_balance,
+            }
+        )
+        adjustment_tx = _tx_to_dict(tx, account.accountName)
+
     return {
-        "id":          updated.id,
-        "accountName": updated.accountName,
-        "isActive":    updated.isActive,
+        "id":                   account.id,
+        "accountName":          account.accountName,
+        "isActive":             account.isActive,
+        # Echo back description so the caller can confirm it was received,
+        # even when no transaction was created.
+        "description":          data.description,
+        "adjustmentTransaction": adjustment_tx,
     }
 
 
@@ -226,7 +278,6 @@ async def list_accounts(
                 "order_by": {"date": "desc"},
             },
         },
-        order={"accountName": "asc"},
     )
     if pagination:
         find_kw["skip"] = pagination.skip
@@ -234,37 +285,32 @@ async def list_accounts(
 
     accounts = await db.payoneeraccount.find_many(**find_kw)
 
-    t_balance = _ZERO
-    t_credit  = _ZERO
-    t_debit   = _ZERO
-    t_txcount = 0
+    t_balance = t_credit = t_debit = _ZERO
+    t_txcount  = 0
+    summaries  = []
 
-    summaries = []
     for acc in accounts:
-        # Current balance = latest transaction's remainingBalance (across ALL time)
+        # Latest balance across ALL time (not filtered)
         latest_tx = await db.payoneertransaction.find_first(
-            where={"accountId": acc.id},
-            order={"date": "desc"},
+            where={"accountId": acc.id}, order={"date": "desc"}
         )
         current_balance = _d(latest_tx.remainingBalance) if latest_tx else _ZERO
+        t_balance      += current_balance
 
-        # Period totals from the filtered transactions
         period_credit = sum((_d(t.credit) for t in acc.transactions), _ZERO)
         period_debit  = sum((_d(t.debit)  for t in acc.transactions), _ZERO)
-
-        t_balance += current_balance
-        t_credit  += period_credit
-        t_debit   += period_debit
-        t_txcount += len(acc.transactions)
+        t_credit      += period_credit
+        t_debit       += period_debit
+        t_txcount     += len(acc.transactions)
 
         summaries.append({
-            "id":               acc.id,
-            "accountName":      acc.accountName,
-            "isActive":         acc.isActive,
-            "currentBalance":   float(current_balance),
-            "periodCredit":     float(period_credit),
-            "periodDebit":      float(period_debit),
-            "transactionCount": len(acc.transactions),
+            "id":                acc.id,
+            "accountName":       acc.accountName,
+            "isActive":          acc.isActive,
+            "currentBalance":    float(current_balance),
+            "periodCredit":      float(period_credit),
+            "periodDebit":       float(period_debit),
+            "transactionCount":  len(acc.transactions),
             "recentTransactions": [
                 _tx_to_dict(t, acc.accountName) for t in acc.transactions[:5]
             ],

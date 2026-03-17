@@ -1,7 +1,7 @@
 """
 app/modules/fiverr/router.py
 ════════════════════════════════════════════════════════════════════════════════
-v6 — Enterprise Edition
+v7 — Enterprise Edition
 
 Endpoint matrix
 ───────────────────────────────────────────────────────────────────────────────
@@ -9,7 +9,8 @@ GET    /profiles                 HR_AND_ABOVE  Combined totals + all profiles
                                               Paginated (50/page). ?name= search.
 GET    /profiles/{id}            HR_AND_ABOVE  Single-profile drill-down (paginated)
 POST   /profiles                 CEO_DIRECTOR  Create + optional initial snapshot
-PATCH  /profiles/{id}            CEO_DIRECTOR  Partial update (rename / isActive)
+PATCH  /profiles/{id}            CEO_DIRECTOR  Partial update (rename / isActive /
+                                              snapshot fields — all optional)
 DELETE /profiles/{id}            CEO_DIRECTOR  Soft-delete (isActive → false)
 
 POST   /snapshots                HR_AND_ABOVE  Upsert daily snapshot (by profileName)
@@ -154,16 +155,37 @@ async def add_profile(
 
 @router.patch(
     "/profiles/{profile_id}",
-    summary="Partially update a Fiverr profile (rename / toggle active status)",
+    summary="Partially update a Fiverr profile (metadata + optional snapshot upsert)",
     description="""
 Performs a **partial update** on an existing Fiverr profile.
 
-All fields are optional — only supplied fields are changed:
+All fields are optional — only supplied fields are changed.
+
+### Profile metadata
 
 | Field | Effect |
 |---|---|
 | `profileName` | Renames the profile; uniqueness enforced (409 on conflict). |
 | `isActive` | `false` soft-deletes the profile; `true` restores a deactivated one. |
+
+### Snapshot fields *(v7 addition)*
+
+When any of the following fields are present the service performs an **upsert**
+on the snapshot for `snapshot_date` (defaults to **today**).  This allows a
+single PATCH call to update both the profile name and the current-day balance
+without a separate POST /snapshots round-trip.
+
+| Field | Description |
+|---|---|
+| `snapshot_date` | Target date for the upsert (defaults to today). |
+| `available_withdraw` | Current available-withdraw balance. |
+| `not_cleared` | Funds not yet cleared. |
+| `active_orders` | Number of active orders. |
+| `active_order_amount` | Total value of active orders ($). |
+| `submitted` | Total submitted amount ($). |
+| `withdrawn` | Total withdrawn amount ($). |
+| `seller_plus` | Seller Plus subscription flag. |
+| `promotion` | Promotion balance ($). |
 
 Sending an empty body `{}` is accepted and returns the current profile state
 unchanged (idempotent).
