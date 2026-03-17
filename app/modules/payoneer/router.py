@@ -1,15 +1,19 @@
 """
 app/modules/payoneer/router.py
 ════════════════════════════════════════════════════════════════════════════════
-v2 — Enterprise Edition
+v3 — Enterprise Edition
 
 Endpoint matrix
 ───────────────────────────────────────────────────────────────────────────────
 GET    /accounts                        CEO_DIRECTOR  Combined totals + all accounts
                                                       Period + ?name= filter. Paginated.
-DELETE /accounts/{id}                   CEO_DIRECTOR  Soft-delete (isActive → false)
 POST   /accounts                        CEO_DIRECTOR  Create + optional opening balance
+PATCH  /accounts/{id}                   CEO_DIRECTOR  Partial update (rename / isActive)
+DELETE /accounts/{id}                   CEO_DIRECTOR  Soft-delete (isActive → false)
+
 POST   /transactions                    CEO_DIRECTOR  Add transaction (by accountName)
+PATCH  /transactions/{id}               CEO_DIRECTOR  Partial update (any field)
+DELETE /transactions/{id}               CEO_DIRECTOR  Hard delete
 GET    /accounts/{id}/transactions      CEO_DIRECTOR  Paginated transactions + accountName
 
 GET    /export                          CEO_DIRECTOR  All-accounts Excel (period-aware)
@@ -27,16 +31,24 @@ from app.core.dependencies import CEO_DIRECTOR
 from app.shared.filters import DateRangeFilter
 from app.shared.pagination import PageParams
 from app.modules.export.schema import ExportQueryParams
-from app.modules.export.service import export_payoneer   # existing all-accounts exporter
+from app.modules.export.service import export_payoneer
 
-from .schema import PayoneerAccountCreate, PayoneerTransactionCreate
+from .schema import (
+    PayoneerAccountCreate,
+    PayoneerAccountUpdate,
+    PayoneerTransactionCreate,
+    PayoneerTransactionUpdate,
+)
 from .service import (
     add_transaction,
     create_account,
     deactivate_account,
+    delete_transaction,
     export_account_excel,
     get_account_transactions,
     list_accounts,
+    update_account,
+    update_transaction,
 )
 
 router = APIRouter(prefix="/payoneer", tags=["Payoneer"])
@@ -115,6 +127,34 @@ async def add_account(
     return await create_account(db, body)
 
 
+@router.patch(
+    "/accounts/{account_id}",
+    summary="Partially update a Payoneer account (rename / toggle active status)",
+    description="""
+Performs a **partial update** on an existing Payoneer account.
+
+All fields are optional — only supplied fields are changed:
+
+| Field | Effect |
+|---|---|
+| `accountName` | Renames the account; uniqueness enforced (409 on conflict). |
+| `isActive` | `false` soft-deletes the account; `true` restores a deactivated one. |
+
+Sending an empty body `{}` is accepted and returns the current account state
+unchanged (idempotent).
+
+**Access:** CEO and Director only.
+    """,
+)
+async def patch_account(
+    account_id: str,
+    body: PayoneerAccountUpdate,
+    db:   Prisma = Depends(get_db),
+    _=Depends(CEO_DIRECTOR),
+):
+    return await update_account(db, account_id, body)
+
+
 @router.delete(
     "/accounts/{account_id}",
     status_code=204,
@@ -157,6 +197,43 @@ async def add_transaction_entry(
     return await add_transaction(db, body)
 
 
+@router.patch(
+    "/transactions/{transaction_id}",
+    summary="Partially update a Payoneer transaction",
+    description="""
+Performs a **partial update** on an existing Payoneer transaction.
+
+All fields are optional — only supplied fields are changed:
+
+| Field | Effect |
+|---|---|
+| `date` | Changes the transaction date. |
+| `details` | Updates the description / reference text. |
+| `accountFrom` | Updates the source label (send `null` to clear). |
+| `accountTo` | Updates the destination label (send `null` to clear). |
+| `debit` | Updates the debit amount. |
+| `credit` | Updates the credit amount. |
+| `remaining_balance` | Corrects the post-transaction balance (not auto-recomputed). |
+
+`remainingBalance` is **never auto-recomputed** — if you update `debit` or
+`credit`, supply the corrected `remaining_balance` in the same request to keep
+the ledger consistent.
+
+Sending an empty body `{}` returns the current transaction state unchanged
+(idempotent).
+
+**Access:** CEO and Director only.
+    """,
+)
+async def patch_transaction(
+    transaction_id: str,
+    body: PayoneerTransactionUpdate,
+    db:   Prisma = Depends(get_db),
+    _=Depends(CEO_DIRECTOR),
+):
+    return await update_transaction(db, transaction_id, body)
+
+
 @router.get(
     "/accounts/{account_id}/transactions",
     summary="Transactions for one Payoneer account (period-aware, paginated)",
@@ -196,7 +273,6 @@ async def remove_transaction(
     db: Prisma = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
 ):
-    from .service import delete_transaction
     await delete_transaction(db, transaction_id)
 
 

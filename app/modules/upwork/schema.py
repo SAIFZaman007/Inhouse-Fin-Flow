@@ -1,25 +1,15 @@
 """
 app/modules/upwork/schema.py
 ════════════════════════════════════════════════════════════════════════════════
-v5 — Enterprise Edition
+v6 — Enterprise Edition
 
-Changes vs v4
+Changes vs v5
 ─────────────
-UpworkSnapshotCreate
-  • ``profile_id``  →  ``profile_name``  (str, case-insensitive server lookup)
+UpworkProfileUpdate   NEW — PATCH /profiles/{id}  (all fields optional)
+UpworkOrderUpdate     NEW — PATCH /orders/{id}     (all fields optional;
+                            afterUpwork re-computed server-side if amount changes)
 
-UpworkOrderCreate
-  • ``profile_id``  →  ``profile_name``  (same rationale)
-
-UpworkSnapshotInProfile  / UpworkSnapshotResponse
-  • ``profileName`` field added — every snapshot row carries a human-readable
-    label; clients never need a second profile lookup.
-
-Design notes
-────────────
-• afterUpwork is NEVER accepted from the client — always server-computed.
-• availableWithdrawAfterFee = availableWithdraw × 0.90 (view-only, not stored).
-• Monetary fields use Decimal for precision; float only in aggregate totals.
+Everything else is unchanged from v5.
 ════════════════════════════════════════════════════════════════════════════════
 """
 from datetime import date, datetime
@@ -55,6 +45,21 @@ class UpworkProfileCreate(BaseModel):
     withdrawn:          Decimal           = Field(default=Decimal("0"), ge=0)
     connects:           int               = Field(default=0, ge=0)
     upwork_plus:        bool              = False
+
+
+class UpworkProfileUpdate(BaseModel):
+    """
+    PATCH /profiles/{id} — partial update for an Upwork profile.
+
+    Only supplied fields are written; omitted fields are left unchanged.
+    Sending ``profileName`` renames the profile (uniqueness enforced server-side).
+    Sending ``isActive = true`` re-activates a previously soft-deleted profile.
+    """
+    profileName: Optional[str]  = Field(default=None, min_length=1, max_length=100)
+    isActive:    Optional[bool] = Field(
+        default=None,
+        description="Set false to soft-delete; true to restore a deactivated profile.",
+    )
 
 
 class UpworkProfileResponse(BaseModel):
@@ -131,6 +136,21 @@ class UpworkOrderCreate(BaseModel):
     client_name:  str     = Field(..., min_length=1)
     order_id:     str     = Field(..., min_length=1)
     amount:       Decimal = Field(..., gt=0)
+
+
+class UpworkOrderUpdate(BaseModel):
+    """
+    PATCH /orders/{id} — partial update for a logged Upwork order.
+
+    Only supplied fields are written; omitted fields are left unchanged.
+    If ``amount`` is updated, ``afterUpwork`` is automatically re-computed
+    server-side (amount × 0.90) — clients must never send ``afterUpwork``.
+    ``order_id`` uniqueness is enforced server-side on rename.
+    """
+    date:        Optional[date]    = None
+    client_name: Optional[str]     = Field(default=None, min_length=1)
+    order_id:    Optional[str]     = Field(default=None, min_length=1)
+    amount:      Optional[Decimal] = Field(default=None, gt=0)
 
 
 class UpworkOrderResponse(BaseModel):

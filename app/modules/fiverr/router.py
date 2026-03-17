@@ -1,7 +1,7 @@
 """
 app/modules/fiverr/router.py
 ════════════════════════════════════════════════════════════════════════════════
-v5 — Enterprise Edition
+v6 — Enterprise Edition
 
 Endpoint matrix
 ───────────────────────────────────────────────────────────────────────────────
@@ -9,12 +9,14 @@ GET    /profiles                 HR_AND_ABOVE  Combined totals + all profiles
                                               Paginated (50/page). ?name= search.
 GET    /profiles/{id}            HR_AND_ABOVE  Single-profile drill-down (paginated)
 POST   /profiles                 CEO_DIRECTOR  Create + optional initial snapshot
+PATCH  /profiles/{id}            CEO_DIRECTOR  Partial update (rename / isActive)
 DELETE /profiles/{id}            CEO_DIRECTOR  Soft-delete (isActive → false)
 
 POST   /snapshots                HR_AND_ABOVE  Upsert daily snapshot (by profileName)
 GET    /profiles/{id}/snapshots  HR_AND_ABOVE  Paginated snapshots — includes profileName
 
 POST   /orders                   HR_AND_ABOVE  Log order (by profileName, afterFiverr computed)
+PATCH  /orders/{id}              HR_AND_ABOVE  Partial update (date/buyer/orderId/amount)
 GET    /profiles/{id}/orders     HR_AND_ABOVE  Paginated orders for one profile
 
 GET    /export                   CEO_DIRECTOR  All-profiles Excel (period-aware)
@@ -36,7 +38,9 @@ from app.modules.export.service import export_fiverr
 
 from .schema import (
     FiverrOrderCreate,
+    FiverrOrderUpdate,
     FiverrProfileCreate,
+    FiverrProfileUpdate,
     FiverrSnapshotCreate,
 )
 from .service import (
@@ -49,6 +53,8 @@ from .service import (
     get_profile_orders,
     get_profile_snapshots,
     list_profiles_summary,
+    update_order,
+    update_profile,
 )
 
 router = APIRouter(prefix="/fiverr", tags=["Fiverr"])
@@ -146,6 +152,34 @@ async def add_profile(
     return await create_profile(db, body)
 
 
+@router.patch(
+    "/profiles/{profile_id}",
+    summary="Partially update a Fiverr profile (rename / toggle active status)",
+    description="""
+Performs a **partial update** on an existing Fiverr profile.
+
+All fields are optional — only supplied fields are changed:
+
+| Field | Effect |
+|---|---|
+| `profileName` | Renames the profile; uniqueness enforced (409 on conflict). |
+| `isActive` | `false` soft-deletes the profile; `true` restores a deactivated one. |
+
+Sending an empty body `{}` is accepted and returns the current profile state
+unchanged (idempotent).
+
+**Access:** CEO and Director only.
+    """,
+)
+async def patch_profile(
+    profile_id: str,
+    body: FiverrProfileUpdate,
+    db:   Prisma = Depends(get_db),
+    _=Depends(CEO_DIRECTOR),
+):
+    return await update_profile(db, profile_id, body)
+
+
 @router.delete(
     "/profiles/{profile_id}",
     status_code=204,
@@ -235,6 +269,37 @@ async def add_order_entry(
     _=Depends(HR_AND_ABOVE),
 ):
     return await add_order(db, body)
+
+
+@router.patch(
+    "/orders/{order_id}",
+    summary="Partially update a logged Fiverr order",
+    description="""
+Performs a **partial update** on an existing Fiverr order.
+
+All fields are optional — only supplied fields are changed:
+
+| Field | Effect |
+|---|---|
+| `date` | Changes the order date. |
+| `buyer_name` | Updates the buyer display name. |
+| `order_id` | Renames the Fiverr order ID; uniqueness enforced (409 on conflict). |
+| `amount` | Updates gross amount **and** auto-recomputes `afterFiverr` (×0.80). |
+
+`afterFiverr` is **always server-computed** — never accepted from the client.
+
+Sending an empty body `{}` returns the current order state unchanged (idempotent).
+
+**Access:** HR and above.
+    """,
+)
+async def patch_order(
+    order_id: str,
+    body: FiverrOrderUpdate,
+    db:   Prisma = Depends(get_db),
+    _=Depends(HR_AND_ABOVE),
+):
+    return await update_order(db, order_id, body)
 
 
 @router.get(

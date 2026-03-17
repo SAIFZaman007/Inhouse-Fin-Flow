@@ -1,22 +1,17 @@
 """
 app/modules/payoneer/service.py
 ════════════════════════════════════════════════════════════════════════════════
-v2 — Enterprise Edition
+v3 — Enterprise Edition
 
-Changes vs v1
+Changes vs v2
 ─────────────
-_resolve_account_by_name  NEW — case-insensitive account lookup by name.
-_tx_to_dict               NEW — serialises a transaction row + accountName.
-create_account            Returns enriched dict; optionally seeds opening tx.
-add_transaction           Resolves account via ``data.account_name`` (not id).
-list_accounts             Combined totals + per-account breakdown; period +
-                          name filter + pagination aware.
-get_account_transactions  Returns paginated dict with accountName on each row.
+update_account      NEW — PATCH /accounts/{id}
+                          Partial rename + isActive toggle. Uniqueness enforced.
+update_transaction  NEW — PATCH /transactions/{id}
+                          Partial field update. remainingBalance updated only
+                          when explicitly supplied (mirrors POST contract).
 
-Datetime bug fix
-────────────────
-All date writes use ``datetime.combine(d, time.min)`` — bare datetime.date
-values are rejected by prisma-client-py's JSON serialiser.
+Everything else is unchanged from v2.
 ════════════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -35,7 +30,9 @@ from app.shared.filters import DateRangeFilter, to_dt_start, to_dt_end
 from app.shared.pagination import PageParams
 from .schema import (
     PayoneerAccountCreate,
+    PayoneerAccountUpdate,
     PayoneerTransactionCreate,
+    PayoneerTransactionUpdate,
 )
 
 logger = logging.getLogger(__name__)
@@ -94,6 +91,20 @@ async def _resolve_account_by_name(db: Prisma, account_name: str):
     return account
 
 
+async def _get_account_or_404(db: Prisma, account_id: str):
+    account = await db.payoneeraccount.find_unique(where={"id": account_id})
+    if not account:
+        raise HTTPException(status_code=404, detail="Payoneer account not found.")
+    return account
+
+
+async def _get_transaction_or_404(db: Prisma, transaction_id: str):
+    tx = await db.payoneertransaction.find_unique(where={"id": transaction_id})
+    if not tx:
+        raise HTTPException(status_code=404, detail="Payoneer transaction not found.")
+    return tx
+
+
 # ── Account CRUD ──────────────────────────────────────────────────────────────
 
 async def create_account(db: Prisma, data: PayoneerAccountCreate) -> dict:
@@ -134,6 +145,58 @@ async def create_account(db: Prisma, data: PayoneerAccountCreate) -> dict:
         "isActive":          account.isActive,
         "currentBalance":    float(data.initial_balance or _ZERO),
         "openingTransaction": opening_tx,
+    }
+
+
+async def update_account(
+    db: Prisma,
+    account_id: str,
+    data: PayoneerAccountUpdate,
+) -> dict:
+    """
+    PATCH /accounts/{id} — partial account update.
+
+    • Rename: accountName uniqueness checked before writing.
+    • isActive toggle: supports both soft-delete and restore.
+    • Returns the updated lightweight account dict.
+    """
+    account = await _get_account_or_404(db, account_id)
+
+    patch: dict = {}
+
+    if data.accountName is not None and data.accountName != account.accountName:
+        conflict = await db.payoneeraccount.find_first(
+            where={
+                "accountName": {"equals": data.accountName, "mode": "insensitive"},
+                "id":          {"not": account_id},
+            }
+        )
+        if conflict:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Account name '{data.accountName}' is already taken.",
+            )
+        patch["accountName"] = data.accountName
+
+    if data.isActive is not None:
+        patch["isActive"] = data.isActive
+
+    if not patch:
+        # Nothing to change — return current state (idempotent 200)
+        return {
+            "id":          account.id,
+            "accountName": account.accountName,
+            "isActive":    account.isActive,
+        }
+
+    updated = await db.payoneeraccount.update(
+        where={"id": account_id},
+        data=patch,
+    )
+    return {
+        "id":          updated.id,
+        "accountName": updated.accountName,
+        "isActive":    updated.isActive,
     }
 
 
@@ -254,6 +317,61 @@ async def add_transaction(db: Prisma, data: PayoneerTransactionCreate) -> dict:
     return _tx_to_dict(tx, account.accountName)
 
 
+async def update_transaction(
+    db: Prisma,
+    transaction_id: str,
+    data: PayoneerTransactionUpdate,
+) -> dict:
+    """
+    PATCH /transactions/{id} — partial transaction update.
+
+    • All fields are optional; only supplied ones are written.
+    • remainingBalance is updated only when explicitly provided — the system
+      does NOT auto-recompute it (ledger integrity is the caller's responsibility,
+      mirroring the POST contract).
+    • Returns the updated full transaction dict (with accountName).
+    """
+    tx      = await _get_transaction_or_404(db, transaction_id)
+    account = await _get_account_or_404(db, tx.accountId)
+
+    patch: dict = {}
+
+    if data.date is not None:
+        patch["date"] = datetime.combine(data.date, time.min)
+
+    if data.details is not None:
+        patch["details"] = data.details
+
+    # accountFrom / accountTo: distinguish "not supplied" from "explicitly cleared"
+    # Pydantic v2 passes None for both cases with Optional fields, so we rely on
+    # model_fields_set to detect which keys the caller actually sent.
+    sent = data.model_fields_set
+
+    if "accountFrom" in sent:
+        patch["accountFrom"] = data.accountFrom   # may be None → explicit clear
+
+    if "accountTo" in sent:
+        patch["accountTo"] = data.accountTo        # may be None → explicit clear
+
+    if data.debit is not None:
+        patch["debit"] = data.debit
+
+    if data.credit is not None:
+        patch["credit"] = data.credit
+
+    if data.remaining_balance is not None:
+        patch["remainingBalance"] = data.remaining_balance
+
+    if not patch:
+        return _tx_to_dict(tx, account.accountName)
+
+    updated = await db.payoneertransaction.update(
+        where={"id": transaction_id},
+        data=patch,
+    )
+    return _tx_to_dict(updated, account.accountName)
+
+
 async def get_account_transactions(
     db: Prisma,
     account_id: str,
@@ -325,7 +443,7 @@ async def export_account_excel(
             detail="openpyxl not installed — cannot generate Excel export.",
         )
 
-    detail  = await get_account_transactions(db, account_id, filters.to_prisma_filter())
+    detail   = await get_account_transactions(db, account_id, filters.to_prisma_filter())
     acc_name = detail["account"]["accountName"]
     start, end = filters.window()
 

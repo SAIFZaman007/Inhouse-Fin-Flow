@@ -1,26 +1,15 @@
 """
 app/modules/fiverr/schema.py
 ════════════════════════════════════════════════════════════════════════════════
-v5 — Enterprise Edition
+v6 — Enterprise Edition
 
-Changes vs v4
+Changes vs v5
 ─────────────
-FiverrSnapshotCreate
-  • ``profile_id``  →  ``profile_name``  (str, case-insensitive server lookup)
-    HR staff know profile names; they should never handle internal UUIDs.
+FiverrProfileUpdate   NEW — PATCH /profiles/{id}  (all fields optional)
+FiverrOrderUpdate     NEW — PATCH /orders/{id}     (all fields optional;
+                            afterFiverr re-computed server-side if amount changes)
 
-FiverrOrderCreate
-  • ``profile_id``  →  ``profile_name``  (same rationale)
-
-FiverrSnapshotInProfile  / FiverrSnapshotResponse
-  • ``profileName`` field added — every snapshot row now carries a human-
-    readable label so clients never have to do a second lookup.
-
-Design notes
-────────────
-• afterFiverr is NEVER accepted from the client — always server-computed.
-• availableWithdrawAfterFee = availableWithdraw × 0.80 (view-only, not stored).
-• Monetary fields use Decimal for precision; float only in aggregate totals.
+Everything else is unchanged from v5.
 ════════════════════════════════════════════════════════════════════════════════
 """
 from datetime import date, datetime
@@ -58,6 +47,21 @@ class FiverrProfileCreate(BaseModel):
     withdrawn:           Decimal           = Field(default=Decimal("0"), ge=0)
     seller_plus:         bool              = False
     promotion:           Decimal           = Field(default=Decimal("0"), ge=0)
+
+
+class FiverrProfileUpdate(BaseModel):
+    """
+    PATCH /profiles/{id} — partial update for a Fiverr profile.
+
+    Only supplied fields are written; omitted fields are left unchanged.
+    Sending ``profileName`` renames the profile (uniqueness enforced server-side).
+    Sending ``isActive = true`` re-activates a previously soft-deleted profile.
+    """
+    profileName: Optional[str]  = Field(default=None, min_length=1, max_length=100)
+    isActive:    Optional[bool] = Field(
+        default=None,
+        description="Set false to soft-delete; true to restore a deactivated profile.",
+    )
 
 
 class FiverrProfileResponse(BaseModel):
@@ -137,6 +141,21 @@ class FiverrOrderCreate(BaseModel):
     buyer_name:   str     = Field(..., min_length=1)
     order_id:     str     = Field(..., min_length=1)
     amount:       Decimal = Field(..., gt=0)
+
+
+class FiverrOrderUpdate(BaseModel):
+    """
+    PATCH /orders/{id} — partial update for a logged Fiverr order.
+
+    Only supplied fields are written; omitted fields are left unchanged.
+    If ``amount`` is updated, ``afterFiverr`` is automatically re-computed
+    server-side (amount × 0.80) — clients must never send ``afterFiverr``.
+    ``order_id`` uniqueness is enforced server-side on rename.
+    """
+    date:       Optional[date]    = None
+    buyer_name: Optional[str]     = Field(default=None, min_length=1)
+    order_id:   Optional[str]     = Field(default=None, min_length=1)
+    amount:     Optional[Decimal] = Field(default=None, gt=0)
 
 
 class FiverrOrderResponse(BaseModel):

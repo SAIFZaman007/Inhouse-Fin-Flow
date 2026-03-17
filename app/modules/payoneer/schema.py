@@ -1,27 +1,14 @@
 """
 app/modules/payoneer/schema.py
 ════════════════════════════════════════════════════════════════════════════════
-v2 — Enterprise Edition
+v3 — Enterprise Edition
 
-Changes vs v1
+Changes vs v2
 ─────────────
-PayoneerAccountCreate
-  • ``initial_balance`` optional — seeds an opening transaction on creation.
-  • ``description`` optional — free-text account note.
+PayoneerAccountUpdate      NEW — PATCH /accounts/{id}      (all fields optional)
+PayoneerTransactionUpdate  NEW — PATCH /transactions/{id}  (all fields optional)
 
-PayoneerTransactionCreate
-  • ``account_id`` → ``account_name``  (case-insensitive server-side lookup).
-    Finance staff know account names, not internal UUIDs.
-
-PayoneerTransactionResponse
-  • ``accountName`` field added — every transaction row carries the
-    human-readable account label; clients never need a second lookup.
-
-PayoneerAccountSummary / PayoneerListResponse  (NEW)
-  • Top-level combined-totals envelope for GET /accounts.
-
-PayoneerAccountDetailResponse  (NEW)
-  • Full drill-down for GET /accounts/{id} or embedded in list.
+Everything else is unchanged from v2.
 ════════════════════════════════════════════════════════════════════════════════
 """
 from datetime import date, datetime
@@ -52,6 +39,21 @@ class PayoneerAccountCreate(BaseModel):
     opening_note: str = Field(
         default="Opening balance",
         description="Details string for the opening transaction.",
+    )
+
+
+class PayoneerAccountUpdate(BaseModel):
+    """
+    PATCH /accounts/{id} — partial update for a Payoneer account.
+
+    Only supplied fields are written; omitted fields are left unchanged.
+    Sending ``accountName`` renames the account (uniqueness enforced server-side).
+    Sending ``isActive = true`` re-activates a previously soft-deleted account.
+    """
+    accountName: Optional[str]  = Field(default=None, min_length=1, max_length=100)
+    isActive:    Optional[bool] = Field(
+        default=None,
+        description="Set false to soft-delete; true to restore a deactivated account.",
     )
 
 
@@ -88,6 +90,28 @@ class PayoneerTransactionCreate(BaseModel):
     debit:             Decimal        = Field(default=Decimal("0"), ge=0)
     credit:            Decimal        = Field(default=Decimal("0"), ge=0)
     remaining_balance: Decimal        = Field(..., description="Balance after this transaction.")
+
+
+class PayoneerTransactionUpdate(BaseModel):
+    """
+    PATCH /transactions/{id} — partial update for a Payoneer transaction.
+
+    Only supplied fields are written; omitted fields are left unchanged.
+    ``remainingBalance`` must be supplied by the caller if it needs correction —
+    the system does not auto-recompute it (mirrors the POST contract).
+    Sending an empty body `{}` is accepted and returns the current row unchanged
+    (idempotent).
+    """
+    date:              Optional[date]    = None
+    details:           Optional[str]     = Field(default=None, min_length=1)
+    accountFrom:       Optional[str]     = None
+    accountTo:         Optional[str]     = None
+    debit:             Optional[Decimal] = Field(default=None, ge=0)
+    credit:            Optional[Decimal] = Field(default=None, ge=0)
+    remaining_balance: Optional[Decimal] = Field(
+        default=None,
+        description="Corrected balance after this transaction.",
+    )
 
 
 class PayoneerTransactionResponse(BaseModel):
