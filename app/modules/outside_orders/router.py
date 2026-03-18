@@ -20,6 +20,7 @@ from prisma import Prisma
 
 from app.core.database import get_db
 from app.core.dependencies import CEO_DIRECTOR, HR_AND_ABOVE
+from app.shared.constants import OrderStatus
 from app.shared.filters import DateRangeFilter
 
 from .schema import OutsideOrderCreate, OutsideOrderResponse, OutsideOrderUpdate
@@ -39,18 +40,18 @@ _XLSX_MEDIA_TYPE = (
 
 @router.get("", response_model=list[OutsideOrderResponse])
 async def get_orders(
-    status:      Optional[str] = Query(default=None, description="Filter by order status (e.g. PENDING, COMPLETED)"),
-    client_name: Optional[str] = Query(default=None, description="Partial / case-insensitive match on client name"),
-    assign_team: Optional[str] = Query(default=None, description="Partial / case-insensitive match on assigned team"),
-    filters:     DateRangeFilter = Depends(),
-    db:          Prisma = Depends(get_db),
+    order_status: Optional[OrderStatus] = Query(default=None, description="Filter by order status (PENDING | IN_PROGRESS | COMPLETED | CANCELLED)"),
+    client_name:  Optional[str]         = Query(default=None, description="Partial / case-insensitive match on client name"),
+    assign_team:  Optional[str]         = Query(default=None, description="Partial / case-insensitive match on assigned team"),
+    filters:      DateRangeFilter = Depends(),
+    db:           Prisma = Depends(get_db),
     _=Depends(HR_AND_ABOVE),
 ):
     """
     List outside orders with optional filters.
 
     All filters are combinable:
-    - `status`       — exact enum match (PENDING | COMPLETED | …)
+    - `order_status` — exact enum match (PENDING | IN_PROGRESS | COMPLETED | CANCELLED)
     - `client_name`  — case-insensitive substring search
     - `assign_team`  — case-insensitive substring search
     - Date filters   — period (daily/weekly/monthly/yearly) or explicit from/to
@@ -58,7 +59,7 @@ async def get_orders(
     return await list_orders(
         db,
         date_filter=filters.to_prisma_filter(),
-        status=status,
+        status=order_status.value if order_status else None,
         client_name=client_name,
         assign_team=assign_team,
     )
@@ -72,11 +73,11 @@ async def get_orders(
     response_description="Excel workbook download",
 )
 async def export_orders_endpoint(
-    status:      Optional[str] = Query(default=None, description="Filter by order status"),
-    client_name: Optional[str] = Query(default=None, description="Partial match on client name"),
-    assign_team: Optional[str] = Query(default=None, description="Partial match on assigned team"),
-    filters:     DateRangeFilter = Depends(),
-    db:          Prisma = Depends(get_db),
+    order_status: Optional[OrderStatus] = Query(default=None, description="Filter by order status (PENDING | IN_PROGRESS | COMPLETED | CANCELLED)"),
+    client_name:  Optional[str]         = Query(default=None, description="Partial match on client name"),
+    assign_team:  Optional[str]         = Query(default=None, description="Partial match on assigned team"),
+    filters:      DateRangeFilter = Depends(),
+    db:           Prisma = Depends(get_db),
     _=Depends(HR_AND_ABOVE),
 ):
     """
@@ -94,7 +95,7 @@ async def export_orders_endpoint(
     data, filename = await export_orders(
         db,
         date_filter=filters.to_prisma_filter(),
-        status=status,
+        status=order_status.value if order_status else None,
         client_name=client_name,
         assign_team=assign_team,
         label=label,

@@ -1,12 +1,21 @@
 """
 app/modules/outside_orders/service.py
 ========================================
-v2 — Additions:
-  • list_orders()  — new optional filters: client_name (icontains), assign_team (icontains)
-  • export_orders() — generates an openpyxl Excel workbook and returns raw bytes
+v3 — date serialization fix
+
+DateTime @db.Date fields in prisma-py v0.14.0 MUST be passed as
+datetime.datetime objects (midnight UTC), identical to the pattern used
+throughout the Fiverr module:
+
+    datetime.combine(data.date, time.min)
+
+Passing datetime.date directly or an ISO string both cause:
+    TypeError / "Could not find field at createOneOutsideOrder.data.date"
 """
+from __future__ import annotations
+
 import io
-from datetime import date as dt_date
+from datetime import date as dt_date, datetime, time
 from decimal import Decimal
 from typing import Optional
 
@@ -20,33 +29,65 @@ from .schema import OutsideOrderCreate, OutsideOrderUpdate
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Private helpers  (mirror the Fiverr service convention exactly)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dt(d: dt_date) -> datetime:
+    """
+    Convert datetime.date → datetime.datetime at midnight.
+
+    prisma-py v0.14.0 requires a full datetime object for every
+    DateTime @db.Date field.  This is the same helper pattern used in
+    the Fiverr service (datetime.combine(d, time.min)).
+    """
+    return datetime.combine(d, time.min)
+
+
+def _enum_val(v) -> str:
+    """Safely extract the string value from an Enum (or plain str)."""
+    return v.value if hasattr(v, "value") else v
+
+
+def _to_date(v) -> dt_date:
+    """
+    Normalise a value returned by the ORM back to a plain date.
+    prisma-py may return DateTime @db.Date fields as datetime or date.
+    """
+    return v.date() if isinstance(v, datetime) else v
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CRUD
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def create_order(db: Prisma, data: OutsideOrderCreate):
-    existing = await db.outsideorder.find_unique(where={"clientId": data.client_id})
+    # clientId has no @unique constraint → use find_first, not find_unique
+    existing = await db.outsideorder.find_first(where={"clientId": data.client_id})
     if existing:
         raise HTTPException(
             status_code=409,
-            detail=f"Client ID '{data.client_id}' already exists",
+            detail=f"Client ID '{data.client_id}' already has an order (order ID: {existing.id})",
         )
 
-    due = float(data.order_amount) - float(data.receive_amount)
+    order_amount   = float(data.order_amount)
+    receive_amount = float(data.receive_amount)
+    due_amount     = order_amount - receive_amount
+
     return await db.outsideorder.create(
         data={
-            "clientId":            data.client_id,
-            "clientName":          data.client_name,
-            "clientLink":          data.client_link,
-            "orderDetails":        data.order_details,
-            "orderSheet":          data.order_sheet,
-            "assignTeam":          data.assign_team,
-            "status":              data.status.value if hasattr(data.status, "value") else data.status,
-            "orderAmount":         data.order_amount,
-            "receiveAmount":       data.receive_amount,
-            "dueAmount":           due,
-            "paymentMethod":       data.payment_method,
+            "clientId":             data.client_id,
+            "clientName":           data.client_name,
+            "clientLink":           data.client_link,
+            "orderDetails":         data.order_details,
+            "orderSheet":           data.order_sheet,
+            "assignTeam":           data.assign_team,
+            "orderStatus":          _enum_val(data.order_status),
+            "orderAmount":          order_amount,
+            "receiveAmount":        receive_amount,
+            "dueAmount":            due_amount,
+            "paymentMethod":        data.payment_method,
             "paymentMethodDetails": data.payment_method_details,
-            "date":                data.date,
+            "date":                 _dt(data.date),   # ← datetime.combine(date, time.min)
         }
     )
 
@@ -73,7 +114,7 @@ async def list_orders(
         where["date"] = date_filter
 
     if status:
-        where["status"] = status.upper()
+        where["orderStatus"] = status.upper()
 
     if client_name:
         where["clientName"] = {"contains": client_name, "mode": "insensitive"}
@@ -95,6 +136,7 @@ async def update_order(db: Prisma, order_id: str, data: OutsideOrderUpdate):
     order = await get_order(db, order_id)
 
     update_data: dict = {}
+
     if data.client_name is not None:
         update_data["clientName"] = data.client_name
     if data.client_link is not None:
@@ -105,20 +147,21 @@ async def update_order(db: Prisma, order_id: str, data: OutsideOrderUpdate):
         update_data["orderSheet"] = data.order_sheet
     if data.assign_team is not None:
         update_data["assignTeam"] = data.assign_team
-    if data.status is not None:
-        update_data["status"] = data.status.value if hasattr(data.status, "value") else data.status
+    if data.order_status is not None:
+        update_data["orderStatus"] = _enum_val(data.order_status)
     if data.payment_method is not None:
         update_data["paymentMethod"] = data.payment_method
     if data.payment_method_details is not None:
         update_data["paymentMethodDetails"] = data.payment_method_details
 
+    # Always recompute dueAmount from whichever amounts are changing
     order_amount   = float(data.order_amount)   if data.order_amount   is not None else float(order.orderAmount)
     receive_amount = float(data.receive_amount) if data.receive_amount is not None else float(order.receiveAmount)
 
     if data.order_amount is not None:
-        update_data["orderAmount"]   = data.order_amount
+        update_data["orderAmount"]   = float(data.order_amount)
     if data.receive_amount is not None:
-        update_data["receiveAmount"] = data.receive_amount
+        update_data["receiveAmount"] = float(data.receive_amount)
 
     update_data["dueAmount"] = order_amount - receive_amount
 
@@ -153,6 +196,8 @@ def _fmt(v) -> str:
     """Safe string formatter for cell values."""
     if v is None:
         return ""
+    if isinstance(v, datetime):
+        return v.date().isoformat()
     if isinstance(v, dt_date):
         return v.isoformat()
     if isinstance(v, Decimal):
@@ -170,9 +215,7 @@ async def export_orders(
 ) -> tuple[bytes, str]:
     """
     Build and return (xlsx_bytes, filename) for the filtered orders.
-
     Parameters mirror list_orders() so the same filters apply to export.
-    label is used as the sheet name and filename prefix.
     """
     rows = await list_orders(db, date_filter, status, client_name, assign_team)
 
@@ -193,12 +236,12 @@ async def export_orders(
     for row_idx, order in enumerate(rows, start=2):
         fill = _ALT_ROW_FILL if row_idx % 2 == 0 else None
         values = [
-            _fmt(order.date),
+            _fmt(order.date),         # normalise datetime → date string
             _fmt(order.clientId),
             _fmt(order.clientName),
             _fmt(order.clientLink),
             _fmt(order.orderDetails),
-            _fmt(getattr(order, "orderStatus", None) or getattr(order, "status", "")),
+            _fmt(order.orderStatus),
             float(order.orderAmount),
             float(order.receiveAmount),
             float(order.dueAmount),

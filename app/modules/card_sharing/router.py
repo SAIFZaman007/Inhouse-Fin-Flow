@@ -1,44 +1,41 @@
 """
 app/modules/card_sharing/router.py
 ════════════════════════════════════════════════════════════════════════════════
-v4 — Full router rewrite.
+v4.1 — Date parsing fix
 
-All endpoints are CEO_DIRECTOR only (most sensitive module).
+ROOT CAUSE of ValueError: Invalid isoformat string: 'string'
+─────────────────────────────────────────────────────────────
+The original add_card endpoint declared `date` as `str = Form(...)` and then
+manually called `_date.fromisoformat(date)` in the body. When Swagger UI is
+used for testing it pre-fills untyped Form fields with the placeholder value
+"string", which is not a valid ISO date — crash.
 
-Changes vs v3:
-  • GET  /card-sharing           — new filters: serial_no, account_name, date range
-  • POST /card-sharing           — accepts accountName (not account_id UUID)
-                                   + optional screenshot file uploads in same request
-  • PATCH /card-sharing/{id}     — now also accepts screenshot file uploads
-  • GET  /card-sharing/export    — dedicated Excel export (replaces export module route)
-  • POST /card-sharing/{id}/screenshots — bug fixed (async Cloudinary + set syntax)
-  • DELETE /card-sharing/{id}/screenshots — unchanged
+THE FIX — two changes in add_card:
+  1. Declare `date` as `date = Form(...)` (Python date type, not str).
+     FastAPI validates and parses it automatically. Invalid dates get a clean
+     422 Unprocessable Entity before the endpoint body runs.
+  2. Remove the now-redundant `_date.fromisoformat(date)` manual parse line.
+     `date` is already a datetime.date object; pass it directly to the schema.
 
-Endpoints:
-  GET    /card-sharing                        → list cards (masked + filters)
-  GET    /card-sharing/export                 → Excel download
-  POST   /card-sharing                        → create card (+ optional screenshots)
-  GET    /card-sharing/{id}                   → get card (masked)
-  GET    /card-sharing/{id}/secure            → get card WITH decrypted fields
-  PATCH  /card-sharing/{id}                   → update card (+ optional screenshots)
-  DELETE /card-sharing/{id}                   → delete card
-  POST   /card-sharing/{id}/screenshots       → upload screenshot(s)
-  DELETE /card-sharing/{id}/screenshots       → remove a screenshot URL
+No other endpoints are affected. service.py is unchanged.
 ════════════════════════════════════════════════════════════════════════════════
 """
+from datetime import date                               
+from decimal import Decimal
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from fastapi.responses import Response
 from prisma import Prisma
-from pydantic import BaseModel
 
 from app.core.database import get_db
 from app.core.dependencies import CEO_DIRECTOR
 from app.shared.filters import DateRangeFilter
 
 from .schema import (
+    CardSharingCreate,
     CardSharingResponse, CardSharingSensitiveResponse,
+    CardSharingUpdate,
     ScreenshotRemoveBody, ScreenshotUploadResponse,
 )
 from .service import (
@@ -130,7 +127,7 @@ async def export_cards_endpoint(
 async def add_card(
     # ── Card fields ────────────────────────────────────────────────────────────
     serial_no:             str            = Form(..., description="Unique card serial number"),
-    date:                  str            = Form(..., description="Card date (YYYY-MM-DD)"),
+    date:                  date           = Form(..., description="Card date (YYYY-MM-DD)"),  # ← typed as date, not str
     account_name:          str            = Form(..., description="Payoneer accountName (not UUID)"),
     card_no:               str            = Form(..., description="Card number (will be encrypted)"),
     card_expire:           str            = Form(..., description="Expiry (MM/YY)"),
@@ -158,16 +155,14 @@ async def add_card(
       the internal UUID.
     • Optionally attach one or more screenshot files in the same request.
       They are uploaded to Cloudinary and their URLs stored in cardDetails.
+    • `date` must be a valid ISO-8601 date string: YYYY-MM-DD.
+      FastAPI validates this automatically — invalid values return 422.
     """
-    from datetime import date as _date
-    from decimal import Decimal
-    from .schema import CardSharingCreate
-
-    parsed_date = _date.fromisoformat(date)
-
+    # `date` is already a datetime.date object — FastAPI parsed and validated it.
+    # No manual fromisoformat() call needed (that was the source of the crash).
     payload = CardSharingCreate(
         serial_no=serial_no,
-        date=parsed_date,
+        date=date,                                      # ← already a date object
         details=details,
         account_name=account_name,
         card_no=card_no,
@@ -248,9 +243,6 @@ async def update_card_endpoint(
     Attach screenshot files to append them to the card's Cloudinary gallery
     without a separate API call.
     """
-    from decimal import Decimal
-    from .schema import CardSharingUpdate
-
     payload = CardSharingUpdate(
         details=details,
         card_no=card_no,

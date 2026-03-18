@@ -1,9 +1,13 @@
 """
 app/modules/dollar_exchange/service.py
 ========================================
-v2 — Additions:
-  • list_exchanges() — new optional filter: account_from (icontains)
-  • export_exchanges() — openpyxl Excel export with per-account & date filtering
+v3 — date serialization fix
+
+DateTime @db.Date fields in prisma-py v0.14.0 MUST be passed as
+datetime.datetime objects (midnight), using the same pattern as the
+working Fiverr module:
+
+    datetime.combine(data.date, time.min)
 
 SCHEMA FACTS (schema.prisma — ground truth):
   Field name   : paymentStatus            ← camelCase, matches schema exactly
@@ -11,7 +15,7 @@ SCHEMA FACTS (schema.prisma — ground truth):
   Enum values  : RECEIVED | DUE           ← use these exact strings everywhere
 
 PRISMA-CLIENT-PY RULES:
-  create/update data dict  → "paymentStatus": "RECEIVED"  (exact schema field + enum value)
+  create/update data dict  → "paymentStatus": "RECEIVED"
   where/filter dict        → "paymentStatus": "RECEIVED"
   Python attribute access  → r.paymentStatus
 
@@ -20,7 +24,7 @@ NOTE ON .aggregate():
   All aggregation is done via db.query_raw() with raw PostgreSQL SQL.
 """
 import io
-from datetime import date as dt_date
+from datetime import date as dt_date, datetime, time
 from decimal import Decimal
 from typing import Optional
 
@@ -34,20 +38,35 @@ from .schema import DollarExchangeCreate, DollarExchangeUpdate
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Private helper  (mirrors the Fiverr service convention exactly)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dt(d: dt_date) -> datetime:
+    """
+    Convert datetime.date → datetime.datetime at midnight.
+
+    prisma-py v0.14.0 requires a full datetime object for every
+    DateTime @db.Date field — the same pattern used across the Fiverr
+    module: datetime.combine(d, time.min).
+    """
+    return datetime.combine(d, time.min)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CRUD
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def create_exchange(db: Prisma, data: DollarExchangeCreate):
     return await db.dollarexchange.create(
         data={
-            "date":          data.date,
+            "date":          _dt(data.date),   # ← datetime.combine(date, time.min)
             "details":       data.details,
             "accountFrom":   data.accountFrom,
             "accountTo":     data.accountTo,
-            "debit":         data.debit,
-            "credit":        data.credit,
-            "rate":          data.rate,
-            "totalBdt":      data.total_bdt,
+            "debit":         float(data.debit),
+            "credit":        float(data.credit),
+            "rate":          float(data.rate),
+            "totalBdt":      float(data.total_bdt),
             "paymentStatus": data.payment_status.value,
         }
     )
@@ -111,8 +130,8 @@ async def update_exchange(db: Prisma, exchange_id: str, data: DollarExchangeUpda
         update_data["accountTo"] = data.accountTo
 
     if data.rate is not None:
-        new_rate = data.rate
-        exchange_amount = (
+        new_rate = float(data.rate)
+        exchange_amount = float(
             existing.credit
             if (existing.credit and existing.credit > 0)
             else existing.debit or Decimal("0")
@@ -177,6 +196,8 @@ _COL_WIDTHS = [12, 36, 22, 22, 14, 14, 10, 18, 16]
 def _fmt(v) -> str:
     if v is None:
         return ""
+    if isinstance(v, datetime):          # ORM may return DateTime @db.Date as datetime
+        return v.date().isoformat()
     if isinstance(v, dt_date):
         return v.isoformat()
     if isinstance(v, Decimal):
