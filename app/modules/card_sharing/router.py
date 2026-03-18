@@ -20,7 +20,7 @@ THE FIX — two changes in add_card:
 No other endpoints are affected. service.py is unchanged.
 ════════════════════════════════════════════════════════════════════════════════
 """
-from datetime import date                               
+from datetime import date                               # ← typed import for Form
 from decimal import Decimal
 from typing import List, Optional
 
