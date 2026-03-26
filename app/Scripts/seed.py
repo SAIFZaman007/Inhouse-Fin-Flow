@@ -92,7 +92,12 @@ async def reset_all(db: Prisma) -> None:
     """
     _header("🗑  RESET — Clearing All Tables")
 
-    # Children first, then parents, then standalone tables
+    # Children before parents — strict FK-safe dependency order.
+    # CardSharing references PayoneerAccount (FK added in migration
+    # 20260326051848_role_matrix_integrated), so CardSharing MUST be
+    # deleted before PayoneerAccount. Previously it came after, which
+    # had no effect on localhost (no FK enforced) but raises
+    # ForeignKeyViolationError on production where the FK now exists.
     steps = [
         ("TermsCondition",      db.termscondition),
         ("PermissionRule",      db.permissionrule),
@@ -103,13 +108,13 @@ async def reset_all(db: Prisma) -> None:
         ("UpworkOrder",         db.upworkorder),
         ("UpworkEntry",         db.upworkentry),
         ("UpworkProfile",       db.upworkprofile),
-        ("PayoneerTransaction", db.payoneertransaction),
-        ("PayoneerAccount",     db.payoneeraccount),
+        ("CardSharing",         db.cardsharing),         # ← BEFORE PayoneerAccount (FK child)
+        ("PayoneerTransaction", db.payoneertransaction), # ← BEFORE PayoneerAccount (FK child)
+        ("PayoneerAccount",     db.payoneeraccount),     # ← parent, now safe to delete
         ("PmakTransaction",     db.pmaktransaction),
         ("PmakAccount",         db.pmakaccount),
         ("OutsideOrder",        db.outsideorder),
         ("DollarExchange",      db.dollarexchange),
-        ("CardSharing",         db.cardsharing),
         ("HrExpense",           db.hrexpense),
         ("Inventory",           db.inventory),
         ("User",                db.user),
