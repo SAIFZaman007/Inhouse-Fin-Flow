@@ -1,13 +1,11 @@
 -- ============================================================================
 -- Migration: 20260326051848_role_matrix_integrated
-===================================================================
+-- ============================================================================
 
 -- CreateEnum
--- (VisibilityStatus is new — does not exist on production yet)
 CREATE TYPE "VisibilityStatus" AS ENUM ('VISIBLE', 'HIDDEN');
 
--- AlterTable: add cardReceiveBank only if it does not already exist
--- (202603151231_fix_card_receive_bank_column may have already added it)
+-- AlterTable: guard against duplicate column from 202603151231_fix_card_receive_bank_column
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -19,7 +17,7 @@ BEGIN
     END IF;
 END $$;
 
--- CreateTable: permission_rules
+-- CreateTable
 CREATE TABLE "permission_rules" (
     "id"              TEXT               NOT NULL,
     "moduleName"      TEXT               NOT NULL,
@@ -34,7 +32,7 @@ CREATE TABLE "permission_rules" (
     CONSTRAINT "permission_rules_pkey" PRIMARY KEY ("id")
 );
 
--- CreateTable: terms_conditions
+-- CreateTable
 CREATE TABLE "terms_conditions" (
     "id"        TEXT         NOT NULL,
     "content"   TEXT         NOT NULL,
@@ -51,8 +49,7 @@ CREATE UNIQUE INDEX "permission_rules_moduleName_key" ON "permission_rules"("mod
 -- CreateIndex
 CREATE INDEX "permission_rules_moduleName_idx" ON "permission_rules"("moduleName");
 
--- AddForeignKey: add constraint only if it does not already exist
--- (an earlier migration may have already added card_sharing_accountId_fkey)
+-- AddForeignKey: guard against duplicate constraint from earlier migration
 DO $$
 BEGIN
     IF NOT EXISTS (
