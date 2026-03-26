@@ -92,27 +92,33 @@ async def reset_all(db: Prisma) -> None:
     """
     _header("🗑  RESET — Clearing All Tables")
 
-    # Children before parents — strict FK-safe dependency order.
-    # CardSharing references PayoneerAccount (FK added in migration
-    # 20260326051848_role_matrix_integrated), so CardSharing MUST be
-    # deleted before PayoneerAccount. Previously it came after, which
-    # had no effect on localhost (no FK enforced) but raises
-    # ForeignKeyViolationError on production where the FK now exists.
+    # Strict FK-safe dependency order — ALL children before their parents.
+    # Full FK map from schema.prisma:
+    #   FiverrOrder, FiverrEntry     → FiverrProfile
+    #   UpworkOrder, UpworkEntry     → UpworkProfile
+    #   CardSharing, PayoneerTransaction → PayoneerAccount
+    #   PmakTransaction, PmakInhouse → PmakAccount   ← PmakInhouse was MISSING
     steps = [
         ("TermsCondition",      db.termscondition),
         ("PermissionRule",      db.permissionrule),
         ("Invitation",          db.invitation),
+        # ── Fiverr (children before FiverrProfile) ───────────────────────────
         ("FiverrOrder",         db.fiverrorder),
         ("FiverrEntry",         db.fiverrentry),
         ("FiverrProfile",       db.fiverrprofile),
+        # ── Upwork (children before UpworkProfile) ───────────────────────────
         ("UpworkOrder",         db.upworkorder),
         ("UpworkEntry",         db.upworkentry),
         ("UpworkProfile",       db.upworkprofile),
-        ("CardSharing",         db.cardsharing),         # ← BEFORE PayoneerAccount (FK child)
-        ("PayoneerTransaction", db.payoneertransaction), # ← BEFORE PayoneerAccount (FK child)
-        ("PayoneerAccount",     db.payoneeraccount),     # ← parent, now safe to delete
+        # ── Payoneer (children before PayoneerAccount) ───────────────────────
+        ("CardSharing",         db.cardsharing),
+        ("PayoneerTransaction", db.payoneertransaction),
+        ("PayoneerAccount",     db.payoneeraccount),
+        # ── PMAK (children before PmakAccount) ───────────────────────────────
+        ("PmakInhouse",         db.pmakinhouse),          # ← was MISSING
         ("PmakTransaction",     db.pmaktransaction),
         ("PmakAccount",         db.pmakaccount),
+        # ── Standalone tables ─────────────────────────────────────────────────
         ("OutsideOrder",        db.outsideorder),
         ("DollarExchange",      db.dollarexchange),
         ("HrExpense",           db.hrexpense),
