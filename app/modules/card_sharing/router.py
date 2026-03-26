@@ -1,26 +1,19 @@
 """
 app/modules/card_sharing/router.py
 ════════════════════════════════════════════════════════════════════════════════
-v4.1 — Date parsing fix
+v5 — Transparent card data + structured DELETE responses
 
-ROOT CAUSE of ValueError: Invalid isoformat string: 'string'
-─────────────────────────────────────────────────────────────
-The original add_card endpoint declared `date` as `str = Form(...)` and then
-manually called `_date.fromisoformat(date)` in the body. When Swagger UI is
-used for testing it pre-fills untyped Form fields with the placeholder value
-"string", which is not a valid ISO date — crash.
-
-THE FIX — two changes in add_card:
-  1. Declare `date` as `date = Form(...)` (Python date type, not str).
-     FastAPI validates and parses it automatically. Invalid dates get a clean
-     422 Unprocessable Entity before the endpoint body runs.
-  2. Remove the now-redundant `_date.fromisoformat(date)` manual parse line.
-     `date` is already a datetime.date object; pass it directly to the schema.
-
-No other endpoints are affected. service.py is unchanged.
+Changes vs v4.1:
+  • cardNo and cardCvc are fully visible in all responses — no masking.
+  • GET /{card_id}/secure still exists for backward compatibility but now
+    returns the same unmasked data as GET /{card_id} (both use CEO_DIRECTOR).
+  • DELETE /{card_id}              → structured JSON response body.
+  • DELETE /{card_id}/screenshots  → structured JSON response body.
+  • service.py is NOT affected — include_sensitive flag is kept as-is so
+    the service signature remains stable.
 ════════════════════════════════════════════════════════════════════════════════
 """
-from datetime import date                               # ← typed import for Form
+from datetime import date                               
 from decimal import Decimal
 from typing import List, Optional
 
@@ -67,7 +60,7 @@ async def get_cards(
     _=Depends(CEO_DIRECTOR),
 ):
     """
-    List all cards — cardNo and cardCvc are masked.
+    List all card sharing records — all fields fully visible.
 
     Filters (all combinable):
     - `serial_no`    — case-insensitive substring search
@@ -76,7 +69,7 @@ async def get_cards(
     """
     return await list_cards(
         db,
-        include_sensitive=False,
+        include_sensitive=True,
         serial_no=serial_no,
         account_name=account_name,
         date_filter=filters.to_prisma_filter() or None,
@@ -87,7 +80,7 @@ async def get_cards(
 
 @router.get(
     "/export",
-    summary="Export card sharing records to Excel (sensitive fields excluded)",
+    summary="Export card sharing records to Excel",
     response_description="Excel workbook download",
 )
 async def export_cards_endpoint(
@@ -100,8 +93,8 @@ async def export_cards_endpoint(
     """
     Export filtered card records to Excel.
 
-    cardNo and cardCvc are NEVER included in the export.
-    Screenshot URLs are replaced with a count for security.
+    All card fields are included in the export.
+    Screenshot URLs are replaced with a count for readability.
     """
     meta     = filters.meta()
     date_str = (meta["dateRange"]["from"] or "all").replace("-", "")
@@ -127,11 +120,11 @@ async def export_cards_endpoint(
 async def add_card(
     # ── Card fields ────────────────────────────────────────────────────────────
     serial_no:             str            = Form(..., description="Unique card serial number"),
-    date:                  date           = Form(..., description="Card date (YYYY-MM-DD)"),  # ← typed as date, not str
+    date:                  date           = Form(..., description="Card date (YYYY-MM-DD)"),
     account_name:          str            = Form(..., description="Payoneer accountName (not UUID)"),
-    card_no:               str            = Form(..., description="Card number (will be encrypted)"),
+    card_no:               str            = Form(..., description="Card number"),
     card_expire:           str            = Form(..., description="Expiry (MM/YY)"),
-    card_cvc:              str            = Form(..., description="CVC (will be encrypted)"),
+    card_cvc:              str            = Form(..., description="CVC"),
     card_vendor:           str            = Form(..., description="Card vendor / issuer"),
     card_limit:            float          = Form(..., description="Card spending limit"),
     card_payment_received: float          = Form(0.0, description="Amount already received"),
@@ -151,18 +144,14 @@ async def add_card(
     Create a card record.
 
     • Provide **accountName** (human-readable) — the system looks up the
-      matching PayoneerAccount automatically.  You no longer need to know
-      the internal UUID.
+      matching PayoneerAccount automatically.
     • Optionally attach one or more screenshot files in the same request.
-      They are uploaded to Cloudinary and their URLs stored in cardDetails.
     • `date` must be a valid ISO-8601 date string: YYYY-MM-DD.
-      FastAPI validates this automatically — invalid values return 422.
+    • cardNo and cardCvc are stored and returned as plain text — no encryption.
     """
-    # `date` is already a datetime.date object — FastAPI parsed and validated it.
-    # No manual fromisoformat() call needed (that was the source of the crash).
     payload = CardSharingCreate(
         serial_no=serial_no,
-        date=date,                                      # ← already a date object
+        date=date,
         details=details,
         account_name=account_name,
         card_no=card_no,
@@ -184,7 +173,7 @@ async def add_card(
         if valid_files:
             await add_screenshots_bulk(db, card_response["id"], valid_files)
             # Refresh card to include uploaded screenshot URLs
-            card_response = await get_card(db, card_response["id"], include_sensitive=False)
+            card_response = await get_card(db, card_response["id"], include_sensitive=True)
 
     return card_response
 
@@ -197,21 +186,21 @@ async def get_card_masked(
     db:      Prisma = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
 ):
-    """Get a single card — cardNo and cardCvc are masked."""
-    return await get_card(db, card_id, include_sensitive=False)
+    """Get a single card — all fields fully visible."""
+    return await get_card(db, card_id, include_sensitive=True)
 
 
 @router.get(
     "/{card_id}/secure",
     response_model=CardSharingSensitiveResponse,
-    summary="Get card with decrypted card number & CVC — CEO/Director only",
+    summary="Get full card details — CEO/Director only",
 )
 async def get_card_secure(
     card_id: str,
     db:      Prisma = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
 ):
-    """Returns fully decrypted card data. Audit-log this endpoint in production."""
+    """Returns full card data. Kept for backward compatibility."""
     return await get_card(db, card_id, include_sensitive=True)
 
 
@@ -221,9 +210,9 @@ async def get_card_secure(
 async def update_card_endpoint(
     card_id:               str,
     details:               Optional[str]   = Form(None),
-    card_no:               Optional[str]   = Form(None, description="New card number (will be encrypted)"),
+    card_no:               Optional[str]   = Form(None, description="New card number"),
     card_expire:           Optional[str]   = Form(None),
-    card_cvc:              Optional[str]   = Form(None, description="New CVC (will be encrypted)"),
+    card_cvc:              Optional[str]   = Form(None, description="New CVC"),
     card_vendor:           Optional[str]   = Form(None),
     card_limit:            Optional[float] = Form(None),
     card_payment_received: Optional[float] = Form(None),
@@ -260,27 +249,36 @@ async def update_card_endpoint(
     if raw:
         card_response = await update_card(db, card_id, payload)
     else:
-        card_response = await get_card(db, card_id, include_sensitive=False)
+        card_response = await get_card(db, card_id, include_sensitive=True)
 
     # Upload any attached screenshots
     if screenshots:
         valid_files = [f for f in screenshots if f.filename]
         if valid_files:
             await add_screenshots_bulk(db, card_id, valid_files)
-            card_response = await get_card(db, card_id, include_sensitive=False)
+            card_response = await get_card(db, card_id, include_sensitive=True)
 
     return card_response
 
 
 # ── Delete ────────────────────────────────────────────────────────────────────
 
-@router.delete("/{card_id}", status_code=204)
+@router.delete("/{card_id}", status_code=200)
 async def delete_card_endpoint(
     card_id: str,
     db:      Prisma = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
 ):
+    """
+    Delete a card record and all associated data.
+    Returns a structured success message.
+    """
     await delete_card(db, card_id)
+    return {
+        "success": True,
+        "message": "Card record deleted successfully.",
+        "id": card_id,
+    }
 
 
 # ── Screenshot management  (dedicated endpoints still available) ───────────────
@@ -298,7 +296,7 @@ async def upload_screenshot(
     _=Depends(CEO_DIRECTOR),
 ):
     """
-    Upload one screenshot file.  The secure_url is appended to cardDetails.
+    Upload one screenshot file. The secure_url is appended to cardDetails.
 
     Tip: You can also upload screenshots directly in the POST / PATCH endpoints
     by attaching files to the `screenshots` field — avoids a second round-trip.
@@ -308,6 +306,7 @@ async def upload_screenshot(
 
 @router.delete(
     "/{card_id}/screenshots",
+    status_code=200,
     summary="Remove a screenshot URL from card details",
 )
 async def delete_screenshot(
@@ -316,5 +315,14 @@ async def delete_screenshot(
     db:      Prisma = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
 ):
-    """Remove a Cloudinary URL from the card's cardDetails list."""
-    return await remove_screenshot(db, card_id, body.url)
+    """
+    Remove a Cloudinary URL from the card's cardDetails list.
+    Returns a structured success message confirming the removed URL.
+    """
+    await remove_screenshot(db, card_id, body.url)
+    return {
+        "success": True,
+        "message": "Screenshot removed successfully.",
+        "card_id": card_id,
+        "removed_url": body.url,
+    }

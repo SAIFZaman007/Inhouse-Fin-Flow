@@ -1,17 +1,18 @@
 """
 app/modules/upwork/router.py
 ════════════════════════════════════════════════════════════════════════════════
-v7 — Enterprise Edition
+v8 — Enterprise Edition
 
 Endpoint matrix
 ───────────────────────────────────────────────────────────────────────────────
 GET    /profiles                 HR_AND_ABOVE  Combined totals + all profiles
                                               Paginated (50/page). ?name= search.
 GET    /profiles/{id}            HR_AND_ABOVE  Single-profile drill-down (paginated)
-POST   /profiles                 CEO_DIRECTOR  Create + optional initial snapshot
-PATCH  /profiles/{id}            CEO_DIRECTOR  Partial update (rename / isActive /
+                                              + optional ?name= filter
+POST   /profiles                 HR_AND_ABOVE  Create + optional initial snapshot
+PATCH  /profiles/{id}            HR_AND_ABOVE  Partial update (rename / isActive /
                                               snapshot fields — all optional)
-DELETE /profiles/{id}            CEO_DIRECTOR  Soft-delete (isActive → false)
+DELETE /profiles/{id}            CEO_DIRECTOR  Soft-delete — returns JSON message
 
 POST   /snapshots                HR_AND_ABOVE  Upsert daily snapshot (by profileName)
 GET    /profiles/{id}/snapshots  HR_AND_ABOVE  Paginated snapshots — includes profileName
@@ -117,6 +118,9 @@ Returns a complete breakdown for **one profile**:
 - Paginated daily snapshots in the window (newest first, 50 per page)
 - Paginated orders in the window (newest first, 50 per page)
 
+Use `?name=` for an optional case-insensitive filter on profile name
+(useful when resolving a profile by name instead of ID).
+
 Same period + pagination query params as GET /profiles.
     """,
 )
@@ -124,10 +128,14 @@ async def get_profile(
     profile_id: str,
     filters:    DateRangeFilter = Depends(),
     pagination: PageParams      = Depends(),
+    name: Annotated[
+        Optional[str],
+        Query(description="Optional case-insensitive filter on profile name."),
+    ] = None,
     db: Prisma = Depends(get_db),
     _=Depends(HR_AND_ABOVE),
 ):
-    return await get_profile_detail(db, profile_id, filters, pagination=pagination)
+    return await get_profile_detail(db, profile_id, filters, pagination=pagination, name=name)
 
 
 @router.post(
@@ -143,12 +151,14 @@ no separate POST /snapshots call needed. `snapshot_date` defaults to today.
 **Required:** `profileName`
 **Optional snapshot fields:** `snapshot_date`, `available_withdraw`, `pending`,
 `in_review`, `work_in_progress`, `withdrawn`, `connects`, `upwork_plus`
+
+**Access:** CEO, Director, and HR.
     """,
 )
 async def add_profile(
     body: UpworkProfileCreate,
     db:   Prisma = Depends(get_db),
-    _=Depends(CEO_DIRECTOR),
+    _=Depends(HR_AND_ABOVE),
 ):
     return await create_profile(db, body)
 
@@ -189,22 +199,32 @@ without a separate POST /snapshots round-trip.
 Sending an empty body `{}` is accepted and returns the current profile state
 unchanged (idempotent).
 
-**Access:** CEO and Director only.
+**Access:** CEO, Director, and HR.
     """,
 )
 async def patch_profile(
     profile_id: str,
     body: UpworkProfileUpdate,
     db:   Prisma = Depends(get_db),
-    _=Depends(CEO_DIRECTOR),
+    _=Depends(HR_AND_ABOVE),
 ):
     return await update_profile(db, profile_id, body)
 
 
 @router.delete(
     "/profiles/{profile_id}",
-    status_code=204,
+    status_code=200,
     summary="Soft-delete an Upwork profile (sets isActive = false)",
+    description="""
+Soft-deletes an Upwork profile by setting `isActive` to `false`.
+
+The profile and all its historical snapshots/orders remain intact in the
+database and can be restored via `PATCH /profiles/{id}` with `isActive: true`.
+
+Returns a JSON confirmation message on success.
+
+**Access:** CEO and Director only.
+    """,
 )
 async def remove_profile(
     profile_id: str,
@@ -212,6 +232,11 @@ async def remove_profile(
     _=Depends(CEO_DIRECTOR),
 ):
     await deactivate_profile(db, profile_id)
+    return {
+        "success": True,
+        "message": "Upwork profile has been deactivated successfully.",
+        "profileId": profile_id,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

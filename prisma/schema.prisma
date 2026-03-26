@@ -2,7 +2,6 @@
 // -----------------------------------------------------------------------------
 //  MAKTech Financial Flow -- Production Schema  (v3 -- Enterprise Edition)
 // -----------------------------------------------------------------------------
-// -----------------------------------------------------------------------------
 
 generator client {
   provider                    = "prisma-client-py"
@@ -60,6 +59,11 @@ enum InvitationStatus {
   ACCEPTED
   EXPIRED
   CANCELLED
+}
+
+enum VisibilityStatus {
+  VISIBLE
+  HIDDEN
 }
 
 // ===============================================================================
@@ -357,25 +361,21 @@ model DollarExchange {
 // ===============================================================================
 //  CARD SHARING
 // ===============================================================================
-//  Sensitive model -- cardNo and cardCvc are stored encrypted at rest.
-//  cardDetails stores a JSON array of Cloudinary secure_url strings
-//  (card screenshots uploaded via Cloudinary API).
-//  All monetary values in USD.
 
 model CardSharing {
   id               String          @id @default(cuid())
   date             DateTime        @db.Date
   serialNo         String          @unique
   details          String?
-  /// FK to PayoneerAccount for referential integrity & reporting
+
   accountId        String
   account          PayoneerAccount @relation(fields: [accountId], references: [id])
-  /// Stored encrypted (AES-256 via app layer before write)
+
   cardNo           String
   cardExpire       String
-  /// Stored encrypted (AES-256 via app layer before write)
+
   cardCvc          String
-  /// JSON array of Cloudinary secure_url strings, e.g. ["https://res.cloudinary.com/..."]
+
   cardDetails      Json            @default("[]")
   /// Who the card is shared with (vendor / partner name)
   cardVendor       String
@@ -439,4 +439,33 @@ model Inventory {
 
   @@index([date])
   @@map("inventory")
+}
+
+
+// ===============================================================================
+//  Role & Permission Rules
+// ===============================================================================
+model PermissionRule {
+  id             String           @id @default(cuid())
+  moduleName     String           @unique
+  ceoAccess      VisibilityStatus @default(VISIBLE) @map("ceo_access")
+  directorAccess VisibilityStatus @default(VISIBLE) @map("director_access")
+  hrAccess       VisibilityStatus @default(HIDDEN)  @map("hr_access")
+  bdevAccess     VisibilityStatus @default(HIDDEN)  @map("bdev_access")
+  displayOrder   Int              @default(0)
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  @@index([moduleName])
+  @@map("permission_rules")
+}
+
+model TermsCondition {
+  id        String   @id @default(cuid())
+  content   String   @db.Text
+  version   Int      @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("terms_conditions")
 }

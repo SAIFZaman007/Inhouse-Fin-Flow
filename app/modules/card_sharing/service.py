@@ -1,26 +1,7 @@
 """
 app/modules/card_sharing/service.py
 ================================================================================
-v4.1 — Production Fix
-
-ROOT CAUSE:
-  PrismaError: Field account is required to return data, got `null` instead.
-
-  During the v3_enterprise_changes migration, orphaned card_sharing rows were
-  backfilled with accountId = '' (empty string sentinel) because no safe FK
-  value existed at migration time. When Prisma executes include={"account": True}
-  on these rows, it finds no matching PayoneerAccount row and raises a non-null
-  violation — crashing the entire list endpoint.
-
-TWO-PART FIX:
-  1. DB fix  — run fix_orphaned_card_sharing.sql to assign real accountIds
-               (or delete junk rows) on production.
-  2. Code fix — this file adds a WHERE accountId != '' guard on all queries
-               so the endpoint never crashes while any unresolved rows exist.
-               _serialize_card already handles card.account being None safely.
-
-  Once fix_orphaned_card_sharing.sql is applied AND the FK constraint is added,
-  the guard becomes a silent no-op and can be removed in a future cleanup.
+v4.1
 ================================================================================
 """
 import io

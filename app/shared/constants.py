@@ -2,14 +2,10 @@
 app/shared/constants.py
 ════════════════════════════════════════════════════════════════════════════════
 Shared enums used across modules.
-
-v3 changes:
-  PmakTransactionStatus renamed → PmakStatus (matches Prisma enum name)
-  InhouseOrderStatus added (for PmakInhouse.orderStatus)
-  PmakTransactionStatus kept as alias for backward compatibility
 ════════════════════════════════════════════════════════════════════════════════
 """
 from enum import Enum
+from typing import Final
 
 class RoleEnum(str, Enum):
     """User roles in the system."""
@@ -53,6 +49,30 @@ class OrderStatus(str, Enum):
 class PaymentStatus(str, Enum):
     RECEIVED = "RECEIVED"
     DUE      = "DUE"
+    
+
+# Default visible modules per role (used for seed + documentation)
+# The actual live values live in the DB (PermissionRule rows).
+ROLE_DEFAULT_MODULES: dict[str, set[str]] = {
+    "CEO": {
+        "dashboard", "fiverr", "upwork", "payoneer", "pmak",
+        "pmak_inhouse", "outside_orders", "card_sharing",
+        "dollar_exchange", "hr_expense", "inventory",
+    },
+    "DIRECTOR": {
+        "dashboard", "fiverr", "upwork", "payoneer", "pmak",
+        "pmak_inhouse", "outside_orders", "card_sharing",
+        "dollar_exchange", "hr_expense", "inventory",
+    },
+    "HR": {
+        "fiverr", "upwork", "outside_orders", "pmak", "pmak_inhouse", "hr_expense", "inventory",
+    },
+    "BDEV": {
+        "pmak", "pmak_inhouse",
+    },
+}
+
+HR_ALLOWED_MODULES = ROLE_DEFAULT_MODULES["HR"]
     
 # Backward-compatible aliases
 OrderStatusEnum = OrderStatus

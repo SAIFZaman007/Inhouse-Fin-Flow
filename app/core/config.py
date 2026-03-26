@@ -87,10 +87,8 @@ class Settings(BaseSettings):
     def smtp_configured(self) -> bool:
         return bool(self.SMTP_USER and self.SMTP_PASSWORD)
 
-
 @lru_cache()
 def get_settings() -> Settings:
     return Settings()
-
 
 settings = get_settings()

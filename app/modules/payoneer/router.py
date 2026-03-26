@@ -1,20 +1,22 @@
 """
 app/modules/payoneer/router.py
 ════════════════════════════════════════════════════════════════════════════════
-v4 — Enterprise Edition
+v5 — Enterprise Edition
 
 Endpoint matrix
 ───────────────────────────────────────────────────────────────────────────────
 GET    /accounts                        CEO_DIRECTOR  Combined totals + all accounts
                                                       Period + ?name= filter. Paginated.
 POST   /accounts                        CEO_DIRECTOR  Create + optional opening balance
-PATCH  /accounts/{id}                   CEO_DIRECTOR  Partial update (rename / isActive /
+GET    /accounts/{account_id}           CEO_DIRECTOR  Single-account detail — full filter
+                                                      system (period-aware, paginated)
+PATCH  /accounts/{account_id}           CEO_DIRECTOR  Partial update (rename / isActive /
                                                       balance-adjustment — all optional)
-DELETE /accounts/{id}                   CEO_DIRECTOR  Soft-delete (isActive → false)
+DELETE /accounts/{account_id}           CEO_DIRECTOR  Soft-delete — returns JSON message
 
 POST   /transactions                    CEO_DIRECTOR  Add transaction (by accountName)
 PATCH  /transactions/{id}               CEO_DIRECTOR  Partial update (any field)
-DELETE /transactions/{id}               CEO_DIRECTOR  Hard delete
+DELETE /transactions/{id}               CEO_DIRECTOR  Hard delete — returns JSON message
 GET    /accounts/{id}/transactions      CEO_DIRECTOR  Paginated transactions + accountName
 
 GET    /export                          CEO_DIRECTOR  All-accounts Excel (period-aware)
@@ -46,6 +48,7 @@ from .service import (
     deactivate_account,
     delete_transaction,
     export_account_excel,
+    get_account_detail,
     get_account_transactions,
     list_accounts,
     update_account,
@@ -128,6 +131,34 @@ async def add_account(
     return await create_account(db, body)
 
 
+@router.get(
+    "/accounts/{account_id}",
+    summary="Single Payoneer account — full detail with period-aware filter",
+    description="""
+Returns a complete breakdown for **one Payoneer account**:
+
+- Account metadata (`id`, `accountName`, `isActive`)
+- `currentBalance` — the latest `remainingBalance` across all time
+- Period-scoped `periodCredit` and `periodDebit` for the selected window
+- **Paginated transactions** in the selected period (newest first, 50 per page)
+
+Each transaction row includes `accountName` for full client context.
+
+Period params: `daily` | `weekly` | `monthly` | `yearly` | `all` (default).
+
+**Access:** CEO and Director only.
+    """,
+)
+async def get_account(
+    account_id: str,
+    filters:    DateRangeFilter = Depends(),
+    pagination: PageParams      = Depends(),
+    db: Prisma = Depends(get_db),
+    _=Depends(CEO_DIRECTOR),
+):
+    return await get_account_detail(db, account_id, filters, pagination=pagination)
+
+
 @router.patch(
     "/accounts/{account_id}",
     summary="Partially update a Payoneer account (metadata + optional balance adjustment)",
@@ -175,8 +206,18 @@ async def patch_account(
 
 @router.delete(
     "/accounts/{account_id}",
-    status_code=204,
+    status_code=200,
     summary="Soft-delete a Payoneer account (sets isActive = false)",
+    description="""
+Soft-deletes a Payoneer account by setting `isActive` to `false`.
+
+The account and all its historical transactions remain intact in the database
+and can be restored via `PATCH /accounts/{id}` with `isActive: true`.
+
+Returns a JSON confirmation message on success.
+
+**Access:** CEO and Director only.
+    """,
 )
 async def remove_account(
     account_id: str,
@@ -184,6 +225,11 @@ async def remove_account(
     _=Depends(CEO_DIRECTOR),
 ):
     await deactivate_account(db, account_id)
+    return {
+        "success": True,
+        "message": "Payoneer account has been deactivated successfully.",
+        "accountId": account_id,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -283,8 +329,19 @@ async def account_transactions(
 
 @router.delete(
     "/transactions/{transaction_id}",
-    status_code=204,
+    status_code=200,
     summary="Delete a Payoneer transaction (hard delete)",
+    description="""
+Permanently removes a Payoneer transaction from the ledger.
+
+> ⚠️ **This is a hard delete** — the record cannot be recovered.
+> If `remainingBalance` values in subsequent transactions depend on this
+> entry, update them manually after deletion to maintain ledger integrity.
+
+Returns a JSON confirmation message on success.
+
+**Access:** CEO and Director only.
+    """,
 )
 async def remove_transaction(
     transaction_id: str,
@@ -292,6 +349,11 @@ async def remove_transaction(
     _=Depends(CEO_DIRECTOR),
 ):
     await delete_transaction(db, transaction_id)
+    return {
+        "success": True,
+        "message": "Payoneer transaction has been permanently deleted.",
+        "transactionId": transaction_id,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -2,25 +2,6 @@
 app/modules/payoneer/service.py
 ════════════════════════════════════════════════════════════════════════════════
 v4 — Enterprise Edition
-
-Changes vs v3
-─────────────
-update_account      EXTENDED — PATCH /accounts/{id}
-                      Now handles ``description``, ``initial_balance``, and
-                      ``opening_note`` from PayoneerAccountUpdate.
-                      When ``initial_balance`` is supplied the service appends a
-                      credit transaction immediately — no separate POST
-                      /transactions call required.
-                      ``description`` is stored in the new transaction's
-                      ``details`` field (if ``initial_balance`` is also given)
-                      or acknowledged in the response even without a transaction.
-
-update_transaction  FIXED — ``date`` is now Optional in the schema (v4).
-                      The guard `if data.date is not None` was already present
-                      in v3 so no logic change is needed here; the fix is purely
-                      in the schema layer.
-
-Everything else is unchanged from v3.
 ════════════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -461,6 +442,88 @@ async def get_account_transactions(
         "periodDebit":    float(period_debit),
         "pagination":     _pagination_meta(pagination, total),
         "transactions":   [_tx_to_dict(t, account.accountName) for t in transactions],
+    }
+    
+    
+async def get_account_detail(
+    db: Prisma,
+    account_id: str,
+    filters: DateRangeFilter,
+    pagination: Optional[PageParams] = None,
+) -> dict:
+    """
+    GET /payoneer/accounts/{account_id}
+    ─────────────────────────────────────
+    Returns a full detail view for a single Payoneer account:
+ 
+    - Account metadata (id, accountName, isActive)
+    - currentBalance — latest remainingBalance across all time
+    - periodCredit / periodDebit — sums within the selected filter window
+    - Paginated transactions in the window (newest first)
+ 
+    Each transaction row includes accountName for client convenience.
+    """
+    # ── Resolve account ───────────────────────────────────────────────────────
+    account = await db.payoneeraccount.find_unique(where={"id": account_id})
+    if not account:
+        raise HTTPException(status_code=404, detail="Payoneer account not found.")
+ 
+    date_f = filters.to_prisma_filter()
+ 
+    # ── Current balance — latest transaction across all time ──────────────────
+    latest_tx = await db.payoneertransaction.find_first(
+        where={"accountId": account_id},
+        order={"date": "desc"},
+    )
+    current_balance = float(latest_tx.remainingBalance) if latest_tx else 0.0
+ 
+    # ── Period-scoped WHERE clause ────────────────────────────────────────────
+    period_where: dict = {"accountId": account_id}
+    if date_f:
+        period_where["date"] = date_f
+ 
+    # ── Period aggregates ─────────────────────────────────────────────────────
+    period_txs = await db.payoneertransaction.find_many(where=period_where)
+    period_credit = sum(float(t.credit) for t in period_txs)
+    period_debit  = sum(float(t.debit)  for t in period_txs)
+    total_count   = len(period_txs)
+ 
+    # ── Paginated transaction list ────────────────────────────────────────────
+    find_kw: dict = dict(where=period_where, order={"date": "desc"})
+    if pagination:
+        find_kw["skip"] = pagination.skip
+        find_kw["take"] = pagination.take
+ 
+    transactions = await db.payoneertransaction.find_many(**find_kw)
+ 
+    tx_rows = [
+        {
+            "id":               t.id,
+            "accountId":        t.accountId,
+            "accountName":      account.accountName,
+            "date":             t.date.date() if isinstance(t.date, datetime) else t.date,
+            "details":          t.details,
+            "accountFrom":      t.accountFrom,
+            "accountTo":        t.accountTo,
+            "debit":            float(t.debit),
+            "credit":           float(t.credit),
+            "remainingBalance": float(t.remainingBalance),
+        }
+        for t in transactions
+    ]
+ 
+    return {
+        "filter": filters.meta(),
+        "account": {
+            "id":          account.id,
+            "accountName": account.accountName,
+            "isActive":    account.isActive,
+        },
+        "currentBalance": current_balance,
+        "periodCredit":   period_credit,
+        "periodDebit":    period_debit,
+        "pagination":     _pagination_meta(pagination, total_count),
+        "transactions":   tx_rows,
     }
 
 

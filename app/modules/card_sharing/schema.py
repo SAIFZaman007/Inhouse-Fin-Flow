@@ -1,17 +1,18 @@
 """
 app/modules/card_sharing/schema.py
 ================================================================================
-v4 — Breaking changes vs v3.1:
+v5 — Transparent card fields (no masking / no encryption):
+
+  cardNo and cardCvc are now fully visible in ALL responses.
+  CardSharingSensitiveResponse is kept as an alias of CardSharingResponse
+  for backward-compatible route imports — both expose the same full data.
 
   account_id  → account_name / payoneer_account_name  (friendlier lookup by name)
 
   The service layer performs a case-insensitive find_first on
   PayoneerAccount.accountName so users never need to know internal UUIDs.
 
-Security rules enforced at schema level:
-  • cardNo and cardCvc are masked in CardSharingResponse (****  / ***)
-  • Only CardSharingSensitiveResponse exposes decrypted values (GET /{id}/secure)
-  • cardDetails holds Cloudinary screenshot URLs — managed separately
+  cardDetails holds Cloudinary screenshot URLs — managed separately.
 ================================================================================
 """
 from datetime import date, datetime
@@ -71,21 +72,21 @@ class CardSharingUpdate(BaseModel):
 
 class CardSharingResponse(BaseModel):
     """
-    Standard (masked) response — safe for listing / detail views.
-    cardNo and cardCvc are intentionally replaced with placeholders.
+    Standard response — all card fields are fully visible (no masking).
+    cardNo and cardCvc are returned as stored.
     """
     id:                  str
     serialNo:            str
     date:                date
     details:             Optional[str]
     payoneerAccountName: str
-    cardNo:              str = "****"
+    cardNo:              str               # fully visible — no masking
     cardExpire:          str
-    cardCvc:             str = "***"
+    cardCvc:             str               # fully visible — no masking
     cardDetails:         List[str]
     cardVendor:          str
     cardLimit:           Decimal
-    cardPaymentReceive:  Decimal        # DB field name kept as-is
+    cardPaymentReceive:  Decimal           # DB field name kept as-is
     cardReceiveBank:     str
     mailDetails:         Optional[str]
     createdAt:           datetime
@@ -95,31 +96,9 @@ class CardSharingResponse(BaseModel):
         from_attributes = True
 
 
-class CardSharingSensitiveResponse(BaseModel):
-    """
-    Full response including DECRYPTED cardNo and cardCvc.
-    Only returned by GET /{id}/secure — CEO/Director only.
-    Audit-log all calls to this endpoint in production.
-    """
-    id:                  str
-    serialNo:            str
-    date:                date
-    details:             Optional[str]
-    payoneerAccountName: str
-    cardNo:              str            # decrypted
-    cardExpire:          str
-    cardCvc:             str            # decrypted
-    cardDetails:         List[str]
-    cardVendor:          str
-    cardLimit:           Decimal
-    cardPaymentReceive:  Decimal
-    cardReceiveBank:     str
-    mailDetails:         Optional[str]
-    createdAt:           datetime
-    updatedAt:           datetime
-
-    class Config:
-        from_attributes = True
+# CardSharingSensitiveResponse is kept as a direct alias so that existing
+# route imports (GET /{id}/secure) continue to resolve without any changes.
+CardSharingSensitiveResponse = CardSharingResponse
 
 
 # ── Screenshot upload ──────────────────────────────────────────────────────────

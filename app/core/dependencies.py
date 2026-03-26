@@ -101,11 +101,9 @@ def require_roles(*roles: str):
 
 
 # ─── Role Guards (single source of truth) ────────────────────────────────────
-CEO_ONLY      = require_roles("CEO")
-CEO_DIRECTOR  = require_roles("CEO", "DIRECTOR")
-HR_AND_ABOVE  = require_roles("CEO", "DIRECTOR", "HR")          # excludes BDEV
-PMAK_EDITORS  = require_roles("CEO", "DIRECTOR", "HR", "BDEV")  # all PMAK writers
-ALL_ROLES     = require_roles("CEO", "DIRECTOR", "HR", "BDEV")  # every authenticated role
-
-# Legacy alias — kept so existing routers that import ALL_ROLES don't break.
-# HR-only modules should be updated to HR_AND_ABOVE where BDev must be excluded.
+CEO_ONLY       = require_roles("CEO")
+CEO_DIRECTOR   = require_roles("CEO", "DIRECTOR")
+ALL_ROLES    = require_roles("CEO", "DIRECTOR", "HR", "BDEV")
+HR_AND_ABOVE   = require_roles("CEO", "DIRECTOR", "HR")      
+BDEV_AND_ABOVE = require_roles("CEO", "DIRECTOR", "HR", "BDEV")  
+PMAK_EDITORS   = require_roles("CEO", "DIRECTOR", "HR", "BDEV") 

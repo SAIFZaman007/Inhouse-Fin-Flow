@@ -1,17 +1,7 @@
 """
 app/modules/upwork/service.py
 ════════════════════════════════════════════════════════════════════════════════
-v7 — Enterprise Edition
-
-Changes vs v6
-─────────────
-update_profile   EXTENDED — PATCH /profiles/{id}
-                   Now accepts the full snapshot field set from UpworkProfileUpdate.
-                   When any snapshot field is present the service upserts today's
-                   (or snapshot_date's) UpworkEntry in the same call, so callers
-                   never need a separate POST /snapshots round-trip.
-
-Everything else is unchanged from v6.
+v8 — Enterprise Edition
 ════════════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -549,8 +539,17 @@ async def get_profile_detail(
     profile_id: str,
     filters: DateRangeFilter,
     pagination: Optional[PageParams] = None,
+    name: Optional[str] = None,             # ← v8: optional name filter
 ) -> dict:
     profile = await _get_profile_or_404(db, profile_id)
+
+    # Optional name filter — 404 if profile exists but name doesn't match
+    if name and name.lower() not in profile.profileName.lower():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Upwork profile not found matching name '{name}'.",
+        )
+
     date_f  = filters.to_prisma_filter()
 
     snap_where:  dict = {"profileId": profile_id}

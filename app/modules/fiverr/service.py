@@ -561,8 +561,17 @@ async def get_profile_detail(
     profile_id: str,
     filters: DateRangeFilter,
     pagination: Optional[PageParams] = None,
+    name: Optional[str] = None,             
 ) -> dict:
     profile = await _get_profile_or_404(db, profile_id)
+
+    # Optional name filter — 404 if profile exists but name doesn't match
+    if name and name.lower() not in profile.profileName.lower():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Fiverr profile not found matching name '{name}'.",
+        )
+
     date_f  = filters.to_prisma_filter()
 
     snap_where:  dict = {"profileId": profile_id}

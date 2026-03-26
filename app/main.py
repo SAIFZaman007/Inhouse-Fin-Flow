@@ -17,6 +17,7 @@ from app.core.middleware import setup_middleware
 from app.core.security import validate_security_config
 
 # ── Module Routers ────────────────────────────────────────────────────────────
+from app.modules.role_matrix.router import router as role_matrix_router
 from app.modules.health.router import router as health_router
 from app.modules.auth.router import router as auth_router
 from app.modules.card_sharing.router import router as card_router
@@ -31,6 +32,7 @@ from app.modules.payoneer.router import router as payoneer_router
 from app.modules.pmak.router import router as pmak_router
 from app.modules.upwork.router import router as upwork_router
 from app.modules.users.router import router as users_router
+from app.modules.role_matrix.service import seed_permission_rules
 
 # ── Windows: ProactorEventLoop ────────────────────────────────────────────────
 if sys.platform == "win32":
@@ -49,6 +51,9 @@ async def lifespan(app: FastAPI):
     """
     validate_security_config()
     await connect_db()
+    from app.core.database import get_db
+    db = await get_db()
+    await seed_permission_rules(db)
     yield
     await disconnect_db()
 
@@ -94,7 +99,7 @@ def create_app() -> FastAPI:
         fiverr_router, upwork_router, payoneer_router,
         pmak_router, outside_router, exchange_router,
         card_router, hr_router, inventory_router,
-        export_router,         
+        export_router, role_matrix_router
     ]:
         app.include_router(router, prefix=API_PREFIX)
 

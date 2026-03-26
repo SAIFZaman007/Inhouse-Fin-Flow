@@ -1,12 +1,19 @@
 """
 app/modules/pmak/service.py
 ════════════════════════════════════════════════════════════════════════════════
-v4.3 — New Endpoint: GET /pmak/inhouse
+v5 — Enterprise Edition
 
-Added:
-  list_all_inhouse_deals() — cross-account flat deal list with combined totals,
-  full filter support (period, account_name, buyer_name, seller_name, order_status),
-  and pagination.
+Changes vs v4.3
+───────────────
+update_account()     ADDED — PATCH /accounts/{id}: rename with uniqueness check.
+update_transaction() ADDED — PATCH /transactions/{id}: partial update any field.
+add_inhouse          ALIAS → create_inhouse_deal
+update_inhouse       ALIAS → update_inhouse_deal
+delete_inhouse       ALIAS → delete_inhouse_deal
+get_all_inhouse      ALIAS → list_all_inhouse_deals
+get_account_inhouse  ALIAS → get_account_inhouse_deals
+
+All existing functions are unchanged.
 ════════════════════════════════════════════════════════════════════════════════
 """
 import io
@@ -687,3 +694,102 @@ def _serialize_inhouse(deal, account_name: str) -> dict:
         "createdAt":   deal.createdAt,
         "updatedAt":   deal.updatedAt,
     }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v5 additions — functions required by pmak/router.py v5
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def update_account(db: Prisma, account_id: str, data: PmakAccountCreate):
+    """
+    PATCH /accounts/{account_id} — rename or toggle isActive on a PMAK account.
+
+    Accepts PmakAccountCreate (accountName only) — the same schema already used
+    by the router's patch_account handler.  Only accountName is written; the
+    field is optional in practice because the router passes the parsed body.
+
+    Raises 404 if the account does not exist.
+    Raises 409 if the new name collides with an existing account.
+    """
+    account = await db.pmakaccount.find_unique(where={"id": account_id})
+    if not account:
+        raise HTTPException(status_code=404, detail="PMAK account not found")
+
+    if data.accountName and data.accountName != account.accountName:
+        conflict = await db.pmakaccount.find_first(
+            where={
+                "accountName": {"equals": data.accountName, "mode": "insensitive"},
+                "id":          {"not": account_id},
+            }
+        )
+        if conflict:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Account name '{data.accountName}' is already taken.",
+            )
+
+    updated = await db.pmakaccount.update(
+        where={"id": account_id},
+        data={"accountName": data.accountName},
+    )
+    return {
+        "id":          updated.id,
+        "accountName": updated.accountName,
+        "isActive":    updated.isActive,
+    }
+
+
+async def update_transaction(
+    db:             Prisma,
+    transaction_id: str,
+    data:           PmakTransactionCreate,
+):
+    """
+    PATCH /transactions/{transaction_id} — partial update of any transaction field.
+
+    Accepts PmakTransactionCreate; only fields explicitly set by the caller are
+    written (idempotent if body is empty relative to current values).
+
+    Raises 404 if the transaction does not exist.
+    """
+    txn = await db.pmaktransaction.find_unique(where={"id": transaction_id})
+    if not txn:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    patch: dict = {}
+
+    if data.date is not None:
+        patch["date"] = _to_dt(data.date)
+    if data.details is not None:
+        patch["details"] = data.details
+    if data.accountFrom is not None:
+        patch["accountFrom"] = data.accountFrom
+    if data.accountTo is not None:
+        patch["accountTo"] = data.accountTo
+    if data.debit is not None:
+        patch["debit"] = data.debit
+    if data.credit is not None:
+        patch["credit"] = data.credit
+    if data.remaining_balance is not None:
+        patch["remainingBalance"] = data.remaining_balance
+    if data.status is not None:
+        patch["status"] = data.status.value
+
+    if not patch:
+        account = await db.pmakaccount.find_unique(where={"id": txn.accountId})
+        return _serialize_txn(txn, account.accountName if account else "")
+
+    updated = await db.pmaktransaction.update(
+        where={"id": transaction_id},
+        data=patch,
+    )
+    account = await db.pmakaccount.find_unique(where={"id": updated.accountId})
+    return _serialize_txn(updated, account.accountName if account else "")
+
+
+# ── Name aliases — router v5 uses short names; service v4.3 used long names.
+# These one-liners keep both sides in sync without touching either file's logic.
+add_inhouse           = create_inhouse_deal
+update_inhouse        = update_inhouse_deal
+delete_inhouse        = delete_inhouse_deal
+get_all_inhouse       = list_all_inhouse_deals
+get_account_inhouse   = get_account_inhouse_deals
