@@ -1,16 +1,6 @@
 -- ============================================================================
 -- Migration: 20260326051848_role_matrix_integrated
---
--- ROOT CAUSE OF P3009 FAILURE:
---   Migration 202603151231_fix_card_receive_bank_column already ran on the
---   production database and added the "cardReceiveBank" column and the
---   "card_sharing_accountId_fkey" foreign key to card_sharing.
---   This migration originally duplicated both of those statements verbatim,
---   causing PostgreSQL to throw "column already exists" / "constraint already
---   exists", which Prisma recorded as a FAILED migration (P3009) and blocked
---   all subsequent deploys.
---
-============================================================================
+===================================================================
 
 -- CreateEnum
 -- (VisibilityStatus is new — does not exist on production yet)
