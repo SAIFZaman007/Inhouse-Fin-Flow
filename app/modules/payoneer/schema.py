@@ -1,24 +1,7 @@
 """
 app/modules/payoneer/schema.py
 ════════════════════════════════════════════════════════════════════════════════
-v4 — Enterprise Edition
-
-Changes vs v3
-─────────────
-PayoneerAccountUpdate   EXTENDED — PATCH /accounts/{id}
-                          Now accepts ``description``, ``initial_balance``,
-                          and ``opening_note`` so a single PATCH call can
-                          rename/toggle the account AND add a balance-adjustment
-                          credit transaction without a separate POST /transactions
-                          round-trip.
-                          New optional fields (all default None → left unchanged):
-                            description, initial_balance, opening_note
-
-PayoneerTransactionUpdate  FIXED — ``date`` is now Optional (was incorrectly
-                             required in v3; an empty PATCH body must be
-                             idempotent).
-
-Everything else is unchanged from v3.
+v7 — Enterprise Edition
 ════════════════════════════════════════════════════════════════════════════════
 """
 from datetime import date, datetime
@@ -40,8 +23,8 @@ class PayoneerAccountCreate(BaseModel):
     immediately with ``details`` = "Opening balance" (or the supplied
     ``opening_note``), so the ledger starts with the correct balance.
     """
-    accountName:     str            = Field(..., min_length=1, max_length=100)
-    description:     Optional[str]  = Field(default=None, description="Optional free-text account note.")
+    accountName:     str               = Field(..., min_length=1, max_length=100)
+    description:     Optional[str]     = Field(default=None, description="Optional free-text account note.")
     initial_balance: Optional[Decimal] = Field(
         default=None, ge=0,
         description="Opening balance — seeds an initial credit transaction.",
@@ -122,18 +105,32 @@ class PayoneerTransactionCreate(BaseModel):
     ``account_name`` replaced ``account_id`` in v2.
     Finance staff know account names — the service resolves the name to an
     internal record automatically.
+
+    ``remaining_balance`` — v6 behaviour (system-computed, always)
+    ──────────────────────────────────────────────────────────────
+    This field is accepted for API-surface compatibility but is **always
+    ignored by the service layer**.  The system unconditionally computes
+    the running balance as ``latest_balance + credit - debit``, ensuring
+    ``currentBalance`` and ``totalBalance`` in ``GET /accounts`` are always
+    correct — even when the caller supplies ``0.00`` or any other value.
     """
-    account_name:      str            = Field(
+    account_name:      str               = Field(
         ..., min_length=1, max_length=100,
         description="Exact Payoneer account name (case-insensitive match).",
     )
     date:              date
-    details:           str            = Field(..., min_length=1)
-    accountFrom:       Optional[str]  = None
-    accountTo:         Optional[str]  = None
-    debit:             Decimal        = Field(default=Decimal("0"), ge=0)
-    credit:            Decimal        = Field(default=Decimal("0"), ge=0)
-    remaining_balance: Decimal        = Field(..., description="Balance after this transaction.")
+    details:           str               = Field(..., min_length=1)
+    accountFrom:       Optional[str]     = None
+    accountTo:         Optional[str]     = None
+    debit:             Decimal           = Field(default=Decimal("0"), ge=0)
+    credit:            Decimal           = Field(default=Decimal("0"), ge=0)
+    remaining_balance: Optional[Decimal] = Field(
+        default=None,
+        description=(
+            "Accepted for compatibility but IGNORED — the service always "
+            "auto-computes: latest_balance + credit - debit."
+        ),
+    )
 
 
 class PayoneerTransactionUpdate(BaseModel):

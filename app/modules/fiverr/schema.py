@@ -1,23 +1,33 @@
 """
 app/modules/fiverr/schema.py
 ════════════════════════════════════════════════════════════════════════════════
-v7 — Enterprise Edition
+v8 — Enterprise Edition
 
-Changes vs v6
+Changes vs v7
 ─────────────
-FiverrProfileUpdate   EXTENDED — PATCH /profiles/{id}
-                        Now accepts the full snapshot field set so a single
-                        PATCH call can rename/toggle the profile AND update
-                        its latest-day snapshot in one round-trip.
-                        New optional fields (all default None → left unchanged):
-                          available_withdraw, not_cleared, active_orders,
-                          active_order_amount, submitted, withdrawn,
-                          seller_plus, promotion, snapshot_date
+FiverrTotals              NEW FIELDS — ``totalActiveOrders`` and
+                            ``totalActiveOrderAmount``
+                              • ``totalActiveOrders``     = total count of
+                                order records across all active profiles for
+                                the selected period.
+                              • ``totalActiveOrderAmount`` = Σ order.amount
+                                across all active profiles for the selected
+                                period.  Reflects the gross value of all logged
+                                orders immediately after POST /orders returns.
 
-FiverrOrderUpdate     FIXED — ``date`` is now Optional (was incorrectly
-                        required in v6; an empty PATCH body must be idempotent).
+FiverrProfileDetailTotals NEW FIELDS — ``activeOrders`` and ``activeOrderAmount``
+                            Same computations scoped to a single profile.
 
-Everything else is unchanged from v6.
+FiverrProfileUpdate       PYDANTIC-V2 FIX — ``seller_plus: Optional[bool]``
+                            changed from bare ``Field(default=None)`` to plain
+                            ``= None`` to prevent PydanticSchemaGenerationError
+                            on startup.
+
+FiverrOrderUpdate         PYDANTIC-V2 FIX — ``date: Optional[date]``
+                            changed from bare ``Field(default=None)`` to plain
+                            ``= None`` for the same reason.
+
+Everything else is unchanged from v7.
 ════════════════════════════════════════════════════════════════════════════════
 """
 from datetime import date, datetime
@@ -102,7 +112,7 @@ class FiverrProfileUpdate(BaseModel):
     active_order_amount: Optional[Decimal] = Field(default=None, ge=0)
     submitted:           Optional[Decimal] = Field(default=None, ge=0)
     withdrawn:           Optional[Decimal] = Field(default=None, ge=0)
-    seller_plus:         Optional[bool]    = Field(default=None)
+    seller_plus:         Optional[bool]    = None                          # FIXED: no bare Field()
     promotion:           Optional[Decimal] = Field(default=None, ge=0)
 
 
@@ -122,11 +132,23 @@ class FiverrProfileResponse(BaseModel):
 
 class FiverrSnapshotCreate(BaseModel):
     """
-    Daily financial snapshot — upserts on (profileName, date).
+    Daily financial snapshot — additive accumulation on (profileName, date).
 
     ``profile_name`` replaced ``profile_id`` in v5.
     The service resolves the name to a profile record server-side, so HR
     staff never need to handle internal UUIDs.
+
+    Submission behaviour
+    ────────────────────
+    • First submission for (profileName, date)
+        → INSERT the row with the incoming values as-is.
+    • Subsequent submission for the same (profileName, date)
+        → ADD (accumulate) the incoming numeric values to the existing stored
+          values rather than replacing them.
+        → ``seller_plus`` uses OR semantics: once True for the day it stays True.
+
+    This ensures that multiple HR inputs throughout the same day accumulate
+    into a running total rather than silently overwriting previous entries.
     """
     profile_name:        str     = Field(
         ..., min_length=1, max_length=100,
@@ -256,10 +278,10 @@ class FiverrOrderInProfile(BaseModel):
 class FiverrTotals(BaseModel):
     """Cross-profile aggregate for the selected period."""
     totalAvailableWithdraw:         float
-    totalAvailableWithdrawAfterFee: float   # × 0.80
+    totalAvailableWithdrawAfterFee: float   
     totalNotCleared:                float
-    totalActiveOrders:              int
-    totalActiveOrderAmount:         float
+    totalActiveOrders:              int     
+    totalActiveOrderAmount:         float   # v8: Σ order.amount across all profiles
     totalSubmitted:                 float
     totalWithdrawn:                 float
     totalPromotion:                 float
@@ -296,8 +318,8 @@ class FiverrProfileDetailTotals(BaseModel):
     availableWithdraw:         float
     availableWithdrawAfterFee: float
     notCleared:                float
-    activeOrders:              int
-    activeOrderAmount:         float
+    activeOrders:              int     # v8: count of order records for this profile
+    activeOrderAmount:         float   # v8: Σ order.amount for this profile
     submitted:                 float
     withdrawn:                 float
     promotion:                 float

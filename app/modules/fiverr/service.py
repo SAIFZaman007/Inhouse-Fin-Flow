@@ -1,17 +1,30 @@
 """
 app/modules/fiverr/service.py
 ════════════════════════════════════════════════════════════════════════════════
-v7 — Enterprise Edition
+v10 — Enterprise Edition
 
-Changes vs v6
+Changes vs v9
 ─────────────
-update_profile   EXTENDED — PATCH /profiles/{id}
-                   Now accepts the full snapshot field set from FiverrProfileUpdate.
-                   When any snapshot field is present the service upserts today's
-                   (or snapshot_date's) FiverrEntry in the same call, so callers
-                   never need a separate POST /snapshots round-trip.
+list_profiles_summary   NEW FIELDS — ``totalActiveOrders`` and
+                          ``totalActiveOrderAmount`` in ``totals``
+                            • ``totalActiveOrders``     = total count of order
+                              records across all active profiles in the period.
+                              Computed as len(p.orders) summed per profile — no
+                              extra DB round-trip.
+                            • ``totalActiveOrderAmount`` = Σ order.amount across
+                              every order in the selected period for all active
+                              profiles.  Summed in the same aggregation loop
+                              that already computes t_revenue.
 
-Everything else is unchanged from v6.
+                          Also added ``activeOrders`` and ``activeOrderAmount``
+                          to each per-profile ``periodTotals`` dict so the
+                          single-profile breakdown is consistent with the
+                          combined totals.
+
+get_profile_detail      NEW FIELDS — ``activeOrders`` and ``activeOrderAmount``
+                          in ``periodTotals``, scoped to a single profile.
+
+Everything else is unchanged from v9.
 ════════════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -38,9 +51,9 @@ from .schema import (
 
 logger = logging.getLogger(__name__)
 
-_FIVERR_FEE  = Decimal("0.20")
-_AFTER_RATE  = Decimal("1") - _FIVERR_FEE   # 0.80
-_ZERO        = Decimal("0")
+_FIVERR_FEE = Decimal("0.20")
+_AFTER_RATE = Decimal("1") - _FIVERR_FEE   # 0.80
+_ZERO       = Decimal("0")
 
 # Snapshot field names present on FiverrProfileUpdate (used for presence check)
 _SNAPSHOT_FIELDS = frozenset({
@@ -154,26 +167,26 @@ async def create_profile(db: Prisma, data: FiverrProfileCreate) -> dict:
             }},
             data={
                 "create": {
-                    "profileId":          profile.id,
-                    "date":               datetime.combine(snap_date, time.min),
-                    "availableWithdraw":  data.available_withdraw,
-                    "notCleared":         data.not_cleared,
-                    "activeOrders":       data.active_orders,
-                    "activeOrderAmount":  data.active_order_amount,
-                    "submitted":          data.submitted,
-                    "withdrawn":          data.withdrawn,
-                    "sellerPlus":         data.seller_plus,
-                    "promotion":          data.promotion,
+                    "profileId":         profile.id,
+                    "date":              datetime.combine(snap_date, time.min),
+                    "availableWithdraw": data.available_withdraw,
+                    "notCleared":        data.not_cleared,
+                    "activeOrders":      data.active_orders,
+                    "activeOrderAmount": data.active_order_amount,
+                    "submitted":         data.submitted,
+                    "withdrawn":         data.withdrawn,
+                    "sellerPlus":        data.seller_plus,
+                    "promotion":         data.promotion,
                 },
                 "update": {
-                    "availableWithdraw":  data.available_withdraw,
-                    "notCleared":         data.not_cleared,
-                    "activeOrders":       data.active_orders,
-                    "activeOrderAmount":  data.active_order_amount,
-                    "submitted":          data.submitted,
-                    "withdrawn":          data.withdrawn,
-                    "sellerPlus":         data.seller_plus,
-                    "promotion":          data.promotion,
+                    "availableWithdraw": data.available_withdraw,
+                    "notCleared":        data.not_cleared,
+                    "activeOrders":      data.active_orders,
+                    "activeOrderAmount": data.active_order_amount,
+                    "submitted":         data.submitted,
+                    "withdrawn":         data.withdrawn,
+                    "sellerPlus":        data.seller_plus,
+                    "promotion":         data.promotion,
                 },
             },
         )
@@ -256,24 +269,24 @@ async def update_profile(
                 return getattr(existing_entry, existing_attr)
             return default
 
-        aw              = _pick("available_withdraw", "availableWithdraw",  _ZERO)
-        not_cleared     = _pick("not_cleared",         "notCleared",         _ZERO)
-        active_orders   = _pick("active_orders",       "activeOrders",       0)
-        active_order_amt= _pick("active_order_amount", "activeOrderAmount",  _ZERO)
-        submitted       = _pick("submitted",            "submitted",          _ZERO)
-        withdrawn       = _pick("withdrawn",            "withdrawn",          _ZERO)
-        seller_plus     = _pick("seller_plus",          "sellerPlus",         False)
-        promotion       = _pick("promotion",            "promotion",          _ZERO)
+        aw               = _pick("available_withdraw",  "availableWithdraw",  _ZERO)
+        not_cleared      = _pick("not_cleared",         "notCleared",         _ZERO)
+        active_orders    = _pick("active_orders",       "activeOrders",       0)
+        active_order_amt = _pick("active_order_amount", "activeOrderAmount",  _ZERO)
+        submitted        = _pick("submitted",           "submitted",          _ZERO)
+        withdrawn        = _pick("withdrawn",           "withdrawn",          _ZERO)
+        seller_plus      = _pick("seller_plus",         "sellerPlus",         False)
+        promotion        = _pick("promotion",           "promotion",          _ZERO)
 
         entry_data = {
-            "availableWithdraw":  aw,
-            "notCleared":         not_cleared,
-            "activeOrders":       active_orders,
-            "activeOrderAmount":  active_order_amt,
-            "submitted":          submitted,
-            "withdrawn":          withdrawn,
-            "sellerPlus":         seller_plus,
-            "promotion":          promotion,
+            "availableWithdraw": aw,
+            "notCleared":        not_cleared,
+            "activeOrders":      active_orders,
+            "activeOrderAmount": active_order_amt,
+            "submitted":         submitted,
+            "withdrawn":         withdrawn,
+            "sellerPlus":        seller_plus,
+            "promotion":         promotion,
         }
 
         entry = await db.fiverrentry.upsert(
@@ -308,38 +321,81 @@ async def deactivate_profile(db: Prisma, profile_id: str) -> None:
 # ── Snapshot CRUD ─────────────────────────────────────────────────────────────
 
 async def create_snapshot(db: Prisma, data: FiverrSnapshotCreate) -> dict:
+    """
+    POST /snapshots — additive daily snapshot (v9).
+
+    Behaviour
+    ─────────
+    • First submission for (profileName, date)
+        → INSERT the row with the incoming values as-is.
+    • Subsequent submission for the same (profileName, date)
+        → ADD the incoming numeric values to the existing stored values.
+        → seller_plus uses OR semantics: once True for the day it stays True.
+
+    This ensures that multiple HR inputs throughout the same day accumulate
+    into a running total rather than silently overwriting previous entries.
+    The response always reflects the current accumulated state of the row.
+    """
     profile = await _resolve_profile_by_name(db, data.profile_name)
 
-    entry = await db.fiverrentry.upsert(
+    snap_dt = datetime.combine(data.date, time.min)
+
+    # ── Fetch existing row (if any) ───────────────────────────────────────────
+    existing = await db.fiverrentry.find_unique(
         where={"profileId_date": {
             "profileId": profile.id,
-            "date":      datetime.combine(data.date, time.min),
-        }},
-        data={
-            "create": {
-                "profileId":          profile.id,
-                "date":               datetime.combine(data.date, time.min),
-                "availableWithdraw":  data.available_withdraw,
-                "notCleared":         data.not_cleared,
-                "activeOrders":       data.active_orders,
-                "activeOrderAmount":  data.active_order_amount,
-                "submitted":          data.submitted,
-                "withdrawn":          data.withdrawn,
-                "sellerPlus":         data.seller_plus,
-                "promotion":          data.promotion,
-            },
-            "update": {
-                "availableWithdraw":  data.available_withdraw,
-                "notCleared":         data.not_cleared,
-                "activeOrders":       data.active_orders,
-                "activeOrderAmount":  data.active_order_amount,
-                "submitted":          data.submitted,
-                "withdrawn":          data.withdrawn,
-                "sellerPlus":         data.seller_plus,
-                "promotion":          data.promotion,
-            },
-        },
+            "date":      snap_dt,
+        }}
     )
+
+    if existing is None:
+        # ── First entry for this (profile, date) — plain INSERT ───────────────
+        entry = await db.fiverrentry.create(
+            data={
+                "profileId":         profile.id,
+                "date":              snap_dt,
+                "availableWithdraw": data.available_withdraw,
+                "notCleared":        data.not_cleared,
+                "activeOrders":      data.active_orders,
+                "activeOrderAmount": data.active_order_amount,
+                "submitted":         data.submitted,
+                "withdrawn":         data.withdrawn,
+                "sellerPlus":        data.seller_plus,
+                "promotion":         data.promotion,
+            }
+        )
+    else:
+        # ── Row already exists — ADD (accumulate) the incoming values ─────────
+        #
+        # Numeric fields: new_total = existing + incoming
+        # Boolean fields: OR semantics (True is sticky for the day)
+        #
+        new_aw          = _d(existing.availableWithdraw) + _d(data.available_withdraw)
+        new_not_cleared = _d(existing.notCleared)        + _d(data.not_cleared)
+        new_act_orders  = existing.activeOrders          + data.active_orders
+        new_act_amt     = _d(existing.activeOrderAmount) + _d(data.active_order_amount)
+        new_submitted   = _d(existing.submitted)         + _d(data.submitted)
+        new_withdrawn   = _d(existing.withdrawn)         + _d(data.withdrawn)
+        new_seller_plus = existing.sellerPlus            or data.seller_plus
+        new_promotion   = _d(existing.promotion)         + _d(data.promotion)
+
+        entry = await db.fiverrentry.update(
+            where={"profileId_date": {
+                "profileId": profile.id,
+                "date":      snap_dt,
+            }},
+            data={
+                "availableWithdraw": new_aw,
+                "notCleared":        new_not_cleared,
+                "activeOrders":      new_act_orders,
+                "activeOrderAmount": new_act_amt,
+                "submitted":         new_submitted,
+                "withdrawn":         new_withdrawn,
+                "sellerPlus":        new_seller_plus,
+                "promotion":         new_promotion,
+            },
+        )
+
     return _entry_to_dict(entry, profile.profileName)
 
 
@@ -492,49 +548,52 @@ async def list_profiles_summary(
 
     profiles = await db.fiverrprofile.find_many(**find_kw)
 
-    # Cross-profile aggregates (from latest snapshot per profile)
-    t_avail = t_not_cleared = t_order_amt = t_submitted = t_withdrawn = t_promo = _ZERO
-    t_active_orders = 0
-    t_revenue       = _ZERO
+    t_avail = t_not_cleared = t_act_amt = t_submitted = t_withdrawn = t_promotion = _ZERO
+    t_active_orders    = 0
+    t_active_order_amt = _ZERO                                           # v10: Σ order.amount
+    t_revenue          = _ZERO
 
     summaries = []
     for p in profiles:
         latest = p.entries[0] if p.entries else None
         aw     = _d(latest.availableWithdraw) if latest else _ZERO
 
-        t_avail       += aw
-        t_not_cleared += _d(latest.notCleared)        if latest else _ZERO
-        t_active_orders += latest.activeOrders         if latest else 0
-        t_order_amt   += _d(latest.activeOrderAmount) if latest else _ZERO
-        t_submitted   += _d(latest.submitted)         if latest else _ZERO
-        t_withdrawn   += _d(latest.withdrawn)         if latest else _ZERO
-        t_promo       += _d(latest.promotion)         if latest else _ZERO
+        t_avail        += aw
+        t_not_cleared  += _d(latest.notCleared)        if latest else _ZERO
+        t_act_amt      += _d(latest.activeOrderAmount)  if latest else _ZERO
+        t_submitted    += _d(latest.submitted)          if latest else _ZERO
+        t_withdrawn    += _d(latest.withdrawn)          if latest else _ZERO
+        t_promotion    += _d(latest.promotion)          if latest else _ZERO
 
-        period_revenue = sum((_d(o.afterFiverr) for o in p.orders), _ZERO)
-        t_revenue     += period_revenue
+        period_revenue       = sum((_d(o.afterFiverr) for o in p.orders), _ZERO)
+        period_order_count   = len(p.orders)                                     # v10
+        period_order_amount  = sum((_d(o.amount)      for o in p.orders), _ZERO) # v10
+        t_revenue           += period_revenue
+        t_active_orders     += period_order_count                                # v10
+        t_active_order_amt  += period_order_amount                               # v10
 
         period_totals = {
             "availableWithdraw":         float(aw),
             "availableWithdrawAfterFee": float(_after_fee(aw)),
             "notCleared":                float(_d(latest.notCleared)        if latest else _ZERO),
-            "activeOrders":              latest.activeOrders                 if latest else 0,
-            "activeOrderAmount":         float(_d(latest.activeOrderAmount) if latest else _ZERO),
-            "submitted":                 float(_d(latest.submitted)         if latest else _ZERO),
-            "withdrawn":                 float(_d(latest.withdrawn)         if latest else _ZERO),
-            "promotion":                 float(_d(latest.promotion)         if latest else _ZERO),
+            "activeOrders":              period_order_count,                     # v10
+            "activeOrderAmount":         float(period_order_amount),             # v10
+            "submitted":                 float(_d(latest.submitted)          if latest else _ZERO),
+            "withdrawn":                 float(_d(latest.withdrawn)          if latest else _ZERO),
+            "promotion":                 float(_d(latest.promotion)          if latest else _ZERO),
             "revenueInPeriod":           float(period_revenue),
         }
 
         summaries.append({
-            "id":             p.id,
-            "profileName":    p.profileName,
-            "isActive":       p.isActive,
-            "latestSnapshot": _entry_to_dict(latest, p.profileName) if latest else None,
-            "periodTotals":   period_totals,
-            "snapshotCount":  len(p.entries),
-            "orderCount":     len(p.orders),
+            "id":              p.id,
+            "profileName":     p.profileName,
+            "isActive":        p.isActive,
+            "latestSnapshot":  _entry_to_dict(latest, p.profileName) if latest else None,
+            "periodTotals":    period_totals,
+            "snapshotCount":   len(p.entries),
+            "orderCount":      len(p.orders),
             "revenueInPeriod": float(period_revenue),
-            "orders":         [_order_to_dict(o) for o in p.orders],
+            "orders":          [_order_to_dict(o) for o in p.orders],
         })
 
     return {
@@ -543,11 +602,11 @@ async def list_profiles_summary(
             "totalAvailableWithdraw":         float(t_avail),
             "totalAvailableWithdrawAfterFee": float(_after_fee(t_avail)),
             "totalNotCleared":                float(t_not_cleared),
-            "totalActiveOrders":              t_active_orders,
-            "totalActiveOrderAmount":         float(t_order_amt),
+            "totalActiveOrders":              t_active_orders,                   # v10
+            "totalActiveOrderAmount":         float(t_active_order_amt),         # v10
             "totalSubmitted":                 float(t_submitted),
             "totalWithdrawn":                 float(t_withdrawn),
-            "totalPromotion":                 float(t_promo),
+            "totalPromotion":                 float(t_promotion),
             "totalRevenueInPeriod":           float(t_revenue),
             "activeProfileCount":             total_profiles,
         },
@@ -561,7 +620,7 @@ async def get_profile_detail(
     profile_id: str,
     filters: DateRangeFilter,
     pagination: Optional[PageParams] = None,
-    name: Optional[str] = None,             
+    name: Optional[str] = None,
 ) -> dict:
     profile = await _get_profile_or_404(db, profile_id)
 
@@ -572,7 +631,7 @@ async def get_profile_detail(
             detail=f"Fiverr profile not found matching name '{name}'.",
         )
 
-    date_f  = filters.to_prisma_filter()
+    date_f = filters.to_prisma_filter()
 
     snap_where:  dict = {"profileId": profile_id}
     order_where: dict = {"profileId": profile_id}
@@ -592,9 +651,11 @@ async def get_profile_detail(
     entries = await db.fiverrentry.find_many(**snap_kw)
     orders  = await db.fiverrorder.find_many(**order_kw)
 
-    latest = entries[0] if entries else None
-    aw     = _d(latest.availableWithdraw) if latest else _ZERO
-    revenue= sum((_d(o.afterFiverr) for o in orders), _ZERO)
+    latest             = entries[0] if entries else None
+    aw                 = _d(latest.availableWithdraw) if latest else _ZERO
+    revenue            = sum((_d(o.afterFiverr) for o in orders), _ZERO)
+    active_order_count = len(orders)                                     # v10
+    active_order_amt   = sum((_d(o.amount)      for o in orders), _ZERO) # v10
 
     return {
         "filter": filters.meta(),
@@ -607,14 +668,14 @@ async def get_profile_detail(
             "availableWithdraw":         float(aw),
             "availableWithdrawAfterFee": float(_after_fee(aw)),
             "notCleared":                float(_d(latest.notCleared)        if latest else _ZERO),
-            "activeOrders":              latest.activeOrders                 if latest else 0,
-            "activeOrderAmount":         float(_d(latest.activeOrderAmount) if latest else _ZERO),
-            "submitted":                 float(_d(latest.submitted)         if latest else _ZERO),
-            "withdrawn":                 float(_d(latest.withdrawn)         if latest else _ZERO),
-            "promotion":                 float(_d(latest.promotion)         if latest else _ZERO),
+            "activeOrders":              active_order_count,                     # v10
+            "activeOrderAmount":         float(active_order_amt),               # v10
+            "submitted":                 float(_d(latest.submitted)          if latest else _ZERO),
+            "withdrawn":                 float(_d(latest.withdrawn)          if latest else _ZERO),
+            "promotion":                 float(_d(latest.promotion)          if latest else _ZERO),
             "revenueInPeriod":           float(revenue),
             "snapshotCount":             snap_total,
-            "orderCount":               order_total,
+            "orderCount":                order_total,
         },
         "pagination": _pagination_meta(pagination, max(snap_total, order_total)),
         "snapshots":  [_entry_to_dict(e, profile.profileName) for e in entries],

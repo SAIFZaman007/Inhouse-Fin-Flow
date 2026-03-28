@@ -1,23 +1,28 @@
 """
 app/modules/upwork/schema.py
 ════════════════════════════════════════════════════════════════════════════════
-v7 — Enterprise Edition
+v8 — Enterprise Edition
 
-Changes vs v6
+Changes vs v7
 ─────────────
-UpworkProfileUpdate   EXTENDED — PATCH /profiles/{id}
-                        Now accepts the full snapshot field set so a single
-                        PATCH call can rename/toggle the profile AND update
-                        its latest-day snapshot in one round-trip.
-                        New optional fields (all default None → left unchanged):
-                          available_withdraw, pending, in_review,
-                          work_in_progress, withdrawn, connects,
-                          upwork_plus, snapshot_date
+UpworkTotals              NEW FIELD — ``totalActiveAmount``
+                            Σ order.amount across all active profiles for the
+                            selected period.  Reflects the gross value of all
+                            logged orders immediately after POST /orders returns.
 
-UpworkOrderUpdate     FIXED — ``date`` is now Optional (was incorrectly
-                        required in v6; an empty PATCH body must be idempotent).
+UpworkProfileDetailTotals NEW FIELD — ``activeAmount``
+                            Same computation scoped to a single profile.
 
-Everything else is unchanged from v6.
+UpworkProfileUpdate       PYDANTIC-V2 FIX — ``upwork_plus: Optional[bool]``
+                            changed from bare ``Field(default=None)`` to plain
+                            ``= None`` to prevent PydanticSchemaGenerationError
+                            on startup.
+
+UpworkOrderUpdate         PYDANTIC-V2 FIX — ``date: Optional[date]``
+                            changed from bare ``Field(default=None)`` to plain
+                            ``= None`` for the same reason.
+
+Everything else is unchanged from v7.
 ════════════════════════════════════════════════════════════════════════════════
 """
 from datetime import date, datetime
@@ -99,7 +104,7 @@ class UpworkProfileUpdate(BaseModel):
     work_in_progress:   Optional[Decimal] = Field(default=None, ge=0)
     withdrawn:          Optional[Decimal] = Field(default=None, ge=0)
     connects:           Optional[int]     = Field(default=None, ge=0)
-    upwork_plus:        Optional[bool]    = Field(default=None)
+    upwork_plus:        Optional[bool]    = None                          # FIXED: no bare Field()
 
 
 class UpworkProfileResponse(BaseModel):
@@ -118,23 +123,35 @@ class UpworkProfileResponse(BaseModel):
 
 class UpworkSnapshotCreate(BaseModel):
     """
-    Daily financial snapshot — upserts on (profileName, date).
+    Daily financial snapshot — additive accumulation on (profileName, date).
 
     ``profile_name`` replaced ``profile_id`` in v5.
     The service resolves the name to a profile record server-side.
+
+    Submission behaviour
+    ────────────────────
+    • First submission for (profileName, date)
+        → INSERT the row with the incoming values as-is.
+    • Subsequent submission for the same (profileName, date)
+        → ADD (accumulate) the incoming numeric values to the existing stored
+          values rather than replacing them.
+        → ``upwork_plus`` uses OR semantics: once True for the day it stays True.
+
+    This ensures that multiple HR inputs throughout the same day accumulate
+    into a running total rather than silently overwriting previous entries.
     """
-    profile_name:      str     = Field(
+    profile_name:       str     = Field(
         ..., min_length=1, max_length=100,
         description="Exact Upwork profile name (case-insensitive match).",
     )
-    date:              date
+    date:               date
     available_withdraw: Decimal = Field(..., ge=0)
-    pending:           Decimal  = Field(default=Decimal("0"), ge=0)
-    in_review:         Decimal  = Field(default=Decimal("0"), ge=0)
-    work_in_progress:  Decimal  = Field(default=Decimal("0"), ge=0)
-    withdrawn:         Decimal  = Field(default=Decimal("0"), ge=0)
-    connects:          int      = Field(default=0, ge=0)
-    upwork_plus:       bool     = False
+    pending:            Decimal = Field(default=Decimal("0"), ge=0)
+    in_review:          Decimal = Field(default=Decimal("0"), ge=0)
+    work_in_progress:   Decimal = Field(default=Decimal("0"), ge=0)
+    withdrawn:          Decimal = Field(default=Decimal("0"), ge=0)
+    connects:           int     = Field(default=0, ge=0)
+    upwork_plus:        bool    = False
 
 
 class UpworkSnapshotResponse(BaseModel):
@@ -255,6 +272,7 @@ class UpworkTotals(BaseModel):
     totalWithdrawn:                 float
     totalConnects:                  int
     totalRevenueInPeriod:           float   # Σ afterUpwork
+    totalActiveAmount:              float   # v8: Σ order.amount across all profiles
     activeProfileCount:             int
 
 
@@ -292,6 +310,7 @@ class UpworkProfileDetailTotals(BaseModel):
     withdrawn:                 float
     connects:                  int
     revenueInPeriod:           float
+    activeAmount:              float   # v8: Σ order.amount for this profile
     snapshotCount:             int
     orderCount:                int
 

@@ -1,7 +1,24 @@
 """
 app/modules/upwork/service.py
 ════════════════════════════════════════════════════════════════════════════════
-v8 — Enterprise Edition
+v10 — Enterprise Edition
+
+Changes vs v9
+─────────────
+list_profiles_summary   NEW FIELD — ``totalActiveAmount`` in ``totals``
+                          Σ order.amount across every order in the selected
+                          period for all active profiles.  Summed in the same
+                          aggregation loop that already computes t_revenue, so
+                          there is zero extra DB round-trip.
+
+                          Also added ``activeAmount`` to each per-profile
+                          ``periodTotals`` dict so the single-profile breakdown
+                          is consistent with the combined totals.
+
+get_profile_detail      NEW FIELD — ``activeAmount`` in ``periodTotals``
+                          Same computation scoped to a single profile.
+
+Everything else is unchanged from v9.
 ════════════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -142,24 +159,24 @@ async def create_profile(db: Prisma, data: UpworkProfileCreate) -> dict:
             }},
             data={
                 "create": {
-                    "profileId":        profile.id,
-                    "date":             datetime.combine(snap_date, time.min),
+                    "profileId":         profile.id,
+                    "date":              datetime.combine(snap_date, time.min),
                     "availableWithdraw": data.available_withdraw,
-                    "pending":          data.pending,
-                    "inReview":         data.in_review,
-                    "workInProgress":   data.work_in_progress,
-                    "withdrawn":        data.withdrawn,
-                    "connects":         data.connects,
-                    "upworkPlus":       data.upwork_plus,
+                    "pending":           data.pending,
+                    "inReview":          data.in_review,
+                    "workInProgress":    data.work_in_progress,
+                    "withdrawn":         data.withdrawn,
+                    "connects":          data.connects,
+                    "upworkPlus":        data.upwork_plus,
                 },
                 "update": {
                     "availableWithdraw": data.available_withdraw,
-                    "pending":          data.pending,
-                    "inReview":         data.in_review,
-                    "workInProgress":   data.work_in_progress,
-                    "withdrawn":        data.withdrawn,
-                    "connects":         data.connects,
-                    "upworkPlus":       data.upwork_plus,
+                    "pending":           data.pending,
+                    "inReview":          data.in_review,
+                    "workInProgress":    data.work_in_progress,
+                    "withdrawn":         data.withdrawn,
+                    "connects":          data.connects,
+                    "upworkPlus":        data.upwork_plus,
                 },
             },
         )
@@ -242,13 +259,13 @@ async def update_profile(
                 return getattr(existing_entry, existing_attr)
             return default
 
-        aw              = _pick("available_withdraw", "availableWithdraw", _ZERO)
-        pending         = _pick("pending",            "pending",           _ZERO)
-        in_review       = _pick("in_review",          "inReview",          _ZERO)
-        work_in_progress= _pick("work_in_progress",   "workInProgress",    _ZERO)
-        withdrawn       = _pick("withdrawn",           "withdrawn",         _ZERO)
-        connects        = _pick("connects",            "connects",          0)
-        upwork_plus     = _pick("upwork_plus",         "upworkPlus",        False)
+        aw               = _pick("available_withdraw", "availableWithdraw", _ZERO)
+        pending          = _pick("pending",            "pending",           _ZERO)
+        in_review        = _pick("in_review",          "inReview",          _ZERO)
+        work_in_progress = _pick("work_in_progress",   "workInProgress",    _ZERO)
+        withdrawn        = _pick("withdrawn",           "withdrawn",         _ZERO)
+        connects         = _pick("connects",            "connects",          0)
+        upwork_plus      = _pick("upwork_plus",         "upworkPlus",        False)
 
         entry_data = {
             "availableWithdraw": aw,
@@ -292,36 +309,78 @@ async def deactivate_profile(db: Prisma, profile_id: str) -> None:
 # ── Snapshot CRUD ─────────────────────────────────────────────────────────────
 
 async def create_snapshot(db: Prisma, data: UpworkSnapshotCreate) -> dict:
+    """
+    POST /snapshots — additive daily snapshot (v9).
+
+    Behaviour
+    ─────────
+    • First submission for (profileName, date)
+        → INSERT the row with the incoming values as-is.
+    • Subsequent submission for the same (profileName, date)
+        → ADD the incoming numeric values to the existing stored values.
+        → upwork_plus uses OR semantics: once True for the day it stays True.
+
+    This ensures that multiple HR inputs throughout the same day accumulate
+    into a running total rather than silently overwriting previous entries.
+    The response always reflects the current accumulated state of the row.
+    """
     profile = await _resolve_profile_by_name(db, data.profile_name)
 
-    entry = await db.upworkentry.upsert(
+    snap_dt = datetime.combine(data.date, time.min)
+
+    # ── Fetch existing row (if any) ───────────────────────────────────────────
+    existing = await db.upworkentry.find_unique(
         where={"profileId_date": {
             "profileId": profile.id,
-            "date":      datetime.combine(data.date, time.min),
-        }},
-        data={
-            "create": {
-                "profileId":        profile.id,
-                "date":             datetime.combine(data.date, time.min),
-                "availableWithdraw": data.available_withdraw,
-                "pending":          data.pending,
-                "inReview":         data.in_review,
-                "workInProgress":   data.work_in_progress,
-                "withdrawn":        data.withdrawn,
-                "connects":         data.connects,
-                "upworkPlus":       data.upwork_plus,
-            },
-            "update": {
-                "availableWithdraw": data.available_withdraw,
-                "pending":          data.pending,
-                "inReview":         data.in_review,
-                "workInProgress":   data.work_in_progress,
-                "withdrawn":        data.withdrawn,
-                "connects":         data.connects,
-                "upworkPlus":       data.upwork_plus,
-            },
-        },
+            "date":      snap_dt,
+        }}
     )
+
+    if existing is None:
+        # ── First entry for this (profile, date) — plain INSERT ───────────────
+        entry = await db.upworkentry.create(
+            data={
+                "profileId":         profile.id,
+                "date":              snap_dt,
+                "availableWithdraw": data.available_withdraw,
+                "pending":           data.pending,
+                "inReview":          data.in_review,
+                "workInProgress":    data.work_in_progress,
+                "withdrawn":         data.withdrawn,
+                "connects":          data.connects,
+                "upworkPlus":        data.upwork_plus,
+            }
+        )
+    else:
+        # ── Row already exists — ADD (accumulate) the incoming values ─────────
+        #
+        # Numeric fields: new_total = existing + incoming
+        # Boolean fields: OR semantics (True is sticky for the day)
+        #
+        new_aw      = _d(existing.availableWithdraw) + _d(data.available_withdraw)
+        new_pending = _d(existing.pending)           + _d(data.pending)
+        new_review  = _d(existing.inReview)          + _d(data.in_review)
+        new_wip     = _d(existing.workInProgress)    + _d(data.work_in_progress)
+        new_wdrawn  = _d(existing.withdrawn)         + _d(data.withdrawn)
+        new_conn    = existing.connects              + data.connects
+        new_plus    = existing.upworkPlus            or data.upwork_plus
+
+        entry = await db.upworkentry.update(
+            where={"profileId_date": {
+                "profileId": profile.id,
+                "date":      snap_dt,
+            }},
+            data={
+                "availableWithdraw": new_aw,
+                "pending":           new_pending,
+                "inReview":          new_review,
+                "workInProgress":    new_wip,
+                "withdrawn":         new_wdrawn,
+                "connects":          new_conn,
+                "upworkPlus":        new_plus,
+            },
+        )
+
     return _entry_to_dict(entry, profile.profileName)
 
 
@@ -363,11 +422,11 @@ async def add_order(db: Prisma, data: UpworkOrderCreate) -> dict:
 
     order = await db.upworkorder.create(
         data={
-            "profileId":  profile.id,
-            "date":       datetime.combine(data.date, time.min),
-            "clientName": data.client_name,
-            "orderId":    data.order_id,
-            "amount":     data.amount,
+            "profileId":   profile.id,
+            "date":        datetime.combine(data.date, time.min),
+            "clientName":  data.client_name,
+            "orderId":     data.order_id,
+            "amount":      data.amount,
             "afterUpwork": _after_fee(data.amount),
         }
     )
@@ -402,7 +461,7 @@ async def update_order(
         patch["orderId"] = data.order_id
 
     if data.amount is not None:
-        patch["amount"]     = data.amount
+        patch["amount"]      = data.amount
         patch["afterUpwork"] = _after_fee(data.amount)
 
     if not patch:
@@ -475,8 +534,9 @@ async def list_profiles_summary(
     profiles = await db.upworkprofile.find_many(**find_kw)
 
     t_avail = t_pending = t_in_review = t_wip = t_withdrawn = _ZERO
-    t_connects = 0
-    t_revenue  = _ZERO
+    t_connects      = 0
+    t_revenue       = _ZERO
+    t_active_amount = _ZERO                                          # v10: Σ order.amount
 
     summaries = []
     for p in profiles:
@@ -490,8 +550,10 @@ async def list_profiles_summary(
         t_withdrawn += _d(latest.withdrawn)      if latest else _ZERO
         t_connects  += latest.connects            if latest else 0
 
-        period_revenue = sum((_d(o.afterUpwork) for o in p.orders), _ZERO)
-        t_revenue     += period_revenue
+        period_revenue       = sum((_d(o.afterUpwork) for o in p.orders), _ZERO)
+        period_active_amount = sum((_d(o.amount)      for o in p.orders), _ZERO)  # v10
+        t_revenue           += period_revenue
+        t_active_amount     += period_active_amount                               # v10
 
         period_totals = {
             "availableWithdraw":         float(aw),
@@ -502,6 +564,7 @@ async def list_profiles_summary(
             "withdrawn":                 float(_d(latest.withdrawn)      if latest else _ZERO),
             "connects":                  latest.connects                  if latest else 0,
             "revenueInPeriod":           float(period_revenue),
+            "activeAmount":              float(period_active_amount),              # v10
         }
 
         summaries.append({
@@ -527,6 +590,7 @@ async def list_profiles_summary(
             "totalWithdrawn":                 float(t_withdrawn),
             "totalConnects":                  t_connects,
             "totalRevenueInPeriod":           float(t_revenue),
+            "totalActiveAmount":              float(t_active_amount),              # v10
             "activeProfileCount":             total_profiles,
         },
         "pagination": _pagination_meta(pagination, total_profiles),
@@ -550,7 +614,7 @@ async def get_profile_detail(
             detail=f"Upwork profile not found matching name '{name}'.",
         )
 
-    date_f  = filters.to_prisma_filter()
+    date_f = filters.to_prisma_filter()
 
     snap_where:  dict = {"profileId": profile_id}
     order_where: dict = {"profileId": profile_id}
@@ -570,9 +634,10 @@ async def get_profile_detail(
     entries = await db.upworkentry.find_many(**snap_kw)
     orders  = await db.upworkorder.find_many(**order_kw)
 
-    latest  = entries[0] if entries else None
-    aw      = _d(latest.availableWithdraw) if latest else _ZERO
-    revenue = sum((_d(o.afterUpwork) for o in orders), _ZERO)
+    latest        = entries[0] if entries else None
+    aw            = _d(latest.availableWithdraw) if latest else _ZERO
+    revenue       = sum((_d(o.afterUpwork) for o in orders), _ZERO)
+    active_amount = sum((_d(o.amount)      for o in orders), _ZERO)   # v10
 
     return {
         "filter": filters.meta(),
@@ -590,8 +655,9 @@ async def get_profile_detail(
             "withdrawn":                 float(_d(latest.withdrawn)      if latest else _ZERO),
             "connects":                  latest.connects                  if latest else 0,
             "revenueInPeriod":           float(revenue),
+            "activeAmount":              float(active_amount),                     # v10
             "snapshotCount":             snap_total,
-            "orderCount":               order_total,
+            "orderCount":                order_total,
         },
         "pagination": _pagination_meta(pagination, max(snap_total, order_total)),
         "snapshots":  [_entry_to_dict(e, profile.profileName) for e in entries],

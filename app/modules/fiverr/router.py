@@ -14,7 +14,7 @@ PATCH  /profiles/{id}            HR_AND_ABOVE  Partial update (rename / isActive
                                               snapshot fields — all optional)
 DELETE /profiles/{id}            CEO_DIRECTOR  Soft-delete — returns JSON message
 
-POST   /snapshots                HR_AND_ABOVE  Upsert daily snapshot (by profileName)
+POST   /snapshots                HR_AND_ABOVE  Additive daily snapshot (by profileName)
 GET    /profiles/{id}/snapshots  HR_AND_ABOVE  Paginated snapshots — includes profileName
 
 POST   /orders                   HR_AND_ABOVE  Log order (by profileName, afterFiverr computed)
@@ -86,8 +86,9 @@ Returns a **single response** containing:
 
 - **Combined totals** across all active profiles for the selected period —
   `totalAvailableWithdraw`, `totalAvailableWithdrawAfterFee` (×0.80),
-  `totalNotCleared`, `totalActiveOrders`, `totalActiveOrderAmount`,
-  `totalSubmitted`, `totalWithdrawn`, `totalPromotion`, `totalRevenueInPeriod`.
+  `totalNotCleared`, `totalActiveOrders` (count of order records),
+  `totalActiveOrderAmount` (Σ order.amount), `totalSubmitted`, `totalWithdrawn`,
+  `totalPromotion`, `totalRevenueInPeriod`.
 - **Paginated per-profile breakdown** with the latest snapshot + all orders
   for the selected window (50 profiles per page by default).
 
@@ -114,7 +115,8 @@ async def get_profiles(
     summary="Single Fiverr profile — full drill-down (paginated)",
     description="""
 Returns a complete breakdown for **one profile**:
-- Period-scoped totals (availableWithdraw, afterFee, notCleared, orders, revenue …)
+- Period-scoped totals (availableWithdraw, afterFee, notCleared,
+  `activeOrders`, `activeOrderAmount`, revenue …)
 - Paginated daily snapshots in the window (newest first, 50 per page)
 - Paginated orders in the window (newest first, 50 per page)
 
@@ -191,11 +193,11 @@ without a separate POST /snapshots round-trip.
 | `available_withdraw` | Current available-withdraw balance. |
 | `not_cleared` | Funds not yet cleared. |
 | `active_orders` | Number of active orders. |
-| `active_order_amount` | Total value of active orders ($). |
-| `submitted` | Total submitted amount ($). |
-| `withdrawn` | Total withdrawn amount ($). |
+| `active_order_amount` | Total value of active orders. |
+| `submitted` | Total submitted amount. |
+| `withdrawn` | Total withdrawn amount. |
 | `seller_plus` | Seller Plus subscription flag. |
-| `promotion` | Promotion balance ($). |
+| `promotion` | Promotion balance. |
 
 Sending an empty body `{}` is accepted and returns the current profile state
 unchanged (idempotent).
@@ -247,17 +249,26 @@ async def remove_profile(
 @router.post(
     "/snapshots",
     status_code=201,
-    summary="Add or update a daily Fiverr snapshot",
+    summary="Add or update a daily Fiverr snapshot (additive accumulation)",
     description="""
-**Upserts** a daily financial snapshot for the specified profile + date.
-If a snapshot already exists for `(profileName, date)` it is **updated**;
-otherwise a new one is created.
+**Additively accumulates** a daily financial snapshot for the specified profile + date.
+
+### Submission behaviour
+
+| Scenario | Result |
+|---|---|
+| **First submission** for `(profileName, date)` | Row is **inserted** with the incoming values as-is. |
+| **Subsequent submission** for the same `(profileName, date)` | Incoming numeric values are **added** to the existing stored values. The response reflects the new running total. |
+
+> **`seller_plus`** uses OR semantics — once `true` for the day it remains `true`
+> regardless of subsequent submissions.
+
+This design ensures that multiple HR inputs throughout the same day accumulate
+into a running total rather than silently overwriting previous entries.
 
 **`profile_name`** — the human-readable profile name (case-insensitive).
 The system resolves it to an internal profile record automatically.
 HR staff never need to know or handle internal profile UUIDs.
-
-Use this endpoint for daily HR data entry to keep profile balances current.
     """,
 )
 async def add_snapshot(
@@ -308,6 +319,10 @@ The system resolves it to an internal profile record automatically.
 
 `afterFiverr` (net after 20 % platform fee) is **computed server-side** —
 it is never accepted from the client.
+
+> The `totalActiveOrders` and `totalActiveOrderAmount` fields in `GET /profiles`
+> totals reflect the cumulative count and gross sum of all logged orders and
+> update automatically as new orders are logged.
     """,
 )
 async def add_order_entry(
@@ -330,7 +345,7 @@ All fields are optional — only supplied fields are changed:
 |---|---|
 | `date` | Changes the order date. |
 | `buyer_name` | Updates the buyer display name. |
-| `order_id` | Renames the Fiverr order ID; uniqueness enforced (409 on conflict). |
+| `order_id` | Renames the Fiverr contract/order ID; uniqueness enforced (409 on conflict). |
 | `amount` | Updates gross amount **and** auto-recomputes `afterFiverr` (×0.80). |
 
 `afterFiverr` is **always server-computed** — never accepted from the client.

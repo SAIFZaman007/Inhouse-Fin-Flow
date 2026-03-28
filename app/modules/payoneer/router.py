@@ -1,7 +1,7 @@
 """
 app/modules/payoneer/router.py
 ════════════════════════════════════════════════════════════════════════════════
-v5 — Enterprise Edition
+v6 — Enterprise Edition
 
 Endpoint matrix
 ───────────────────────────────────────────────────────────────────────────────
@@ -14,7 +14,7 @@ PATCH  /accounts/{account_id}           CEO_DIRECTOR  Partial update (rename / i
                                                       balance-adjustment — all optional)
 DELETE /accounts/{account_id}           CEO_DIRECTOR  Soft-delete — returns JSON message
 
-POST   /transactions                    CEO_DIRECTOR  Add transaction (by accountName)
+POST   /transactions                    CEO_DIRECTOR  Add transaction (auto-balance)
 PATCH  /transactions/{id}               CEO_DIRECTOR  Partial update (any field)
 DELETE /transactions/{id}               CEO_DIRECTOR  Hard delete — returns JSON message
 GET    /accounts/{id}/transactions      CEO_DIRECTOR  Paginated transactions + accountName
@@ -80,7 +80,9 @@ def _xlsx(data: bytes, filename: str) -> Response:
     description="""
 Returns a **single response** containing:
 
-- **Combined totals** across all active accounts:
+- **Combined totals** across all active accounts — computed live from the
+  database on every request so they always reflect the most recently committed
+  transaction:
   `totalBalance` (Σ latest balance per account), `totalCredit`, `totalDebit`,
   `totalTransactions`, `activeAccountCount`.
 - **Paginated per-account breakdown** (50 accounts per page by default),
@@ -239,7 +241,7 @@ async def remove_account(
 @router.post(
     "/transactions",
     status_code=201,
-    summary="Add a Payoneer transaction",
+    summary="Add a Payoneer transaction (balance always auto-computed by system)",
     description="""
 Adds a ledger transaction for the specified account.
 
@@ -247,8 +249,24 @@ Adds a ledger transaction for the specified account.
 The system resolves it to an internal record automatically.
 Finance staff never need to handle internal account UUIDs.
 
-`remainingBalance` must be supplied by the caller (it reflects the account
-balance *after* this transaction, as entered in the Payoneer interface).
+### `remaining_balance` — always computed by the system *(v6)*
+
+The system is the **exclusive source of truth** for the running balance.
+Any `remaining_balance` value submitted by the caller — including `0.00` — is
+**silently ignored**.  The service always stores:
+
+```
+new_balance = latest_balance + credit - debit
+```
+
+This guarantees that `currentBalance` per account and `totalBalance` across
+all accounts in `GET /accounts` are always mathematically correct, with no
+manual calculation required from HR staff.
+
+> **Totals update immediately:** `totalBalance`, `totalCredit`, `totalDebit`,
+> and `totalTransactions` in `GET /accounts` are computed live from the
+> database on every request — they reflect this transaction the instant it
+> is committed, with no extra step required.
 
 **Access:** CEO and Director only.
     """,

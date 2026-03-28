@@ -14,7 +14,7 @@ PATCH  /profiles/{id}            HR_AND_ABOVE  Partial update (rename / isActive
                                               snapshot fields — all optional)
 DELETE /profiles/{id}            CEO_DIRECTOR  Soft-delete — returns JSON message
 
-POST   /snapshots                HR_AND_ABOVE  Upsert daily snapshot (by profileName)
+POST   /snapshots                HR_AND_ABOVE  Additive daily snapshot (by profileName)
 GET    /profiles/{id}/snapshots  HR_AND_ABOVE  Paginated snapshots — includes profileName
 
 POST   /orders                   HR_AND_ABOVE  Log order (by profileName, afterUpwork computed)
@@ -87,7 +87,7 @@ Returns a **single response** containing:
 - **Combined totals** across all active profiles for the selected period —
   `totalAvailableWithdraw`, `totalAvailableWithdrawAfterFee` (×0.90),
   `totalPending`, `totalInReview`, `totalWorkInProgress`, `totalWithdrawn`,
-  `totalConnects`, `totalRevenueInPeriod`.
+  `totalConnects`, `totalRevenueInPeriod`, `totalActiveAmount` (Σ order.amount).
 - **Paginated per-profile breakdown** with the latest snapshot + all orders
   for the selected window (50 profiles per page by default).
 
@@ -114,7 +114,8 @@ async def get_profiles(
     summary="Single Upwork profile — full drill-down (paginated)",
     description="""
 Returns a complete breakdown for **one profile**:
-- Period-scoped totals (availableWithdraw, afterFee, pending, inReview, wip, revenue …)
+- Period-scoped totals (availableWithdraw, afterFee, pending, inReview, wip,
+  revenue, `activeAmount` …)
 - Paginated daily snapshots in the window (newest first, 50 per page)
 - Paginated orders in the window (newest first, 50 per page)
 
@@ -246,17 +247,26 @@ async def remove_profile(
 @router.post(
     "/snapshots",
     status_code=201,
-    summary="Add or update a daily Upwork snapshot",
+    summary="Add or update a daily Upwork snapshot (additive accumulation)",
     description="""
-**Upserts** a daily financial snapshot for the specified profile + date.
-If a snapshot already exists for `(profileName, date)` it is **updated**;
-otherwise a new one is created.
+**Additively accumulates** a daily financial snapshot for the specified profile + date.
+
+### Submission behaviour
+
+| Scenario | Result |
+|---|---|
+| **First submission** for `(profileName, date)` | Row is **inserted** with the incoming values as-is. |
+| **Subsequent submission** for the same `(profileName, date)` | Incoming numeric values are **added** to the existing stored values. The response reflects the new running total. |
+
+> **`upwork_plus`** uses OR semantics — once `true` for the day it remains `true`
+> regardless of subsequent submissions.
+
+This design ensures that multiple HR inputs throughout the same day accumulate
+into a running total rather than silently overwriting previous entries.
 
 **`profile_name`** — the human-readable profile name (case-insensitive).
 The system resolves it to an internal profile record automatically.
 HR staff never need to know or handle internal profile UUIDs.
-
-Use this endpoint for daily HR data entry to keep profile balances current.
     """,
 )
 async def add_snapshot(
@@ -307,6 +317,10 @@ The system resolves it to an internal profile record automatically.
 
 `afterUpwork` (net after 10 % service fee) is **computed server-side** —
 it is never accepted from the client.
+
+> The `totalActiveAmount` field in `GET /profiles` totals reflects the
+> cumulative sum of all order `amount` values and updates automatically
+> as new orders are logged.
     """,
 )
 async def add_order_entry(

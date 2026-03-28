@@ -1,7 +1,7 @@
 """
 app/modules/payoneer/service.py
 ════════════════════════════════════════════════════════════════════════════════
-v4 — Enterprise Edition
+v7 — Enterprise Edition
 ════════════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -93,6 +93,28 @@ async def _get_transaction_or_404(db: Prisma, transaction_id: str):
     if not tx:
         raise HTTPException(status_code=404, detail="Payoneer transaction not found.")
     return tx
+
+
+async def _latest_balance(db: Prisma, account_id: str) -> Decimal:
+    """
+    Fetch the current running balance for ``account_id`` by reading the
+    ``remainingBalance`` of the most-recent transaction.
+
+    Sort order: ``date DESC, id DESC``
+    ────────────────────────────────────────────────────────────────────────────
+    ``id`` is a CUID — lexicographically monotonic, so it reliably breaks ties
+    when two or more transactions share the same calendar date (e.g. bulk
+    imports, same-day opening balance + first transaction).  Without the
+    secondary sort, ``find_first`` returns an arbitrary row among same-day ties,
+    which makes ``currentBalance`` and ``totalBalance`` non-deterministic.
+
+    Returns ``Decimal("0")`` when no transactions exist yet.
+    """
+    latest_tx = await db.payoneertransaction.find_first(
+        where={"accountId": account_id},
+        order=[{"date": "desc"}, {"id": "desc"}],
+    )
+    return _d(latest_tx.remainingBalance) if latest_tx else _ZERO
 
 
 # ── Account CRUD ──────────────────────────────────────────────────────────────
@@ -194,11 +216,7 @@ async def update_account(
     if data.initial_balance is not None and data.initial_balance > 0:
         # Determine the running balance to use as the new remainingBalance.
         # We take the latest transaction's remainingBalance and add the credit.
-        latest_tx = await db.payoneertransaction.find_first(
-            where={"accountId": account_id},
-            order={"date": "desc"},
-        )
-        current_balance = _d(latest_tx.remainingBalance) if latest_tx else _ZERO
+        current_balance = await _latest_balance(db, account_id)
         new_balance     = current_balance + data.initial_balance
 
         # Build the details string — prefer explicit description over opening_note
@@ -223,12 +241,12 @@ async def update_account(
         adjustment_tx = _tx_to_dict(tx, account.accountName)
 
     return {
-        "id":                   account.id,
-        "accountName":          account.accountName,
-        "isActive":             account.isActive,
+        "id":                    account.id,
+        "accountName":           account.accountName,
+        "isActive":              account.isActive,
         # Echo back description so the caller can confirm it was received,
         # even when no transaction was created.
-        "description":          data.description,
+        "description":           data.description,
         "adjustmentTransaction": adjustment_tx,
     }
 
@@ -240,10 +258,21 @@ async def list_accounts(
     pagination: Optional[PageParams] = None,
 ) -> dict:
     """
-    Combined totals + paginated per-account breakdown.
+    Combined totals + paginated per-account breakdown  (v6).
+
     ``name`` performs case-insensitive partial search on accountName.
+
+    Totals guarantee (v6 fix)
+    ─────────────────────────
+    totalBalance, totalCredit, totalDebit, totalTransactions are computed
+    across **all** matching accounts before pagination is applied, so page 2+
+    always returns the same correct aggregate as page 1.
+
+    ``_latest_balance`` results are cached per account so the same DB query
+    is never issued twice in a single request.
     """
-    date_f = filters.to_prisma_filter()
+    date_f      = filters.to_prisma_filter()
+    date_f_where = {"date": date_f} if date_f else {}
 
     where: dict = {"isActive": True}
     if name:
@@ -251,44 +280,53 @@ async def list_accounts(
 
     total_accounts = await db.payoneeraccount.count(where=where)
 
-    find_kw: dict = dict(
+    # ── Fetch ALL matching accounts with their period-filtered transactions ────
+    # Must happen before pagination so totals cover the full matching set.
+    all_accounts = await db.payoneeraccount.find_many(
         where=where,
         include={
             "transactions": {
-                "where":    {"date": date_f} if date_f else {},
+                "where":    date_f_where,
                 "order_by": {"date": "desc"},
             },
         },
     )
-    if pagination:
-        find_kw["skip"] = pagination.skip
-        find_kw["take"] = pagination.take
 
-    accounts = await db.payoneeraccount.find_many(**find_kw)
+    # ── Pre-fetch latest all-time balance per account — cached to avoid N×2 ──
+    account_balances: dict[str, Decimal] = {}
+    for acc in all_accounts:
+        account_balances[acc.id] = await _latest_balance(db, acc.id)
 
+    # ── Cross-account totals (full matching set, not paginated) ───────────────
     t_balance = t_credit = t_debit = _ZERO
-    t_txcount  = 0
-    summaries  = []
+    t_txcount = 0
 
-    for acc in accounts:
-        # Latest balance across ALL time (not filtered)
-        latest_tx = await db.payoneertransaction.find_first(
-            where={"accountId": acc.id}, order={"date": "desc"}
-        )
-        current_balance = _d(latest_tx.remainingBalance) if latest_tx else _ZERO
-        t_balance      += current_balance
-
+    for acc in all_accounts:
+        bal           = account_balances[acc.id]
+        t_balance    += bal
         period_credit = sum((_d(t.credit) for t in acc.transactions), _ZERO)
         period_debit  = sum((_d(t.debit)  for t in acc.transactions), _ZERO)
-        t_credit      += period_credit
-        t_debit       += period_debit
-        t_txcount     += len(acc.transactions)
+        t_credit     += period_credit
+        t_debit      += period_debit
+        t_txcount    += len(acc.transactions)
+
+    # ── Paginate in-process (totals are already captured above) ──────────────
+    if pagination:
+        page_slice = all_accounts[pagination.skip : pagination.skip + pagination.take]
+    else:
+        page_slice = all_accounts
+
+    summaries: list[dict] = []
+    for acc in page_slice:
+        bal           = account_balances[acc.id]
+        period_credit = sum((_d(t.credit) for t in acc.transactions), _ZERO)
+        period_debit  = sum((_d(t.debit)  for t in acc.transactions), _ZERO)
 
         summaries.append({
             "id":                acc.id,
             "accountName":       acc.accountName,
             "isActive":          acc.isActive,
-            "currentBalance":    float(current_balance),
+            "currentBalance":    float(bal),
             "periodCredit":      float(period_credit),
             "periodDebit":       float(period_debit),
             "transactionCount":  len(acc.transactions),
@@ -324,11 +362,36 @@ async def deactivate_account(db: Prisma, account_id: str) -> None:
 
 async def add_transaction(db: Prisma, data: PayoneerTransactionCreate) -> dict:
     """
-    Add a ledger transaction.
+    POST /transactions — add a ledger transaction (v6).
+
     Resolves account by ``data.account_name`` — staff never handle UUIDs.
+
+    remainingBalance computation  (system-owned, always)
+    ─────────────────────────────────────────────────────
+    The service is the exclusive source of truth for the running balance.
+    ``data.remaining_balance`` is accepted at the schema level for API
+    compatibility but is **unconditionally ignored here**.
+
+    The balance is ALWAYS computed as:
+        new_balance = latest_balance + credit - debit
+
+    This guarantees that:
+    • ``currentBalance`` per account is always mathematically consistent.
+    • ``totalBalance`` in GET /accounts is always correct.
+    • A caller supplying ``0.00`` (or any other value) cannot accidentally
+      corrupt the ledger.
+
+    The combined totals in GET /accounts are computed live from the DB on every
+    request — totalBalance, totalCredit, totalDebit, totalTransactions are
+    updated immediately after this call completes with no extra step required.
     """
     account = await _resolve_account_by_name(db, data.account_name)
 
+    # ── Always auto-compute remainingBalance — caller-supplied value ignored ──
+    current_balance   = await _latest_balance(db, account.id)
+    remaining_balance = current_balance + _d(data.credit) - _d(data.debit)
+
+    # ── Persist ───────────────────────────────────────────────────────────────
     tx = await db.payoneertransaction.create(
         data={
             "accountId":        account.id,
@@ -338,7 +401,7 @@ async def add_transaction(db: Prisma, data: PayoneerTransactionCreate) -> dict:
             "accountTo":        data.accountTo,
             "debit":            data.debit,
             "credit":           data.credit,
-            "remainingBalance": data.remaining_balance,
+            "remainingBalance": remaining_balance,
         }
     )
     return _tx_to_dict(tx, account.accountName)
@@ -423,10 +486,7 @@ async def get_account_transactions(
     transactions = await db.payoneertransaction.find_many(**find_kw)
 
     # Current balance from latest tx across all time
-    latest = await db.payoneertransaction.find_first(
-        where={"accountId": account_id}, order={"date": "desc"}
-    )
-    current_balance = _d(latest.remainingBalance) if latest else _ZERO
+    current_balance = await _latest_balance(db, account_id)
 
     period_credit = sum((_d(t.credit) for t in transactions), _ZERO)
     period_debit  = sum((_d(t.debit)  for t in transactions), _ZERO)
@@ -443,8 +503,8 @@ async def get_account_transactions(
         "pagination":     _pagination_meta(pagination, total),
         "transactions":   [_tx_to_dict(t, account.accountName) for t in transactions],
     }
-    
-    
+
+
 async def get_account_detail(
     db: Prisma,
     account_id: str,
@@ -455,47 +515,43 @@ async def get_account_detail(
     GET /payoneer/accounts/{account_id}
     ─────────────────────────────────────
     Returns a full detail view for a single Payoneer account:
- 
+
     - Account metadata (id, accountName, isActive)
     - currentBalance — latest remainingBalance across all time
     - periodCredit / periodDebit — sums within the selected filter window
     - Paginated transactions in the window (newest first)
- 
+
     Each transaction row includes accountName for client convenience.
     """
     # ── Resolve account ───────────────────────────────────────────────────────
     account = await db.payoneeraccount.find_unique(where={"id": account_id})
     if not account:
         raise HTTPException(status_code=404, detail="Payoneer account not found.")
- 
+
     date_f = filters.to_prisma_filter()
- 
+
     # ── Current balance — latest transaction across all time ──────────────────
-    latest_tx = await db.payoneertransaction.find_first(
-        where={"accountId": account_id},
-        order={"date": "desc"},
-    )
-    current_balance = float(latest_tx.remainingBalance) if latest_tx else 0.0
- 
+    current_balance = await _latest_balance(db, account_id)
+
     # ── Period-scoped WHERE clause ────────────────────────────────────────────
     period_where: dict = {"accountId": account_id}
     if date_f:
         period_where["date"] = date_f
- 
+
     # ── Period aggregates ─────────────────────────────────────────────────────
-    period_txs = await db.payoneertransaction.find_many(where=period_where)
+    period_txs    = await db.payoneertransaction.find_many(where=period_where)
     period_credit = sum(float(t.credit) for t in period_txs)
     period_debit  = sum(float(t.debit)  for t in period_txs)
     total_count   = len(period_txs)
- 
+
     # ── Paginated transaction list ────────────────────────────────────────────
     find_kw: dict = dict(where=period_where, order={"date": "desc"})
     if pagination:
         find_kw["skip"] = pagination.skip
         find_kw["take"] = pagination.take
- 
+
     transactions = await db.payoneertransaction.find_many(**find_kw)
- 
+
     tx_rows = [
         {
             "id":               t.id,
@@ -511,7 +567,7 @@ async def get_account_detail(
         }
         for t in transactions
     ]
- 
+
     return {
         "filter": filters.meta(),
         "account": {
@@ -519,7 +575,7 @@ async def get_account_detail(
             "accountName": account.accountName,
             "isActive":    account.isActive,
         },
-        "currentBalance": current_balance,
+        "currentBalance": float(current_balance),
         "periodCredit":   period_credit,
         "periodDebit":    period_debit,
         "pagination":     _pagination_meta(pagination, total_count),
