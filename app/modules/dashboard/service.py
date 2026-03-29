@@ -25,6 +25,12 @@ Filter strategy
 All filters are ADDITIVE:  each section of the dashboard respects the same
 date window so the frontend can show a fully consistent time-scoped view.
 
+KPI Formulas
+------------
+  totalNotCleared        = Fiverr.notCleared + Upwork.pending + Upwork.inReview
+  totalAvailableWithdraw = Fiverr.availableWithdraw + Upwork.availableWithdraw
+  totalRevenue           = totalAvailableWithdraw + totalNotCleared + payoneerBalance
+
 Usage from router:
     from .service import get_dashboard_summary
     data = await get_dashboard_summary(db, period="weekly", export_date="2025-03-10")
@@ -188,14 +194,15 @@ async def _fiverr_summary(
         act_ord = latest.activeOrders             if latest else 0
         act_amt = _d(latest.activeOrderAmount)   if latest else _ZERO
 
-        # Revenue = sum of afterFiverr for individual orders in window
-        revenue = sum((_d(o.afterFiverr) for o in p.orders), _ZERO)
+        # revenueInPeriod (spec): availableWithdraw + notCleared - withdrawn
+        wdrawn  = _d(latest.withdrawn) if latest else _ZERO
+        revenue = avail + not_cl - wdrawn
 
-        total_available          += avail
-        total_not_cleared        += not_cl
-        total_active_orders      += act_ord
+        total_available           += avail
+        total_not_cleared         += not_cl
+        total_active_orders       += act_ord
         total_active_order_amount += act_amt
-        total_revenue            += revenue
+        total_revenue             += revenue
 
         profile_list.append({
             "profileId":          p.id,
@@ -204,7 +211,8 @@ async def _fiverr_summary(
             "notCleared":         float(not_cl),
             "activeOrders":       act_ord,
             "activeOrderAmount":  float(act_amt),
-            "revenueInPeriod":    float(revenue),
+            "withdrawn":          float(wdrawn),
+            "revenueInPeriod":    float(revenue),   # aw + notCleared - withdrawn
             "entryCount":         len(p.entries),
         })
 
@@ -214,7 +222,7 @@ async def _fiverr_summary(
             "notCleared":         float(total_not_cleared),
             "activeOrders":       total_active_orders,
             "activeOrderAmount":  float(total_active_order_amount),
-            "revenueInPeriod":    float(total_revenue),
+            "revenueInPeriod":    float(total_revenue),   # Σ (aw + notCleared - withdrawn)
         },
         "Fiverr_profiles": profile_list,
     }
@@ -250,7 +258,9 @@ async def _upwork_summary(
         pending = _d(latest.pending)            if latest else _ZERO
         review  = _d(latest.inReview)           if latest else _ZERO
         wip     = _d(latest.workInProgress)     if latest else _ZERO
-        revenue = sum((_d(o.afterUpwork) for o in p.orders), _ZERO)
+        # revenueInPeriod (spec): availableWithdraw + pending + inReview - withdrawn
+        wdrawn  = _d(latest.withdrawn) if latest else _ZERO
+        revenue = avail + pending + review - wdrawn
 
         total_available += avail
         total_pending   += pending
@@ -265,7 +275,8 @@ async def _upwork_summary(
             "pending":           float(pending),
             "inReview":          float(review),
             "workInProgress":    float(wip),
-            "revenueInPeriod":   float(revenue),
+            "withdrawn":         float(wdrawn),
+            "revenueInPeriod":   float(revenue),   # aw + pending + inReview - withdrawn
             "entryCount":        len(p.entries),
         })
 
@@ -587,19 +598,29 @@ async def get_dashboard_summary(
     )
 
     # ── Cross-module KPI roll-ups ─────────────────────────────────────────────
+    # totalAvailableWithdraw = Fiverr.availableWithdraw + Upwork.availableWithdraw
     total_available_withdraw = (
         fiverr["totals"]["availableWithdraw"]
         + upwork["totals"]["availableWithdraw"]
     )
-    total_not_cleared = fiverr["totals"]["notCleared"]
+
+    # totalNotCleared = Fiverr.notCleared + Upwork.pending + Upwork.inReview
+    total_not_cleared = (
+        fiverr["totals"]["notCleared"]
+        + upwork["totals"]["pending"]
+        + upwork["totals"]["inReview"]
+    )
+
     total_active_orders = (
         fiverr["totals"]["activeOrders"]
         + outside["totals"]["activeOrders"]
     )
+
+    # totalRevenue = totalAvailableWithdraw + totalNotCleared + payoneerBalance
     total_revenue = (
-        fiverr["totals"]["revenueInPeriod"]
-        + upwork["totals"]["revenueInPeriod"]
-        + outside["totals"]["receiveAmount"]
+        total_available_withdraw
+        + total_not_cleared
+        + payoneer["totals"]["totalBalance"]
     )
 
     return {

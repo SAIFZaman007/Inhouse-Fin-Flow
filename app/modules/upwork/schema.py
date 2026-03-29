@@ -1,35 +1,34 @@
 """
 app/modules/upwork/schema.py
 ════════════════════════════════════════════════════════════════════════════════
-v8 — Enterprise Edition
+v9 — Enterprise Edition
 
-Changes vs v7
+Changes vs v8
 ─────────────
-UpworkTotals              NEW FIELD — ``totalActiveAmount``
-                            Σ order.amount across all active profiles for the
-                            selected period.  Reflects the gross value of all
-                            logged orders immediately after POST /orders returns.
+UpworkSnapshotCreate      NEW OPTIONAL FIELD — ``active_amount``
+                            Optional alias for ``work_in_progress``.  Both map
+                            to the same ``workInProgress`` DB column.
+                            • Only ``work_in_progress`` supplied  → unchanged behaviour.
+                            • Only ``active_amount``   supplied   → treated as wip.
+                            • Both supplied                       → values are summed.
+                            Omitting ``active_amount`` has zero effect on existing flows.
 
-UpworkProfileDetailTotals NEW FIELD — ``activeAmount``
-                            Same computation scoped to a single profile.
+UpworkSnapshotResponse    NEW FIELD — ``activeAmount``
+UpworkSnapshotInProfile   Always equals ``workInProgress``; surfaced as a sibling
+                            key so all consumer endpoints expose both names.
 
-UpworkProfileUpdate       PYDANTIC-V2 FIX — ``upwork_plus: Optional[bool]``
-                            changed from bare ``Field(default=None)`` to plain
-                            ``= None`` to prevent PydanticSchemaGenerationError
-                            on startup.
+UpworkProfileDetailTotals Field order aligned with list response for consistency.
 
-UpworkOrderUpdate         PYDANTIC-V2 FIX — ``date: Optional[date]``
-                            changed from bare ``Field(default=None)`` to plain
-                            ``= None`` for the same reason.
+UpworkOrderCreate         Doc-string updated to describe order → snapshot sync.
 
-Everything else is unchanged from v7.
+Everything else is unchanged from v8.
 ════════════════════════════════════════════════════════════════════════════════
 """
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ── Fee constant (mirrors service.py — keep in sync) ─────────────────────────
@@ -139,6 +138,20 @@ class UpworkSnapshotCreate(BaseModel):
 
     This ensures that multiple HR inputs throughout the same day accumulate
     into a running total rather than silently overwriting previous entries.
+    The response always reflects the current accumulated state of the row.
+
+    ``active_amount`` / ``work_in_progress`` duality
+    ─────────────────────────────────────────────────
+    ``active_amount`` is an **optional alias** for ``work_in_progress``.
+    Both fields map to the same ``workInProgress`` DB column.
+
+    • Only ``work_in_progress`` supplied  → stored as-is (unchanged behaviour).
+    • Only ``active_amount``   supplied   → treated identically to ``work_in_progress``.
+    • Both supplied                       → their values are **summed** before storage.
+    • Neither supplied                    → defaults to 0.
+
+    Both ``workInProgress`` and ``activeAmount`` are always returned in every
+    response with identical values, for full forward/backward compatibility.
     """
     profile_name:       str     = Field(
         ..., min_length=1, max_length=100,
@@ -149,9 +162,30 @@ class UpworkSnapshotCreate(BaseModel):
     pending:            Decimal = Field(default=Decimal("0"), ge=0)
     in_review:          Decimal = Field(default=Decimal("0"), ge=0)
     work_in_progress:   Decimal = Field(default=Decimal("0"), ge=0)
+    # Optional alias ──────────────────────────────────────────────────────────
+    active_amount:      Optional[Decimal] = Field(
+        default=None, ge=0,
+        description=(
+            "Optional alias for work_in_progress. "
+            "When supplied its value is added to work_in_progress before storage. "
+            "The response always reflects the merged value under both keys."
+        ),
+    )
     withdrawn:          Decimal = Field(default=Decimal("0"), ge=0)
     connects:           int     = Field(default=0, ge=0)
     upwork_plus:        bool    = False
+
+    @model_validator(mode="after")
+    def _merge_active_amount(self) -> "UpworkSnapshotCreate":
+        """
+        Collapse ``active_amount`` into ``work_in_progress`` so the service
+        layer always works through a single field name.
+        """
+        if self.active_amount is not None:
+            self.work_in_progress = self.work_in_progress + self.active_amount
+        # Mirror back so the response always carries both keys.
+        self.active_amount = self.work_in_progress
+        return self
 
 
 class UpworkSnapshotResponse(BaseModel):
@@ -165,6 +199,7 @@ class UpworkSnapshotResponse(BaseModel):
     pending:                   Decimal
     inReview:                  Decimal
     workInProgress:            Decimal
+    activeAmount:              Decimal  # v9: alias — always equals workInProgress
     withdrawn:                 Decimal
     connects:                  int
     upworkPlus:                bool
@@ -184,6 +219,22 @@ class UpworkOrderCreate(BaseModel):
 
     ``profile_name`` replaced ``profile_id`` in v5.
     ``afterUpwork`` (amount × 0.90) is always computed server-side.
+
+    Automatic snapshot sync
+    ───────────────────────
+    After persisting the order row the service additively updates the snapshot
+    for ``(profileName, date)``:
+
+    • ``workInProgress`` and ``activeAmount`` on the matching snapshot are
+      each incremented by ``amount`` (they are the same DB column; both
+      response keys reflect the updated value).
+    • If no snapshot exists yet for that date one is **upserted** automatically
+      with the order amount seeding ``workInProgress`` / ``activeAmount``.
+    • The aggregated ``periodTotals`` and ``totals`` values returned by
+      GET /profiles update automatically to reflect the new order.
+
+    No extra API call is needed after POST /orders — the platform stays
+    fully in-sync with a single request.
     """
     profile_name: str     = Field(
         ..., min_length=1, max_length=100,
@@ -241,6 +292,7 @@ class UpworkSnapshotInProfile(BaseModel):
     pending:                   float
     inReview:                  float
     workInProgress:            float
+    activeAmount:              float  # v9: alias — always equals workInProgress
     withdrawn:                 float
     connects:                  int
     upworkPlus:                bool
@@ -307,10 +359,10 @@ class UpworkProfileDetailTotals(BaseModel):
     pending:                   float
     inReview:                  float
     workInProgress:            float
+    activeAmount:              float   # v8: Σ order.amount for this profile
     withdrawn:                 float
     connects:                  int
     revenueInPeriod:           float
-    activeAmount:              float   # v8: Σ order.amount for this profile
     snapshotCount:             int
     orderCount:                int
 

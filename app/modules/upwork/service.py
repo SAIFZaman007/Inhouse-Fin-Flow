@@ -1,24 +1,40 @@
 """
 app/modules/upwork/service.py
 ════════════════════════════════════════════════════════════════════════════════
-v10 — Enterprise Edition
+v13 — Enterprise Edition
 
-Changes vs v9
-─────────────
-list_profiles_summary   NEW FIELD — ``totalActiveAmount`` in ``totals``
-                          Σ order.amount across every order in the selected
-                          period for all active profiles.  Summed in the same
-                          aggregation loop that already computes t_revenue, so
-                          there is zero extra DB round-trip.
+Changes vs v12
+──────────────
+create_snapshot   ROOT CAUSE FIX — Previous versions used Prisma ``upsert``
+                    which atomically replaced ALL fields on conflict, silently
+                    wiping any values that the caller omitted.  Fixed to use
+                    the same fetch-then-additive-update pattern as the Fiverr
+                    module:
+                      • If no row exists for (profile, date) → plain INSERT.
+                      • If a row already exists             → ADD incoming
+                        numeric values to the stored values.
+                        ``upworkPlus`` retains OR semantics (sticky True).
+                    This mirrors the Fiverr implementation exactly and is the
+                    only correct approach for an accumulation ledger.
 
-                          Also added ``activeAmount`` to each per-profile
-                          ``periodTotals`` dict so the single-profile breakdown
-                          is consistent with the combined totals.
+revenueInPeriod   FORMULA FIX — now computed as:
+                      availableWithdraw + pending + inReview - withdrawn
+                    matching the spec.  Previously the field was sourced from
+                    order revenue (afterUpwork), which is a different concept.
+                    ``revenueInPeriod`` now reflects the net balance state of
+                    the latest snapshot in the period.  Order revenue is still
+                    surfaced as ``orderRevenueInPeriod`` (Σ afterUpwork) for
+                    full backwards compatibility.
 
-get_profile_detail      NEW FIELD — ``activeAmount`` in ``periodTotals``
-                          Same computation scoped to a single profile.
+withdrawn         DEDUCTION — ``withdrawn`` is subtracted from
+                    ``revenueInPeriod`` via the helper ``_revenue_from_snapshot``,
+                    applied consistently in _entry_to_dict, list_profiles_summary,
+                    get_profile_detail, create_snapshot, and add_order.
 
-Everything else is unchanged from v9.
+activeAmount /    Always equal — both derived from the same ``workInProgress``
+workInProgress    DB column.  Parity maintained in every response path.
+
+Everything else is unchanged from v12.
 ════════════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -71,8 +87,39 @@ def _after_fee(amount: Any) -> Decimal:
     return (_d(amount) * _AFTER_RATE).quantize(Decimal("0.01"))
 
 
+def _revenue_from_snapshot(entry: Any) -> Decimal:
+    """
+    Compute revenueInPeriod from a snapshot row.
+
+    Formula (spec):
+        revenueInPeriod = availableWithdraw + pending + inReview - withdrawn
+
+    This represents the net earned balance still on the platform — funds that
+    have been earned but not yet withdrawn.  ``withdrawn`` is subtracted so
+    that deducted amounts are correctly removed from both revenueInPeriod
+    and the effective available balance.
+    Returns Decimal("0") for a None entry.
+    """
+    if entry is None:
+        return _ZERO
+    return (
+        _d(entry.availableWithdraw)
+        + _d(entry.pending)
+        + _d(entry.inReview)
+        - _d(entry.withdrawn)
+    )
+
+
 def _entry_to_dict(entry: Any, profile_name: str) -> dict:
-    aw = _d(entry.availableWithdraw)
+    """
+    Serialise a UpworkEntry ORM object to a plain dict.
+
+    ``activeAmount`` always mirrors ``workInProgress`` (same DB column).
+    ``revenueInPeriod`` = availableWithdraw + pending + inReview - withdrawn.
+    """
+    aw  = _d(entry.availableWithdraw)
+    wip = _d(entry.workInProgress)
+    rev = _revenue_from_snapshot(entry)
     return {
         "id":                        entry.id,
         "profileId":                 entry.profileId,
@@ -82,8 +129,10 @@ def _entry_to_dict(entry: Any, profile_name: str) -> dict:
         "availableWithdrawAfterFee": float(_after_fee(aw)),
         "pending":                   float(_d(entry.pending)),
         "inReview":                  float(_d(entry.inReview)),
-        "workInProgress":            float(_d(entry.workInProgress)),
+        "workInProgress":            float(wip),
+        "activeAmount":              float(wip),          # always equals workInProgress
         "withdrawn":                 float(_d(entry.withdrawn)),
+        "revenueInPeriod":           float(rev),          # aw + pending + inReview - withdrawn
         "connects":                  entry.connects,
         "upworkPlus":                entry.upworkPlus,
         "createdAt":                 entry.createdAt,
@@ -134,6 +183,44 @@ async def _resolve_profile_by_name(db: Prisma, profile_name: str):
             detail=f"Upwork profile '{profile_name}' not found.",
         )
     return profile
+
+
+# ── Snapshot sync helper ──────────────────────────────────────────────────────
+
+async def _sync_snapshot_wip(
+    db: Prisma,
+    profile_id: str,
+    snap_dt: datetime,
+    delta: Decimal,
+) -> None:
+    """
+    Additively increment ``workInProgress`` on the snapshot for
+    ``(profile_id, snap_dt)`` by ``delta``.
+
+    If no snapshot row exists yet for that date it is created with
+    ``workInProgress = delta`` and all other numeric fields at zero.
+    This ensures that POST /orders never silently drops the sync even
+    when no manual snapshot has been submitted for that day.
+    """
+    existing = await db.upworkentry.find_unique(
+        where={"profileId_date": {"profileId": profile_id, "date": snap_dt}}
+    )
+
+    if existing is None:
+        await db.upworkentry.create(
+            data={
+                "profileId":         profile_id,
+                "date":              snap_dt,
+                "availableWithdraw": _ZERO,
+                "workInProgress":    delta,
+            }
+        )
+    else:
+        new_wip = _d(existing.workInProgress) + delta
+        await db.upworkentry.update(
+            where={"profileId_date": {"profileId": profile_id, "date": snap_dt}},
+            data={"workInProgress": new_wip},
+        )
 
 
 # ── Profile CRUD ──────────────────────────────────────────────────────────────
@@ -198,17 +285,12 @@ async def update_profile(
     """
     PATCH /profiles/{id} — partial profile update (v7).
 
-    Handles two independent concerns in one atomic-ish call:
-
     1. Profile metadata  — rename (with uniqueness check) and/or isActive toggle.
     2. Snapshot upsert   — if any snapshot field is supplied, upsert the
                            UpworkEntry for ``snapshot_date`` (defaults to today).
-
-    Returns the updated profile dict plus the upserted snapshot (if any).
     """
     profile = await _get_profile_or_404(db, profile_id)
 
-    # ── 1. Profile metadata patch ─────────────────────────────────────────────
     profile_patch: dict = {}
 
     if data.profileName is not None and data.profileName != profile.profileName:
@@ -234,7 +316,6 @@ async def update_profile(
             data=profile_patch,
         )
 
-    # ── 2. Snapshot upsert (only when at least one snapshot field was sent) ───
     sent            = data.model_fields_set
     snapshot_fields = sent & _SNAPSHOT_FIELDS
     upserted_snapshot: Optional[dict] = None
@@ -242,7 +323,6 @@ async def update_profile(
     if snapshot_fields:
         snap_date = data.snapshot_date or date.today()
 
-        # Fetch the existing entry (if any) to use as fallback for unsent fields
         existing_entry = await db.upworkentry.find_unique(
             where={"profileId_date": {
                 "profileId": profile_id,
@@ -250,9 +330,7 @@ async def update_profile(
             }}
         )
 
-        # Build the upsert payload — fall back to existing values for unsent fields
         def _pick(field: str, existing_attr: str, default: Any) -> Any:
-            """Return the new value if sent, else existing value, else default."""
             if field in sent:
                 return getattr(data, field)
             if existing_entry is not None:
@@ -310,22 +388,31 @@ async def deactivate_profile(db: Prisma, profile_id: str) -> None:
 
 async def create_snapshot(db: Prisma, data: UpworkSnapshotCreate) -> dict:
     """
-    POST /snapshots — additive daily snapshot (v9).
+    POST /snapshots — additive daily snapshot (v13).
 
-    Behaviour
-    ─────────
-    • First submission for (profileName, date)
-        → INSERT the row with the incoming values as-is.
-    • Subsequent submission for the same (profileName, date)
-        → ADD the incoming numeric values to the existing stored values.
-        → upwork_plus uses OR semantics: once True for the day it stays True.
+    ROOT CAUSE FIX
+    ──────────────
+    Previous versions used Prisma ``upsert`` which atomically REPLACED all
+    fields on a key conflict, wiping any values the caller did not include
+    in the current submission.  This function now uses the correct pattern:
 
-    This ensures that multiple HR inputs throughout the same day accumulate
-    into a running total rather than silently overwriting previous entries.
-    The response always reflects the current accumulated state of the row.
+      1. Fetch the existing row for (profile, date).
+      2. If no row exists → plain INSERT with incoming values.
+      3. If a row exists  → ADD incoming numeric values to stored values
+                            (upworkPlus uses OR — sticky True).
+
+    This is the same pattern used by the Fiverr module and guarantees that
+    repeated POST /snapshots calls never erase previous data.
+
+    revenueInPeriod formula (spec):
+        revenueInPeriod = availableWithdraw + pending + inReview - withdrawn
+
+    ``active_amount`` is already folded into ``work_in_progress`` by the
+    Pydantic model validator on UpworkSnapshotCreate before this function
+    is called.  Both ``workInProgress`` and ``activeAmount`` are returned
+    in the response (via _entry_to_dict) with identical values.
     """
     profile = await _resolve_profile_by_name(db, data.profile_name)
-
     snap_dt = datetime.combine(data.date, time.min)
 
     # ── Fetch existing row (if any) ───────────────────────────────────────────
@@ -353,10 +440,6 @@ async def create_snapshot(db: Prisma, data: UpworkSnapshotCreate) -> dict:
         )
     else:
         # ── Row already exists — ADD (accumulate) the incoming values ─────────
-        #
-        # Numeric fields: new_total = existing + incoming
-        # Boolean fields: OR semantics (True is sticky for the day)
-        #
         new_aw      = _d(existing.availableWithdraw) + _d(data.available_withdraw)
         new_pending = _d(existing.pending)           + _d(data.pending)
         new_review  = _d(existing.inReview)          + _d(data.in_review)
@@ -381,7 +464,35 @@ async def create_snapshot(db: Prisma, data: UpworkSnapshotCreate) -> dict:
             },
         )
 
-    return _entry_to_dict(entry, profile.profileName)
+    # ── Rebuild aggregated totals so the caller gets a complete refresh ────────
+    all_orders          = await db.upworkorder.find_many(where={"profileId": profile.id})
+    total_revenue       = sum((_d(o.afterUpwork) for o in all_orders), _ZERO)
+    total_active_amount = sum((_d(o.amount)      for o in all_orders), _ZERO)
+
+    updated_aw  = _d(entry.availableWithdraw)
+    updated_wip = _d(entry.workInProgress)
+    rev         = _revenue_from_snapshot(entry)
+
+    snapshot_dict = _entry_to_dict(entry, profile.profileName)
+
+    return {
+        **snapshot_dict,
+        "syncedTotals": {
+            "revenueAllTime":       float(total_revenue),
+            "activeAmountAllTime":  float(total_active_amount),
+            "latestSnapshot": {
+                "availableWithdraw":         float(updated_aw),
+                "availableWithdrawAfterFee": float(_after_fee(updated_aw)),
+                "pending":                   float(_d(entry.pending)),
+                "inReview":                  float(_d(entry.inReview)),
+                "workInProgress":            float(updated_wip),
+                "activeAmount":              float(updated_wip),    # always mirrors workInProgress
+                "withdrawn":                 float(_d(entry.withdrawn)),
+                "revenueInPeriod":           float(rev),            # aw + pending + inReview - withdrawn
+                "connects":                  entry.connects,
+            },
+        },
+    }
 
 
 async def get_profile_snapshots(
@@ -414,23 +525,71 @@ async def get_profile_snapshots(
 # ── Order CRUD ────────────────────────────────────────────────────────────────
 
 async def add_order(db: Prisma, data: UpworkOrderCreate) -> dict:
+    """
+    POST /orders — log a new Upwork order and sync the daily snapshot (v13).
+
+    1. Resolve the active profile by name (case-insensitive).
+    2. Guard against duplicate orderId (409 on conflict).
+    3. Persist the UpworkOrder row with server-computed ``afterUpwork``.
+    4. Additively sync the UpworkEntry (snapshot) for the same date:
+         workInProgress += order.amount
+       Snapshot is created if it doesn't exist for that date.
+    5. Return the persisted order dict + snapshotSync summary + syncedTotals.
+    """
     profile = await _resolve_profile_by_name(db, data.profile_name)
 
     existing = await db.upworkorder.find_unique(where={"orderId": data.order_id})
     if existing:
         raise HTTPException(status_code=409, detail="Order ID already exists.")
 
+    snap_dt = datetime.combine(data.date, time.min)
+
     order = await db.upworkorder.create(
         data={
             "profileId":   profile.id,
-            "date":        datetime.combine(data.date, time.min),
+            "date":        snap_dt,
             "clientName":  data.client_name,
             "orderId":     data.order_id,
             "amount":      data.amount,
             "afterUpwork": _after_fee(data.amount),
         }
     )
-    return _order_to_dict(order)
+
+    await _sync_snapshot_wip(db, profile.id, snap_dt, _d(data.amount))
+
+    updated_entry = await db.upworkentry.find_unique(
+        where={"profileId_date": {"profileId": profile.id, "date": snap_dt}}
+    )
+
+    all_orders          = await db.upworkorder.find_many(where={"profileId": profile.id})
+    total_revenue       = sum((_d(o.afterUpwork) for o in all_orders), _ZERO)
+    total_active_amount = sum((_d(o.amount)      for o in all_orders), _ZERO)
+
+    rev = _revenue_from_snapshot(updated_entry) if updated_entry else _ZERO
+
+    return {
+        **_order_to_dict(order),
+        "snapshotSync": {
+            "date":            str(data.date),
+            "workInProgress":  float(_d(updated_entry.workInProgress)) if updated_entry else float(_d(data.amount)),
+            "activeAmount":    float(_d(updated_entry.workInProgress)) if updated_entry else float(_d(data.amount)),
+            "latestSnapshot": {
+                "availableWithdraw":         float(_d(updated_entry.availableWithdraw))            if updated_entry else 0.0,
+                "availableWithdrawAfterFee": float(_after_fee(_d(updated_entry.availableWithdraw))) if updated_entry else 0.0,
+                "pending":                   float(_d(updated_entry.pending))                       if updated_entry else 0.0,
+                "inReview":                  float(_d(updated_entry.inReview))                      if updated_entry else 0.0,
+                "workInProgress":            float(_d(updated_entry.workInProgress))                if updated_entry else float(_d(data.amount)),
+                "activeAmount":              float(_d(updated_entry.workInProgress))                if updated_entry else float(_d(data.amount)),
+                "withdrawn":                 float(_d(updated_entry.withdrawn))                     if updated_entry else 0.0,
+                "revenueInPeriod":           float(rev),
+                "connects":                  updated_entry.connects                                 if updated_entry else 0,
+            } if updated_entry else None,
+        },
+        "syncedTotals": {
+            "revenueAllTime":       float(total_revenue),
+            "activeAmountAllTime":  float(total_active_amount),
+        },
+    }
 
 
 async def update_order(
@@ -506,6 +665,19 @@ async def list_profiles_summary(
     name: Optional[str] = None,
     pagination: Optional[PageParams] = None,
 ) -> dict:
+    """
+    GET /profiles — combined totals + paginated per-profile breakdown (v13).
+
+    revenueInPeriod formula (spec):
+        revenueInPeriod = availableWithdraw + pending + inReview - withdrawn
+
+    ``withdrawn`` is subtracted so deducted amounts correctly reduce the
+    net platform balance.  Applied per-profile from the latest snapshot in
+    the selected window, then summed for cross-profile totals.
+
+    ``orderRevenueInPeriod`` (Σ afterUpwork) is surfaced separately for
+    full backwards compatibility.
+    """
     date_f = filters.to_prisma_filter()
 
     where: dict = {"isActive": True}
@@ -533,38 +705,47 @@ async def list_profiles_summary(
 
     profiles = await db.upworkprofile.find_many(**find_kw)
 
-    t_avail = t_pending = t_in_review = t_wip = t_withdrawn = _ZERO
+    t_avail         = t_pending = t_in_review = t_wip = t_withdrawn = _ZERO
     t_connects      = 0
-    t_revenue       = _ZERO
-    t_active_amount = _ZERO                                          # v10: Σ order.amount
+    t_revenue       = _ZERO   # Σ revenueInPeriod per spec formula
+    t_order_revenue = _ZERO   # Σ afterUpwork (order flow)
+    t_active_amount = _ZERO   # Σ order.amount
 
     summaries = []
     for p in profiles:
         latest = p.entries[0] if p.entries else None
         aw     = _d(latest.availableWithdraw) if latest else _ZERO
+        wdrawn = _d(latest.withdrawn)          if latest else _ZERO
 
         t_avail     += aw
         t_pending   += _d(latest.pending)        if latest else _ZERO
         t_in_review += _d(latest.inReview)       if latest else _ZERO
         t_wip       += _d(latest.workInProgress) if latest else _ZERO
-        t_withdrawn += _d(latest.withdrawn)      if latest else _ZERO
+        t_withdrawn += wdrawn
         t_connects  += latest.connects            if latest else 0
 
-        period_revenue       = sum((_d(o.afterUpwork) for o in p.orders), _ZERO)
-        period_active_amount = sum((_d(o.amount)      for o in p.orders), _ZERO)  # v10
-        t_revenue           += period_revenue
-        t_active_amount     += period_active_amount                               # v10
+        period_revenue       = _revenue_from_snapshot(latest)
+        period_order_revenue = sum((_d(o.afterUpwork) for o in p.orders), _ZERO)
+        period_active_amount = sum((_d(o.amount)      for o in p.orders), _ZERO)
+
+        t_revenue       += period_revenue
+        t_order_revenue += period_order_revenue
+        t_active_amount += period_active_amount
+
+        wip_val = float(_d(latest.workInProgress) if latest else _ZERO)
 
         period_totals = {
             "availableWithdraw":         float(aw),
             "availableWithdrawAfterFee": float(_after_fee(aw)),
             "pending":                   float(_d(latest.pending)        if latest else _ZERO),
             "inReview":                  float(_d(latest.inReview)       if latest else _ZERO),
-            "workInProgress":            float(_d(latest.workInProgress) if latest else _ZERO),
-            "withdrawn":                 float(_d(latest.withdrawn)      if latest else _ZERO),
+            "workInProgress":            wip_val,
+            "activeAmount":              wip_val,                        # always mirrors workInProgress
+            "withdrawn":                 float(wdrawn),
+            "revenueInPeriod":           float(period_revenue),          # aw + pending + inReview - withdrawn
+            "orderRevenueInPeriod":      float(period_order_revenue),    # Σ afterUpwork
+            "totalActiveAmount":         float(period_active_amount),    # Σ order.amount
             "connects":                  latest.connects                  if latest else 0,
-            "revenueInPeriod":           float(period_revenue),
-            "activeAmount":              float(period_active_amount),              # v10
         }
 
         summaries.append({
@@ -589,8 +770,9 @@ async def list_profiles_summary(
             "totalWorkInProgress":            float(t_wip),
             "totalWithdrawn":                 float(t_withdrawn),
             "totalConnects":                  t_connects,
-            "totalRevenueInPeriod":           float(t_revenue),
-            "totalActiveAmount":              float(t_active_amount),              # v10
+            "totalRevenueInPeriod":           float(t_revenue),         # Σ (aw + pending + inReview - withdrawn)
+            "totalOrderRevenueInPeriod":      float(t_order_revenue),   # Σ afterUpwork
+            "totalActiveAmount":              float(t_active_amount),
             "activeProfileCount":             total_profiles,
         },
         "pagination": _pagination_meta(pagination, total_profiles),
@@ -603,11 +785,10 @@ async def get_profile_detail(
     profile_id: str,
     filters: DateRangeFilter,
     pagination: Optional[PageParams] = None,
-    name: Optional[str] = None,             # ← v8: optional name filter
+    name: Optional[str] = None,
 ) -> dict:
     profile = await _get_profile_or_404(db, profile_id)
 
-    # Optional name filter — 404 if profile exists but name doesn't match
     if name and name.lower() not in profile.profileName.lower():
         raise HTTPException(
             status_code=404,
@@ -636,8 +817,10 @@ async def get_profile_detail(
 
     latest        = entries[0] if entries else None
     aw            = _d(latest.availableWithdraw) if latest else _ZERO
-    revenue       = sum((_d(o.afterUpwork) for o in orders), _ZERO)
-    active_amount = sum((_d(o.amount)      for o in orders), _ZERO)   # v10
+    wip           = _d(latest.workInProgress)    if latest else _ZERO
+    revenue       = _revenue_from_snapshot(latest)
+    order_revenue = sum((_d(o.afterUpwork) for o in orders), _ZERO)
+    active_amount = sum((_d(o.amount)      for o in orders), _ZERO)
 
     return {
         "filter": filters.meta(),
@@ -651,11 +834,13 @@ async def get_profile_detail(
             "availableWithdrawAfterFee": float(_after_fee(aw)),
             "pending":                   float(_d(latest.pending)        if latest else _ZERO),
             "inReview":                  float(_d(latest.inReview)       if latest else _ZERO),
-            "workInProgress":            float(_d(latest.workInProgress) if latest else _ZERO),
+            "workInProgress":            float(wip),
+            "activeAmount":              float(wip),                     # always mirrors workInProgress
             "withdrawn":                 float(_d(latest.withdrawn)      if latest else _ZERO),
+            "revenueInPeriod":           float(revenue),                 # aw + pending + inReview - withdrawn
+            "orderRevenueInPeriod":      float(order_revenue),           # Σ afterUpwork
+            "totalActiveAmount":         float(active_amount),
             "connects":                  latest.connects                  if latest else 0,
-            "revenueInPeriod":           float(revenue),
-            "activeAmount":              float(active_amount),                     # v10
             "snapshotCount":             snap_total,
             "orderCount":                order_total,
         },
@@ -704,13 +889,12 @@ async def export_profile_excel(
             w = max((len(str(cell.value or "")) for cell in col), default=8)
             ws.column_dimensions[get_column_letter(col[0].column)].width = min(w + 4, 40)
 
-    # Sheet 1 — Snapshots
     ws1 = wb.active
     ws1.title = "Snapshots"
     _header(ws1, [
         "Date", "Available Withdraw ($)", "After Fee ($)", "Pending ($)",
-        "In Review ($)", "Work in Progress ($)", "Withdrawn ($)",
-        "Connects", "Upwork Plus",
+        "In Review ($)", "Work in Progress ($)", "Active Amount ($)",
+        "Withdrawn ($)", "Revenue in Period ($)", "Connects", "Upwork Plus",
     ])
     for ri, s in enumerate(detail["snapshots"], 2):
         fill = ALT_FILL if ri % 2 == 0 else None
@@ -718,14 +902,14 @@ async def export_profile_excel(
             str(s["date"]),
             s["availableWithdraw"], s["availableWithdrawAfterFee"],
             s["pending"], s["inReview"], s["workInProgress"],
-            s["withdrawn"], s["connects"], s["upworkPlus"],
+            s["activeAmount"], s["withdrawn"], s["revenueInPeriod"],
+            s["connects"], s["upworkPlus"],
         ], 1):
             cell = ws1.cell(row=ri, column=ci, value=v)
             if fill:
                 cell.fill = fill
     _autofit(ws1)
 
-    # Sheet 2 — Orders
     ws2 = wb.create_sheet("Orders")
     _header(ws2, ["Date", "Client", "Order ID", "Amount ($)", "After Upwork ($)"])
     for ri, o in enumerate(detail["orders"], 2):

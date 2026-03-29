@@ -264,6 +264,20 @@ async def remove_profile(
 This design ensures that multiple HR inputs throughout the same day accumulate
 into a running total rather than silently overwriting previous entries.
 
+### `active_amount` / `work_in_progress` duality
+
+`active_amount` is an **optional alias** for `work_in_progress`. Both map to
+the same database column.
+
+| Scenario | Result |
+|---|---|
+| Only `work_in_progress` supplied | Stored as-is — no change to existing behaviour. |
+| Only `active_amount` supplied | Treated identically to `work_in_progress`. |
+| Both supplied | Values are **summed** before storage. |
+
+Both `workInProgress` and `activeAmount` are always returned in every response
+with identical values for full forward/backward compatibility.
+
 **`profile_name`** — the human-readable profile name (case-insensitive).
 The system resolves it to an internal profile record automatically.
 HR staff never need to know or handle internal profile UUIDs.
@@ -310,7 +324,7 @@ async def profile_snapshots(
     status_code=201,
     summary="Log a new Upwork order",
     description="""
-Logs an individual Upwork order.
+Logs an individual Upwork order and **automatically syncs** the daily snapshot.
 
 **`profile_name`** — the human-readable profile name (case-insensitive).
 The system resolves it to an internal profile record automatically.
@@ -318,9 +332,21 @@ The system resolves it to an internal profile record automatically.
 `afterUpwork` (net after 10 % service fee) is **computed server-side** —
 it is never accepted from the client.
 
-> The `totalActiveAmount` field in `GET /profiles` totals reflects the
-> cumulative sum of all order `amount` values and updates automatically
-> as new orders are logged.
+### Automatic snapshot sync
+
+After the order row is persisted the system **additively updates** the snapshot
+for `(profileName, date)`:
+
+- `workInProgress` and `activeAmount` on the matching snapshot are each
+  incremented by `amount` (they are the same DB column).
+- If no snapshot exists yet for that date one is **upserted automatically**
+  with the order amount seeding both fields.
+
+No extra API call is needed — the platform stays fully in-sync in a single request.
+
+The response includes a **`snapshotSync`** summary (date, updated
+`workInProgress` / `activeAmount`) and a **`syncedTotals`** block
+(`revenueAllTime`, `activeAmountAllTime`) for immediate dashboard display.
     """,
 )
 async def add_order_entry(
@@ -410,7 +436,7 @@ async def export_all_profiles(
     summary="Export a single Upwork profile to Excel (period-aware)",
     description="""
 Downloads a two-sheet Excel workbook for **one profile**:
-- **Sheet 1** — Daily Snapshots (all fields + After Fee column)
+- **Sheet 1** — Daily Snapshots (all fields + After Fee column + Active Amount column)
 - **Sheet 2** — Orders (date, client, orderId, amount, afterUpwork)
 
 Supports the same period query parameters as all other endpoints.
