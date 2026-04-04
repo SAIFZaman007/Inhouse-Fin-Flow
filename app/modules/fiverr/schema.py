@@ -1,34 +1,14 @@
 """
 app/modules/fiverr/schema.py
-════════════════════════════════════════════════════════════════════════════════
-v1 — Enterprise Edition
-
-Pydantic models for the Fiverr module.
-
-FiverrSnapshotCreate  POST /snapshots — additive daily snapshot.
-                        ``active_order_amount`` maps to the DB column
-                        ``activeOrderAmount``.  ``active_orders`` is the
-                        integer count of active orders.
-
-FiverrOrderCreate     POST /orders — log a new Fiverr order.
-                        ``after_fiverr`` is ALWAYS server-computed as
-                        ``amount × 0.80`` (Fiverr's 20 % platform fee).
-                        Any caller-supplied value is ignored.
-                        After persisting the order the service additively
-                        syncs the snapshot for the same (profile, date):
-                          activeOrders      += 1
-                          activeOrderAmount += order.amount
-
-FiverrProfileCreate / FiverrProfileUpdate  — profile lifecycle management.
-
-FiverrOrderUpdate     — partial update; all fields optional.
-════════════════════════════════════════════════════════════════════════════════
+================================================================================
+v3 — Enterprise Edition
+================================================================================
 """
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -39,30 +19,30 @@ class FiverrProfileCreate(BaseModel):
     """
     Create a new Fiverr profile.
 
-    If ``available_withdraw`` is provided, an initial snapshot is recorded
+    If any snapshot field is provided an initial snapshot is recorded
     immediately, seeding the ledger with the correct opening values.
+    The service layer silently writes ``submitted = Decimal("0")`` to the
+    DB column — this field is not surfaced to callers.
     """
-    profileName:       str               = Field(..., min_length=1, max_length=100)
-    # Optional initial snapshot fields
-    snapshot_date:     Optional[date]    = Field(
-        default=None,
-        description="Date for the initial snapshot. Defaults to today.",
-    )
-    available_withdraw: Optional[Decimal] = Field(default=None, ge=0)
-    not_cleared:        Optional[Decimal] = Field(default=None, ge=0)
-    active_orders:      Optional[int]     = Field(default=None, ge=0)
+    profileName: Optional[str] = Field(default=None, min_length=1, max_length=100)
+
+    # ── Optional initial snapshot fields ─────────────────────────────────────
+    snapshot_date:       Optional[date]    = Field(default=None, description="Date for the initial snapshot. Defaults to today.")
+    available_withdraw:  Optional[Decimal] = Field(default=None, ge=0)
+    not_cleared:         Optional[Decimal] = Field(default=None, ge=0)
+    active_orders:       Optional[int]     = Field(default=None, ge=0)
     active_order_amount: Optional[Decimal] = Field(default=None, ge=0)
-    submitted:          Optional[Decimal] = Field(default=None, ge=0)
-    withdrawn:          Optional[Decimal] = Field(default=None, ge=0)
-    seller_plus:        bool              = Field(default=False)
-    promotion:          Optional[Decimal] = Field(default=None, ge=0)
+    withdrawn:           Optional[Decimal] = Field(default=None, ge=0)
+    seller_plus:         bool              = Field(default=False)
+    promotion:           Optional[Decimal] = Field(default=None, ge=0)
 
 
 class FiverrProfileUpdate(BaseModel):
     """
-    PATCH /profiles/{id} — partial update for a Fiverr profile.
+    ``PATCH /profiles/{id}`` — partial update for a Fiverr profile.
 
     All fields are optional — only supplied fields are written.
+    Sending an empty body ``{}`` is idempotent.
 
     ### Profile metadata
     ``profileName``  Renames the profile (uniqueness enforced server-side).
@@ -71,8 +51,6 @@ class FiverrProfileUpdate(BaseModel):
     ### Snapshot upsert fields
     When any snapshot field is supplied the service performs an **upsert**
     on the ``FiverrEntry`` for ``snapshot_date`` (defaults to today).
-
-    Sending an empty body ``{}`` is idempotent.
     """
     # ── Profile metadata ──────────────────────────────────────────────────────
     profileName: Optional[str]  = Field(default=None, min_length=1, max_length=100)
@@ -84,7 +62,6 @@ class FiverrProfileUpdate(BaseModel):
     not_cleared:         Optional[Decimal] = Field(default=None, ge=0)
     active_orders:       Optional[int]     = Field(default=None, ge=0)
     active_order_amount: Optional[Decimal] = Field(default=None, ge=0)
-    submitted:           Optional[Decimal] = Field(default=None, ge=0)
     withdrawn:           Optional[Decimal] = Field(default=None, ge=0)
     seller_plus:         Optional[bool]    = Field(default=None)
     promotion:           Optional[Decimal] = Field(default=None, ge=0)
@@ -106,32 +83,62 @@ class FiverrProfileResponse(BaseModel):
 
 class FiverrSnapshotCreate(BaseModel):
     """
-    POST /snapshots — additive daily snapshot.
+    ``POST /snapshots`` — additive daily snapshot.
 
     ### Accumulation behaviour
-    • First submission for ``(profile_name, date)``  → INSERT with incoming values.
-    • Subsequent submission for the same pair         → ADD incoming values to stored
-      values (numeric fields accumulate; ``seller_plus`` uses OR semantics).
+    | Condition                                     | Action                               |
+    |-----------------------------------------------|--------------------------------------|
+    | First submission for ``(profile_name, date)`` | INSERT with incoming values          |
+    | Subsequent submission for the same pair        | ADD incoming values to stored values |
 
-    ``profile_name``  Human-readable profile name (case-insensitive lookup).
+    Numeric fields accumulate; ``seller_plus`` uses OR semantics.
+    ``profile_name`` is matched case-insensitively.
+
+    All numeric snapshot fields are **optional** — omitted fields default to
+    zero and do not affect any previously stored value.
     """
-    profile_name:        str             = Field(
-        ..., min_length=1, max_length=100,
+    profile_name: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
         description="Fiverr profile name (case-insensitive match).",
     )
     date:                date
-    available_withdraw:  Decimal         = Field(default=Decimal("0"), ge=0)
-    not_cleared:         Decimal         = Field(default=Decimal("0"), ge=0)
-    active_orders:       int             = Field(default=0, ge=0)
-    active_order_amount: Decimal         = Field(default=Decimal("0"), ge=0)
-    submitted:           Decimal         = Field(default=Decimal("0"), ge=0)
-    withdrawn:           Decimal         = Field(default=Decimal("0"), ge=0)
-    seller_plus:         bool            = Field(default=False)
-    promotion:           Decimal         = Field(default=Decimal("0"), ge=0)
+    available_withdraw:  Optional[Decimal] = Field(default=Decimal("0"), ge=0)
+    not_cleared:         Optional[Decimal] = Field(default=Decimal("0"), ge=0)
+    active_orders:       Optional[int]     = Field(default=0, ge=0)
+    active_order_amount: Optional[Decimal] = Field(default=Decimal("0"), ge=0)
+    withdrawn:           Optional[Decimal] = Field(default=Decimal("0"), ge=0)
+    seller_plus:         Optional[bool]    = Field(default=False)
+    promotion:           Optional[Decimal] = Field(default=Decimal("0"), ge=0)
+
+
+class FiverrSnapshotUpdate(BaseModel):
+    """
+    ``PATCH /snapshots/{id}`` — partial update for an existing daily snapshot.
+
+    All fields are optional — only supplied fields are written (SET semantics,
+    not additive accumulation).  This allows HR to correct a previously
+    submitted snapshot without re-entering unrelated values.
+
+    ``profile_name`` and ``date`` are intentionally excluded — they form the
+    natural key and are immutable after creation.
+    """
+    available_withdraw:  Optional[Decimal] = Field(default=None, ge=0)
+    not_cleared:         Optional[Decimal] = Field(default=None, ge=0)
+    active_orders:       Optional[int]     = Field(default=None, ge=0)
+    active_order_amount: Optional[Decimal] = Field(default=None, ge=0)
+    withdrawn:           Optional[Decimal] = Field(default=None, ge=0)
+    seller_plus:         Optional[bool]    = Field(default=None)
+    promotion:           Optional[Decimal] = Field(default=None, ge=0)
 
 
 class FiverrSnapshotResponse(BaseModel):
-    """Full snapshot row — includes ``profileName`` for client convenience."""
+    """
+    Full snapshot row — includes ``profileName`` for client convenience.
+
+    ``submitted`` is intentionally excluded from API responses.
+    """
     id:                 str
     profileId:          str
     profileName:        str
@@ -140,7 +147,6 @@ class FiverrSnapshotResponse(BaseModel):
     notCleared:         Decimal
     activeOrders:       int
     activeOrderAmount:  Decimal
-    submitted:          Decimal
     withdrawn:          Decimal
     sellerPlus:         bool
     promotion:          Decimal
@@ -156,41 +162,39 @@ class FiverrSnapshotResponse(BaseModel):
 
 class FiverrOrderCreate(BaseModel):
     """
-    POST /orders — log a new Fiverr order.
+    ``POST /orders`` — log a new Fiverr order.
 
-    ``profile_name``  Human-readable profile name (case-insensitive lookup).
+    ``profile_name`` is matched case-insensitively.
 
-    ``after_fiverr`` behaviour  (system-computed, always)
-    ──────────────────────────────────────────────────────
-    This field is NOT accepted from the caller.  The service always computes:
-        after_fiverr = amount × 0.80
-    (Fiverr charges a 20 % platform fee on all orders.)
+    ### ``after_fiverr`` — always system-computed
+    The service always computes: ``after_fiverr = amount × 0.80``
 
     ### Automatic snapshot sync
     After the order is persisted the service additively updates the
     ``FiverrEntry`` for the same ``(profile_name, date)``:
-        activeOrders      += 1
-        activeOrderAmount += order.amount
-    The snapshot is upserted if it doesn't yet exist for that date.
+    ```
+    activeOrders      += 1
+    activeOrderAmount += order.amount
+    ```
     """
-    profile_name: str     = Field(
-        ..., min_length=1, max_length=100,
+    profile_name: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
         description="Fiverr profile name (case-insensitive match).",
     )
-    date:         date
-    buyer_name:   str     = Field(..., min_length=1)
-    order_id:     str     = Field(..., min_length=1)
-    amount:       Decimal = Field(..., gt=0)
+    date:       date
+    buyer_name: Optional[str]     = Field(default=None, min_length=1)
+    order_id:   Optional[str]     = Field(default=None, min_length=1)
+    amount:     Optional[Decimal] = Field(default=None, gt=0)
 
 
 class FiverrOrderUpdate(BaseModel):
     """
-    PATCH /orders/{id} — partial update for a Fiverr order.
+    ``PATCH /orders/{id}`` — partial update for a Fiverr order.
 
     All fields are optional — only supplied fields are written.
     ``after_fiverr`` is always recomputed when ``amount`` is updated.
-
-    Sending an empty body ``{}`` is idempotent.
     """
     date:       date
     buyer_name: Optional[str]     = Field(default=None, min_length=1)
@@ -214,16 +218,60 @@ class FiverrOrderResponse(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Trash  (soft-delete registry)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FiverrTrashItem(BaseModel):
+    """
+    One soft-deleted record as stored in the trash registry.
+
+    ``type``      ``"profile"`` | ``"snapshot"`` | ``"order"``
+    ``snapshot``  Full record dict captured at deletion time.
+    """
+    id:        str
+    module:    str
+    type:      str
+    deletedAt: str
+    snapshot:  Dict[str, Any]
+
+
+class FiverrTrashResponse(BaseModel):
+    """Envelope for ``GET /trash``."""
+    total:  int
+    items:  List[FiverrTrashItem]
+
+
+class FiverrRestoreRequest(BaseModel):
+    """
+    ``POST /restore-trash`` — restore one or more soft-deleted records.
+
+    ``ids``  List of original DB primary keys to restore.
+             Each ID must exist in the trash registry.
+    """
+    ids: List[str] = Field(..., min_length=1, description="List of trash record IDs to restore.")
+
+
+class FiverrRestoreResponse(BaseModel):
+    """Result envelope for ``POST /restore-trash``."""
+    restored: List[str]
+    failed:   List[str]
+    message:  str
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Combined-totals envelope  GET /profiles
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FiverrTotals(BaseModel):
-    """Cross-profile aggregate for the selected period."""
+    """
+    Cross-profile aggregate for the selected period.
+
+    ``submitted`` is excluded — see module-level docstring.
+    """
     totalAvailableWithdraw:  float
     totalNotCleared:         float
     totalActiveOrders:       int
     totalActiveOrderAmount:  float
-    totalSubmitted:          float
     totalWithdrawn:          float
     totalPromotion:          float
     totalRevenueInPeriod:    float   # Σ afterFiverr in period
@@ -233,19 +281,19 @@ class FiverrTotals(BaseModel):
 
 class FiverrProfileSummary(BaseModel):
     """Per-profile row in the list response."""
-    id:                str
-    profileName:       str
-    isActive:          bool
-    latestSnapshot:    Optional[FiverrSnapshotResponse]
-    periodTotals:      Dict[str, Any]
-    snapshotCount:     int
-    orderCount:        int
-    revenueInPeriod:   float
-    orders:            List[FiverrOrderResponse]
+    id:              str
+    profileName:     str
+    isActive:        bool
+    latestSnapshot:  Optional[FiverrSnapshotResponse]
+    periodTotals:    Dict[str, Any]
+    snapshotCount:   int
+    orderCount:      int
+    revenueInPeriod: float
+    orders:          List[FiverrOrderResponse]
 
 
 class FiverrListResponse(BaseModel):
-    """Top-level envelope for GET /profiles."""
+    """Top-level envelope for ``GET /profiles``."""
     filter:   Dict[str, Any]
     totals:   FiverrTotals
     profiles: List[FiverrProfileSummary]
@@ -257,9 +305,9 @@ class FiverrListResponse(BaseModel):
 
 class FiverrProfileDetailResponse(BaseModel):
     """Paginated snapshot + order list with profile metadata."""
-    filter:        Dict[str, Any]
-    profile:       FiverrProfileResponse
-    periodTotals:  Dict[str, Any]
-    pagination:    Dict[str, Any]
-    snapshots:     List[FiverrSnapshotResponse]
-    orders:        List[FiverrOrderResponse]
+    filter:       Dict[str, Any]
+    profile:      FiverrProfileResponse
+    periodTotals: Dict[str, Any]
+    pagination:   Dict[str, Any]
+    snapshots:    List[FiverrSnapshotResponse]
+    orders:       List[FiverrOrderResponse]

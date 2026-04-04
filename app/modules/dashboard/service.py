@@ -12,28 +12,8 @@ Modules covered:
   ✅ Payoneer             — balance (last remainingBalance per account)
   ✅ PMAK                 — balance + inhouse totals
   ✅ Dollar Exchange      — totalBdt exchanged, DUE vs RECEIVED
-  ✅ HR Expense           — debit/credit totals
+  ✅ HR Expense           — totalDebits, totalCredits, totalRemainingBalance
   ✅ Inventory            — total item count, total value
-
-Filter strategy
----------------
-  period=daily    → rows WHERE date = :ref_date          (default: today)
-  period=weekly   → rows WHERE date BETWEEN week_start AND week_end
-  period=monthly  → rows WHERE YEAR(date)=:year AND MONTH(date)=:month
-  period=yearly   → rows WHERE YEAR(date)=:year
-
-All filters are ADDITIVE:  each section of the dashboard respects the same
-date window so the frontend can show a fully consistent time-scoped view.
-
-KPI Formulas
-------------
-  totalNotCleared        = Fiverr.notCleared + Upwork.pending + Upwork.inReview
-  totalAvailableWithdraw = Fiverr.availableWithdraw + Upwork.availableWithdraw
-  totalRevenue           = totalAvailableWithdraw + totalNotCleared + payoneerBalance
-
-Usage from router:
-    from .service import get_dashboard_summary
-    data = await get_dashboard_summary(db, period="weekly", export_date="2025-03-10")
 """
 from __future__ import annotations
 
@@ -44,13 +24,14 @@ from typing import Any, Literal
 
 from prisma import Prisma
 
+from app.core import trash_store  # ← required for soft-delete order filtering
+
 logger = logging.getLogger(__name__)
 
 # ── Types ────────────────────────────────────────────────────────────────────
 Period = Literal["daily", "weekly", "monthly", "yearly", "all"]
 
 _ZERO = Decimal("0")
-
 
 # ── Date-window helpers ───────────────────────────────────────────────────────
 
@@ -164,7 +145,36 @@ async def _fiverr_summary(
     Per-profile snapshot + aggregated totals.
     Uses FiverrEntry (daily snapshots) for balance figures and
     FiverrOrder (individual orders) for revenue within the window.
+
+    Revenue formula  : revenueInPeriod = availableWithdraw + notCleared - withdrawn
+
+    ### activeOrders — dynamic count (v3 fix)
+    ``activeOrders`` is now derived from the actual count of ``FiverrOrder``
+    rows fetched for each profile, excluding any orders currently held in the
+    soft-delete trash registry.  This mirrors ``_upwork_summary`` which has
+    always used ``len(p.orders)`` for its ``orderCount``.
+
+    The old approach — reading ``FiverrEntry.activeOrders`` (a static snapshot
+    field) — produced stale values whenever orders were added or soft-deleted
+    between snapshot submissions.
+
+    ### Soft-delete safety
+    FiverrOrder rows are never physically deleted from the database; they are
+    only registered in ``trash_store``.  We pre-fetch the set of all soft-deleted
+    Fiverr order IDs once and exclude them from every per-profile count.  This
+    ensures:
+      • POST /orders     → +1 immediately (new row appears in p.orders)
+      • SOFT DELETE order → -1 immediately (ID enters trash_store)
+      • SOFT DELETE profile → profile excluded via isActive=False filter; its
+        orders contribute 0 to the aggregate
+
+    totalWithdrawn is surfaced in totals so the top-level KPI roll-up can
+    compute net totalAvailableWithdraw without an extra query.
     """
+    # ── Pre-fetch soft-deleted order IDs (single async call, O(1) set lookup) ──
+    deleted_items     = await trash_store.get_all(module="fiverr", record_type="order")
+    deleted_order_ids: frozenset[str] = frozenset(item["id"] for item in deleted_items)
+
     profiles = await db.fiverrprofile.find_many(
         where={"isActive": True},
         include={
@@ -178,41 +188,48 @@ async def _fiverr_summary(
         },
     )
 
-    profile_list = []
-    total_available  = _ZERO
-    total_not_cleared = _ZERO
-    total_active_orders = 0
+    profile_list              = []
+    total_available           = _ZERO
+    total_not_cleared         = _ZERO
+    total_active_orders       = 0
     total_active_order_amount = _ZERO
-    total_revenue    = _ZERO  # sum of afterFiverr in window
+    total_revenue             = _ZERO
+    total_withdrawn           = _ZERO  # exposed for KPI: totalAvailableWithdraw
 
     for p in profiles:
         # Latest entry in the window = most recent snapshot
         latest = p.entries[0] if p.entries else None
 
         avail   = _d(latest.availableWithdraw)  if latest else _ZERO
-        not_cl  = _d(latest.notCleared)          if latest else _ZERO
-        act_ord = latest.activeOrders             if latest else 0
-        act_amt = _d(latest.activeOrderAmount)   if latest else _ZERO
-
-        # revenueInPeriod (spec): availableWithdraw + notCleared - withdrawn
-        wdrawn  = _d(latest.withdrawn) if latest else _ZERO
+        not_cl  = _d(latest.notCleared)         if latest else _ZERO
+        act_amt = _d(latest.activeOrderAmount)  if latest else _ZERO
+        wdrawn  = _d(latest.withdrawn)          if latest else _ZERO
         revenue = avail + not_cl - wdrawn
+
+        # ── Dynamic order count — excludes soft-deleted orders ────────────────
+        # FIX: was `latest.activeOrders if latest else 0` (static snapshot field).
+        # Now counts actual FiverrOrder rows, minus any in the trash registry.
+        act_ord: int = sum(
+            1 for o in p.orders
+            if o.id not in deleted_order_ids
+        )
 
         total_available           += avail
         total_not_cleared         += not_cl
-        total_active_orders       += act_ord
+        total_active_orders       += act_ord      # ← live order count, not snapshot
         total_active_order_amount += act_amt
         total_revenue             += revenue
+        total_withdrawn           += wdrawn
 
         profile_list.append({
             "profileId":          p.id,
             "profileName":        p.profileName,
             "availableWithdraw":  float(avail),
             "notCleared":         float(not_cl),
-            "activeOrders":       act_ord,
+            "activeOrders":       act_ord,         # ← live order count, not snapshot
             "activeOrderAmount":  float(act_amt),
             "withdrawn":          float(wdrawn),
-            "revenueInPeriod":    float(revenue),   # aw + notCleared - withdrawn
+            "revenueInPeriod":    float(revenue),
             "entryCount":         len(p.entries),
         })
 
@@ -220,9 +237,10 @@ async def _fiverr_summary(
         "totals": {
             "availableWithdraw":  float(total_available),
             "notCleared":         float(total_not_cleared),
-            "activeOrders":       total_active_orders,
+            "activeOrders":       total_active_orders,      # ← live, dynamic
             "activeOrderAmount":  float(total_active_order_amount),
-            "revenueInPeriod":    float(total_revenue),   # Σ (aw + notCleared - withdrawn)
+            "revenueInPeriod":    float(total_revenue),
+            "totalWithdrawn":     float(total_withdrawn),   # ← used by KPI roll-up
         },
         "Fiverr_profiles": profile_list,
     }
@@ -232,6 +250,13 @@ async def _upwork_summary(
     db: Prisma,
     date_filter: dict,
 ) -> dict[str, Any]:
+    """
+    Per-profile snapshot + aggregated totals.
+
+    Revenue formula  : revenueInPeriod = availableWithdraw + pending + inReview - withdrawn
+    totalWithdrawn, orderCount, and activeAmount are surfaced in totals so the
+    top-level KPI roll-up can compute derived KPIs without extra queries.
+    """
     profiles = await db.upworkprofile.find_many(
         where={"isActive": True},
         include={
@@ -245,12 +270,15 @@ async def _upwork_summary(
         },
     )
 
-    profile_list = []
-    total_available  = _ZERO
-    total_pending    = _ZERO
-    total_in_review  = _ZERO
-    total_wip        = _ZERO
-    total_revenue    = _ZERO
+    profile_list        = []
+    total_available     = _ZERO
+    total_pending       = _ZERO
+    total_in_review     = _ZERO
+    total_wip           = _ZERO
+    total_revenue       = _ZERO
+    total_withdrawn     = _ZERO  # exposed for KPI: totalAvailableWithdraw
+    total_order_count   = 0      # exposed for KPI: totalActiveOrders
+    total_active_amount = _ZERO  # exposed for KPI: totalActiveOrderAmount
 
     for p in profiles:
         latest  = p.entries[0] if p.entries else None
@@ -258,15 +286,21 @@ async def _upwork_summary(
         pending = _d(latest.pending)            if latest else _ZERO
         review  = _d(latest.inReview)           if latest else _ZERO
         wip     = _d(latest.workInProgress)     if latest else _ZERO
-        # revenueInPeriod (spec): availableWithdraw + pending + inReview - withdrawn
-        wdrawn  = _d(latest.withdrawn) if latest else _ZERO
+        wdrawn  = _d(latest.withdrawn)          if latest else _ZERO
         revenue = avail + pending + review - wdrawn
 
-        total_available += avail
-        total_pending   += pending
-        total_in_review += review
-        total_wip       += wip
-        total_revenue   += revenue
+        # activeAmount: total funds actively in pipeline for this profile
+        active_amount = pending + review + wip
+        order_count   = len(p.orders)
+
+        total_available     += avail
+        total_pending       += pending
+        total_in_review     += review
+        total_wip           += wip
+        total_revenue       += revenue
+        total_withdrawn     += wdrawn
+        total_order_count   += order_count
+        total_active_amount += active_amount
 
         profile_list.append({
             "profileId":         p.id,
@@ -276,7 +310,7 @@ async def _upwork_summary(
             "inReview":          float(review),
             "workInProgress":    float(wip),
             "withdrawn":         float(wdrawn),
-            "revenueInPeriod":   float(revenue),   # aw + pending + inReview - withdrawn
+            "revenueInPeriod":   float(revenue),
             "entryCount":        len(p.entries),
         })
 
@@ -287,6 +321,9 @@ async def _upwork_summary(
             "inReview":          float(total_in_review),
             "workInProgress":    float(total_wip),
             "revenueInPeriod":   float(total_revenue),
+            "totalWithdrawn":    float(total_withdrawn),    # ← used by KPI roll-up
+            "orderCount":        total_order_count,          # ← used by KPI roll-up
+            "activeAmount":      float(total_active_amount), # ← used by KPI roll-up
         },
         "Upwork_profiles": profile_list,
     }
@@ -345,10 +382,10 @@ async def _card_sharing_summary(
 
     return {
         "totals": {
-            "cardCount":          len(cards),
-            "totalCardLimit":     float(total_limit),
+            "cardCount":            len(cards),
+            "totalCardLimit":       float(total_limit),
             "totalPaymentReceived": float(total_payment),
-            "outstanding":        float(total_limit - total_payment),
+            "outstanding":          float(total_limit - total_payment),
         },
     }
 
@@ -373,7 +410,7 @@ async def _payoneer_summary(
         },
     )
 
-    account_list = []
+    account_list  = []
     total_balance = _ZERO
 
     for a in accounts:
@@ -414,9 +451,9 @@ async def _pmak_summary(
         },
     )
 
-    account_list = []
-    total_balance = _ZERO
-    total_inhouse = _ZERO
+    account_list       = []
+    total_balance      = _ZERO
+    total_inhouse      = _ZERO
     inhouse_by_status: dict[str, int] = {}
 
     for a in accounts:
@@ -431,18 +468,18 @@ async def _pmak_summary(
             inhouse_by_status[deal.orderStatus] = inhouse_by_status.get(deal.orderStatus, 0) + 1
 
         account_list.append({
-            "accountId":      a.id,
-            "accountName":    a.accountName,
-            "balance":        float(balance),
-            "inhouseTotal":   float(inhouse),
-            "inhouseCount":   len(a.inhouseDeals),
+            "accountId":    a.id,
+            "accountName":  a.accountName,
+            "balance":      float(balance),
+            "inhouseTotal": float(inhouse),
+            "inhouseCount": len(a.inhouseDeals),
         })
 
     return {
         "totals": {
-            "totalBalance":     float(total_balance),
-            "totalInhouse":     float(total_inhouse),
-            "inhouseByStatus":  inhouse_by_status,
+            "totalBalance":    float(total_balance),
+            "totalInhouse":    float(total_inhouse),
+            "inhouseByStatus": inhouse_by_status,
         },
         "accounts": account_list,
     }
@@ -487,22 +524,26 @@ async def _hr_expense_summary(
 ) -> dict[str, Any]:
     rows = await db.hrexpense.find_many(where={**date_filter})
 
-    total_debit  = _ZERO
-    total_credit = _ZERO
-    latest_balance = _ZERO
+    total_debit     = _ZERO
+    total_credit    = _ZERO
+    total_remaining = _ZERO
 
     for r in rows:
-        total_debit  += _d(r.debit)
-        total_credit += _d(r.credit)
-        latest_balance = _d(r.remainingBalance)  # last row wins
+        total_debit     += _d(r.debit)
+        total_credit    += _d(r.credit)
+        total_remaining += _d(r.remainingBalance)
+
+    # Net effective balance across all records in the window
+    # Formula: sum(remainingBalance) + totalCredits - totalDebits
+    total_remaining_balance = total_remaining + total_credit - total_debit
 
     return {
         "totals": {
-            "totalDebit":      float(total_debit),
-            "totalCredit":     float(total_credit),
-            "netExpense":      float(total_debit - total_credit),
-            "latestBalance":   float(latest_balance),
-            "transactionCount": len(rows),
+            "totalRecords":          len(rows),
+            "totalDebits":           float(total_debit),
+            "totalCredits":          float(total_credit),
+            "netExpense":            float(total_debit - total_credit),
+            "totalRemainingBalance": float(total_remaining_balance),
         },
     }
 
@@ -555,6 +596,16 @@ async def get_dashboard_summary(
     month        : month (1–12) for monthly filter
     from_date_str: explicit range start (ISO date) — overrides period
     to_date_str  : explicit range end   (ISO date) — overrides period
+
+    ### totalActiveOrders — KPI derivation (v3)
+    ``totalActiveOrders = fiverr.totals.activeOrders      ← live order count (v3 fix)
+                        + upwork.totals.orderCount         ← live order count (unchanged)
+                        + outsideOrders.totals.orderCount  ← live order count (unchanged)``
+
+    Because ``fiverr.totals.activeOrders`` is now derived from actual
+    ``FiverrOrder`` rows (not the snapshot field), this KPI is automatically
+    correct and reactive to every order create / soft-delete / profile
+    soft-delete operation.
     """
     ref_date  = _parse_date(ref_date_str)
     from_date = _parse_date(from_date_str) if from_date_str else None
@@ -565,7 +616,7 @@ async def get_dashboard_summary(
 
     # ── Metadata ─────────────────────────────────────────────────────────────
     filter_meta: dict[str, Any] = {
-        "period":     period,
+        "period":    period,
         "dateRange": {
             "from": start.isoformat() if start else None,
             "to":   end.isoformat()   if end   else None,
@@ -598,52 +649,84 @@ async def get_dashboard_summary(
     )
 
     # ── Cross-module KPI roll-ups ─────────────────────────────────────────────
-    # totalAvailableWithdraw = Fiverr.availableWithdraw + Upwork.availableWithdraw
+
+    # FIX 1 ─ totalRevenue = Fiverr.revenueInPeriod + Upwork.revenueInPeriod
+    #                        + Payoneer.totalBalance
+    total_revenue = (
+        fiverr["totals"]["revenueInPeriod"]
+        + upwork["totals"]["revenueInPeriod"]
+        + payoneer["totals"]["totalBalance"]
+    )
+
+    # FIX 2 ─ totalAvailableWithdraw = (Fiverr.aw + Upwork.aw)
+    #                                  - (Fiverr.withdrawn + Upwork.withdrawn)
     total_available_withdraw = (
         fiverr["totals"]["availableWithdraw"]
         + upwork["totals"]["availableWithdraw"]
+        - fiverr["totals"]["totalWithdrawn"]
+        - upwork["totals"]["totalWithdrawn"]
     )
 
-    # totalNotCleared = Fiverr.notCleared + Upwork.pending + Upwork.inReview
+    # FIX 3 ─ totalNotCleared = Fiverr.notCleared + Upwork.pending + Upwork.inReview
     total_not_cleared = (
         fiverr["totals"]["notCleared"]
         + upwork["totals"]["pending"]
         + upwork["totals"]["inReview"]
     )
 
+    # FIX 4 ─ totalActiveOrders = Fiverr.activeOrders  ← NOW live order count (v3)
+    #                             + Upwork.orderCount   ← already live order count
+    #                             + OutsideOrders.orderCount
+    # No formula change needed here — fixing _fiverr_summary upstream is sufficient.
     total_active_orders = (
         fiverr["totals"]["activeOrders"]
-        + outside["totals"]["activeOrders"]
+        + upwork["totals"]["orderCount"]
+        + outside["totals"]["orderCount"]
     )
 
-    # totalRevenue = totalAvailableWithdraw + totalNotCleared + payoneerBalance
-    total_revenue = (
-        total_available_withdraw
-        + total_not_cleared
-        + payoneer["totals"]["totalBalance"]
+    # FIX 5 ─ dollarExchangeTotal = totalBdt  (BDT amount, not USD exchanged)
+    dollar_exchange_total = dollar["totals"]["totalBdt"]
+
+    # NEW KPI 1 ─ totalOutsideOrderAmount = orderAmount - receiveAmount (unpaid portion)
+    total_outside_order_amount = (
+        outside["totals"]["orderAmount"]
+        - outside["totals"]["receiveAmount"]
+    )
+
+    # NEW KPI 2 ─ totalActiveOrderAmount = Fiverr.activeOrderAmount
+    #                                      + Upwork.activeAmount
+    #                                      + totalOutsideOrderAmount
+    total_active_order_amount = (
+        fiverr["totals"]["activeOrderAmount"]
+        + upwork["totals"]["activeAmount"]
+        + total_outside_order_amount
     )
 
     return {
-        "filter":   filter_meta,
+        "filter":  filter_meta,
         "kpis": {
-            "totalRevenue":          round(total_revenue, 2),
-            "totalAvailableWithdraw": round(total_available_withdraw, 2),
-            "totalNotCleared":        round(total_not_cleared, 2),
-            "totalActiveOrders":      total_active_orders,
-            "payoneerBalance":        payoneer["totals"]["totalBalance"],
-            "pmakBalance":            pmak["totals"]["totalBalance"],
-            "dollarExchangeTotal":    dollar["totals"]["totalUsdExchanged"],
-            "hrExpenseTotal":         hr["totals"]["netExpense"],
+            # ── Existing KPIs (corrected formulas) ───────────────────────────
+            "totalRevenue":            round(total_revenue, 2),            # FIX 1
+            "totalAvailableWithdraw":  round(total_available_withdraw, 2), # FIX 2
+            "totalNotCleared":         round(total_not_cleared, 2),        # FIX 3
+            "totalActiveOrders":       total_active_orders,                 # FIX 4 (v3: live)
+            "payoneerBalance":         payoneer["totals"]["totalBalance"],
+            "pmakBalance":             pmak["totals"]["totalBalance"],
+            "dollarExchangeTotal":     dollar_exchange_total,               # FIX 5
+            "hrExpenseTotal":          hr["totals"]["totalRemainingBalance"],
+            # ── New KPIs ─────────────────────────────────────────────────────
+            "totalOutsideOrderAmount": round(total_outside_order_amount, 2),
+            "totalActiveOrderAmount":  round(total_active_order_amount, 2),
         },
         "modules": {
-            "fiverr":         fiverr,
-            "upwork":         upwork,
-            "outsideOrders":  outside,
-            "cardSharing":    card,
-            "payoneer":       payoneer,
-            "pmak":           pmak,
+            "fiverr":        fiverr,
+            "upwork":        upwork,
+            "outsideOrders": outside,
+            "cardSharing":   card,
+            "payoneer":      payoneer,
+            "pmak":          pmak,
             "dollarExchange": dollar,
-            "hrExpense":      hr,
-            "inventory":      inventory,
+            "hrExpense":     hr,
+            "inventory":     inventory,
         },
     }

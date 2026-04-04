@@ -1,40 +1,7 @@
 """
 app/modules/upwork/service.py
 ════════════════════════════════════════════════════════════════════════════════
-v13 — Enterprise Edition
-
-Changes vs v12
-──────────────
-create_snapshot   ROOT CAUSE FIX — Previous versions used Prisma ``upsert``
-                    which atomically replaced ALL fields on conflict, silently
-                    wiping any values that the caller omitted.  Fixed to use
-                    the same fetch-then-additive-update pattern as the Fiverr
-                    module:
-                      • If no row exists for (profile, date) → plain INSERT.
-                      • If a row already exists             → ADD incoming
-                        numeric values to the stored values.
-                        ``upworkPlus`` retains OR semantics (sticky True).
-                    This mirrors the Fiverr implementation exactly and is the
-                    only correct approach for an accumulation ledger.
-
-revenueInPeriod   FORMULA FIX — now computed as:
-                      availableWithdraw + pending + inReview - withdrawn
-                    matching the spec.  Previously the field was sourced from
-                    order revenue (afterUpwork), which is a different concept.
-                    ``revenueInPeriod`` now reflects the net balance state of
-                    the latest snapshot in the period.  Order revenue is still
-                    surfaced as ``orderRevenueInPeriod`` (Σ afterUpwork) for
-                    full backwards compatibility.
-
-withdrawn         DEDUCTION — ``withdrawn`` is subtracted from
-                    ``revenueInPeriod`` via the helper ``_revenue_from_snapshot``,
-                    applied consistently in _entry_to_dict, list_profiles_summary,
-                    get_profile_detail, create_snapshot, and add_order.
-
-activeAmount /    Always equal — both derived from the same ``workInProgress``
-workInProgress    DB column.  Parity maintained in every response path.
-
-Everything else is unchanged from v12.
+v14 — Enterprise Edition
 ════════════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -49,6 +16,7 @@ from typing import Any, Optional
 from fastapi import HTTPException
 from prisma import Prisma
 
+from app.core import trash_store
 from app.shared.filters import DateRangeFilter
 from app.shared.pagination import PageParams
 from .schema import (
@@ -57,6 +25,7 @@ from .schema import (
     UpworkProfileCreate,
     UpworkProfileUpdate,
     UpworkSnapshotCreate,
+    UpworkSnapshotUpdate,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,12 +62,6 @@ def _revenue_from_snapshot(entry: Any) -> Decimal:
 
     Formula (spec):
         revenueInPeriod = availableWithdraw + pending + inReview - withdrawn
-
-    This represents the net earned balance still on the platform — funds that
-    have been earned but not yet withdrawn.  ``withdrawn`` is subtracted so
-    that deducted amounts are correctly removed from both revenueInPeriod
-    and the effective available balance.
-    Returns Decimal("0") for a None entry.
     """
     if entry is None:
         return _ZERO
@@ -199,8 +162,6 @@ async def _sync_snapshot_wip(
 
     If no snapshot row exists yet for that date it is created with
     ``workInProgress = delta`` and all other numeric fields at zero.
-    This ensures that POST /orders never silently drops the sync even
-    when no manual snapshot has been submitted for that day.
     """
     existing = await db.upworkentry.find_unique(
         where={"profileId_date": {"profileId": profile_id, "date": snap_dt}}
@@ -226,6 +187,9 @@ async def _sync_snapshot_wip(
 # ── Profile CRUD ──────────────────────────────────────────────────────────────
 
 async def create_profile(db: Prisma, data: UpworkProfileCreate) -> dict:
+    if not data.profileName:
+        raise HTTPException(status_code=422, detail="profileName is required.")
+
     existing = await db.upworkprofile.find_unique(
         where={"profileName": data.profileName}
     )
@@ -376,12 +340,82 @@ async def update_profile(
 
 
 async def deactivate_profile(db: Prisma, profile_id: str) -> None:
+    """Legacy hard soft-delete — sets isActive=False only (no trash registry)."""
     profile = await db.upworkprofile.find_unique(where={"id": profile_id})
     if not profile:
         raise HTTPException(status_code=404, detail="Upwork profile not found.")
     await db.upworkprofile.update(
         where={"id": profile_id}, data={"isActive": False}
     )
+
+
+async def soft_delete_profile(db: Prisma, profile_id: str) -> dict:
+    """
+    Full soft-delete for a profile (v14).
+
+    1. Fetch profile + all its entries + all its orders.
+    2. Write the profile record to trash_store (type="profile").
+    3. Write each entry to trash_store (type="snapshot").
+    4. Write each order to trash_store (type="order").
+    5. Set isActive=False on the profile.
+    6. Return confirmation with counts.
+    """
+    profile = await db.upworkprofile.find_unique(
+        where={"id": profile_id},
+        include={"entries": True, "orders": True},
+    )
+    if not profile:
+        raise HTTPException(status_code=404, detail="Upwork profile not found.")
+
+    # Capture full profile snapshot for trash
+    profile_snap = {
+        "id":          profile.id,
+        "profileName": profile.profileName,
+        "isActive":    profile.isActive,
+    }
+    await trash_store.add(
+        record_id=profile.id,
+        module="upwork",
+        record_type="profile",
+        snapshot=profile_snap,
+    )
+
+    # Archive each snapshot
+    for entry in profile.entries:
+        entry_snap = _entry_to_dict(entry, profile.profileName)
+        await trash_store.add(
+            record_id=entry.id,
+            module="upwork",
+            record_type="snapshot",
+            snapshot=entry_snap,
+        )
+
+    # Archive each order
+    for order in profile.orders:
+        order_snap = _order_to_dict(order)
+        await trash_store.add(
+            record_id=order.id,
+            module="upwork",
+            record_type="order",
+            snapshot=order_snap,
+        )
+
+    # Soft-delete at DB level
+    await db.upworkprofile.update(
+        where={"id": profile_id}, data={"isActive": False}
+    )
+
+    order_count = len(profile.orders)
+    snap_count  = len(profile.entries)
+
+    return {
+        "success":         True,
+        "message":         "Upwork profile has been soft-deleted.",
+        "profileId":       profile_id,
+        "profileName":     profile.profileName,
+        "snapshotsArchived": snap_count,
+        "ordersArchived":    order_count,
+    }
 
 
 # ── Snapshot CRUD ─────────────────────────────────────────────────────────────
@@ -392,26 +426,19 @@ async def create_snapshot(db: Prisma, data: UpworkSnapshotCreate) -> dict:
 
     ROOT CAUSE FIX
     ──────────────
-    Previous versions used Prisma ``upsert`` which atomically REPLACED all
-    fields on a key conflict, wiping any values the caller did not include
-    in the current submission.  This function now uses the correct pattern:
-
-      1. Fetch the existing row for (profile, date).
-      2. If no row exists → plain INSERT with incoming values.
-      3. If a row exists  → ADD incoming numeric values to stored values
-                            (upworkPlus uses OR — sticky True).
-
-    This is the same pattern used by the Fiverr module and guarantees that
-    repeated POST /snapshots calls never erase previous data.
+    Uses fetch-then-additive-update pattern:
+      • If no row exists for (profile, date) → plain INSERT.
+      • If a row already exists             → ADD incoming numeric values.
+        ``upworkPlus`` retains OR semantics (sticky True).
 
     revenueInPeriod formula (spec):
         revenueInPeriod = availableWithdraw + pending + inReview - withdrawn
-
-    ``active_amount`` is already folded into ``work_in_progress`` by the
-    Pydantic model validator on UpworkSnapshotCreate before this function
-    is called.  Both ``workInProgress`` and ``activeAmount`` are returned
-    in the response (via _entry_to_dict) with identical values.
     """
+    if not data.profile_name:
+        raise HTTPException(status_code=422, detail="profile_name is required.")
+    if not data.date:
+        raise HTTPException(status_code=422, detail="date is required.")
+
     profile = await _resolve_profile_by_name(db, data.profile_name)
     snap_dt = datetime.combine(data.date, time.min)
 
@@ -423,51 +450,60 @@ async def create_snapshot(db: Prisma, data: UpworkSnapshotCreate) -> dict:
         }}
     )
 
+    # Guard: if this entry is in trash, reject
+    if existing and trash_store.is_deleted(existing.id):
+        raise HTTPException(
+            status_code=409,
+            detail="A snapshot for this date was soft-deleted. Restore it first via POST /restore-trash.",
+        )
+
+    aw_in  = data.available_withdraw or _ZERO
+    pd_in  = data.pending            or _ZERO
+    ir_in  = data.in_review          or _ZERO
+    wip_in = data.work_in_progress   or _ZERO
+    wd_in  = data.withdrawn          or _ZERO
+    cn_in  = data.connects           or 0
+    pl_in  = data.upwork_plus        or False
+
     if existing is None:
         # ── First entry for this (profile, date) — plain INSERT ───────────────
         entry = await db.upworkentry.create(
             data={
                 "profileId":         profile.id,
                 "date":              snap_dt,
-                "availableWithdraw": data.available_withdraw,
-                "pending":           data.pending,
-                "inReview":          data.in_review,
-                "workInProgress":    data.work_in_progress,
-                "withdrawn":         data.withdrawn,
-                "connects":          data.connects,
-                "upworkPlus":        data.upwork_plus,
+                "availableWithdraw": aw_in,
+                "pending":           pd_in,
+                "inReview":          ir_in,
+                "workInProgress":    wip_in,
+                "withdrawn":         wd_in,
+                "connects":          cn_in,
+                "upworkPlus":        pl_in,
             }
         )
     else:
         # ── Row already exists — ADD (accumulate) the incoming values ─────────
-        new_aw      = _d(existing.availableWithdraw) + _d(data.available_withdraw)
-        new_pending = _d(existing.pending)           + _d(data.pending)
-        new_review  = _d(existing.inReview)          + _d(data.in_review)
-        new_wip     = _d(existing.workInProgress)    + _d(data.work_in_progress)
-        new_wdrawn  = _d(existing.withdrawn)         + _d(data.withdrawn)
-        new_conn    = existing.connects              + data.connects
-        new_plus    = existing.upworkPlus            or data.upwork_plus
-
         entry = await db.upworkentry.update(
             where={"profileId_date": {
                 "profileId": profile.id,
                 "date":      snap_dt,
             }},
             data={
-                "availableWithdraw": new_aw,
-                "pending":           new_pending,
-                "inReview":          new_review,
-                "workInProgress":    new_wip,
-                "withdrawn":         new_wdrawn,
-                "connects":          new_conn,
-                "upworkPlus":        new_plus,
+                "availableWithdraw": _d(existing.availableWithdraw) + aw_in,
+                "pending":           _d(existing.pending)           + pd_in,
+                "inReview":          _d(existing.inReview)          + ir_in,
+                "workInProgress":    _d(existing.workInProgress)    + wip_in,
+                "withdrawn":         _d(existing.withdrawn)         + wd_in,
+                "connects":          existing.connects              + cn_in,
+                "upworkPlus":        existing.upworkPlus            or pl_in,
             },
         )
 
-    # ── Rebuild aggregated totals so the caller gets a complete refresh ────────
+    # ── Rebuild aggregated totals ─────────────────────────────────────────────
     all_orders          = await db.upworkorder.find_many(where={"profileId": profile.id})
-    total_revenue       = sum((_d(o.afterUpwork) for o in all_orders), _ZERO)
-    total_active_amount = sum((_d(o.amount)      for o in all_orders), _ZERO)
+    # Exclude soft-deleted orders from totals
+    live_orders         = [o for o in all_orders if not trash_store.is_deleted(o.id)]
+    total_revenue       = sum((_d(o.afterUpwork) for o in live_orders), _ZERO)
+    total_active_amount = sum((_d(o.amount)      for o in live_orders), _ZERO)
 
     updated_aw  = _d(entry.availableWithdraw)
     updated_wip = _d(entry.workInProgress)
@@ -486,12 +522,101 @@ async def create_snapshot(db: Prisma, data: UpworkSnapshotCreate) -> dict:
                 "pending":                   float(_d(entry.pending)),
                 "inReview":                  float(_d(entry.inReview)),
                 "workInProgress":            float(updated_wip),
-                "activeAmount":              float(updated_wip),    # always mirrors workInProgress
+                "activeAmount":              float(updated_wip),
                 "withdrawn":                 float(_d(entry.withdrawn)),
-                "revenueInPeriod":           float(rev),            # aw + pending + inReview - withdrawn
+                "revenueInPeriod":           float(rev),
                 "connects":                  entry.connects,
             },
         },
+    }
+
+
+async def update_snapshot(
+    db: Prisma,
+    snapshot_id: str,
+    data: UpworkSnapshotUpdate,
+) -> dict:
+    """
+    PATCH /snapshots/{id} — partial update with SET semantics (v14).
+
+    Only supplied fields are overwritten. This is correction-mode, not
+    accumulation-mode — existing values are replaced, not added to.
+    """
+    entry = await db.upworkentry.find_unique(where={"id": snapshot_id})
+    if not entry:
+        raise HTTPException(status_code=404, detail="Upwork snapshot not found.")
+
+    if trash_store.is_deleted(snapshot_id):
+        raise HTTPException(
+            status_code=410,
+            detail="This snapshot has been soft-deleted. Restore it first via POST /restore-trash.",
+        )
+
+    patch: dict = {}
+    sent = data.model_fields_set
+
+    if "available_withdraw" in sent and data.available_withdraw is not None:
+        patch["availableWithdraw"] = data.available_withdraw
+    if "pending" in sent and data.pending is not None:
+        patch["pending"] = data.pending
+    if "in_review" in sent and data.in_review is not None:
+        patch["inReview"] = data.in_review
+    if "work_in_progress" in sent and data.work_in_progress is not None:
+        patch["workInProgress"] = data.work_in_progress
+    if "withdrawn" in sent and data.withdrawn is not None:
+        patch["withdrawn"] = data.withdrawn
+    if "connects" in sent and data.connects is not None:
+        patch["connects"] = data.connects
+    if "upwork_plus" in sent and data.upwork_plus is not None:
+        patch["upworkPlus"] = data.upwork_plus
+
+    if not patch:
+        # Idempotent — return current state
+        profile = await _get_profile_or_404(db, entry.profileId)
+        return _entry_to_dict(entry, profile.profileName)
+
+    updated = await db.upworkentry.update(
+        where={"id": snapshot_id},
+        data=patch,
+    )
+    profile = await _get_profile_or_404(db, updated.profileId)
+    return _entry_to_dict(updated, profile.profileName)
+
+
+async def soft_delete_snapshot(db: Prisma, snapshot_id: str) -> dict:
+    """
+    DELETE /snapshots/{id} — soft-delete a snapshot (v14).
+
+    1. Fetch snapshot + owning profile.
+    2. Write full snapshot dict to trash_store.
+    3. The row remains in DB — it is excluded from all live calculations
+       via ``trash_store.is_deleted()`` guards in list/detail builders.
+    4. Return the trash item dict for confirmation.
+    """
+    entry = await db.upworkentry.find_unique(where={"id": snapshot_id})
+    if not entry:
+        raise HTTPException(status_code=404, detail="Upwork snapshot not found.")
+
+    if trash_store.is_deleted(snapshot_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Snapshot is already in trash.",
+        )
+
+    profile = await _get_profile_or_404(db, entry.profileId)
+    snap_dict = _entry_to_dict(entry, profile.profileName)
+
+    trash_item = await trash_store.add(
+        record_id=snapshot_id,
+        module="upwork",
+        record_type="snapshot",
+        snapshot=snap_dict,
+    )
+
+    return {
+        "success":   True,
+        "message":   "Upwork snapshot has been soft-deleted.",
+        "trashItem": trash_item,
     }
 
 
@@ -507,18 +632,19 @@ async def get_profile_snapshots(
     if date_filter:
         where["date"] = date_filter
 
-    total   = await db.upworkentry.count(where=where)
-    find_kw = dict(where=where, order={"date": "desc"})
-    if pagination:
-        find_kw["skip"] = pagination.skip
-        find_kw["take"] = pagination.take
+    all_entries = await db.upworkentry.find_many(where=where, order={"date": "desc"})
+    # Exclude soft-deleted
+    live_entries = [e for e in all_entries if not trash_store.is_deleted(e.id)]
+    total = len(live_entries)
 
-    entries = await db.upworkentry.find_many(**find_kw)
+    if pagination:
+        live_entries = live_entries[pagination.skip: pagination.skip + pagination.take]
+
     return {
         "profileId":   profile_id,
         "profileName": profile.profileName,
         "pagination":  _pagination_meta(pagination, total),
-        "snapshots":   [_entry_to_dict(e, profile.profileName) for e in entries],
+        "snapshots":   [_entry_to_dict(e, profile.profileName) for e in live_entries],
     }
 
 
@@ -526,7 +652,7 @@ async def get_profile_snapshots(
 
 async def add_order(db: Prisma, data: UpworkOrderCreate) -> dict:
     """
-    POST /orders — log a new Upwork order and sync the daily snapshot (v13).
+    POST /orders — log a new Upwork order and sync the daily snapshot (v14).
 
     1. Resolve the active profile by name (case-insensitive).
     2. Guard against duplicate orderId (409 on conflict).
@@ -535,7 +661,20 @@ async def add_order(db: Prisma, data: UpworkOrderCreate) -> dict:
          workInProgress += order.amount
        Snapshot is created if it doesn't exist for that date.
     5. Return the persisted order dict + snapshotSync summary + syncedTotals.
+
+    orderCount is dynamic — computed from live (non-trashed) orders.
     """
+    if not data.profile_name:
+        raise HTTPException(status_code=422, detail="profile_name is required.")
+    if not data.date:
+        raise HTTPException(status_code=422, detail="date is required.")
+    if not data.client_name:
+        raise HTTPException(status_code=422, detail="client_name is required.")
+    if not data.order_id:
+        raise HTTPException(status_code=422, detail="order_id is required.")
+    if data.amount is None:
+        raise HTTPException(status_code=422, detail="amount is required.")
+
     profile = await _resolve_profile_by_name(db, data.profile_name)
 
     existing = await db.upworkorder.find_unique(where={"orderId": data.order_id})
@@ -561,9 +700,11 @@ async def add_order(db: Prisma, data: UpworkOrderCreate) -> dict:
         where={"profileId_date": {"profileId": profile.id, "date": snap_dt}}
     )
 
+    # Dynamic orderCount — live orders only
     all_orders          = await db.upworkorder.find_many(where={"profileId": profile.id})
-    total_revenue       = sum((_d(o.afterUpwork) for o in all_orders), _ZERO)
-    total_active_amount = sum((_d(o.amount)      for o in all_orders), _ZERO)
+    live_orders         = [o for o in all_orders if not trash_store.is_deleted(o.id)]
+    total_revenue       = sum((_d(o.afterUpwork) for o in live_orders), _ZERO)
+    total_active_amount = sum((_d(o.amount)      for o in live_orders), _ZERO)
 
     rev = _revenue_from_snapshot(updated_entry) if updated_entry else _ZERO
 
@@ -586,6 +727,7 @@ async def add_order(db: Prisma, data: UpworkOrderCreate) -> dict:
             } if updated_entry else None,
         },
         "syncedTotals": {
+            "orderCount":           len(live_orders),
             "revenueAllTime":       float(total_revenue),
             "activeAmountAllTime":  float(total_active_amount),
         },
@@ -600,6 +742,12 @@ async def update_order(
     order = await db.upworkorder.find_unique(where={"id": order_id})
     if not order:
         raise HTTPException(status_code=404, detail="Upwork order not found.")
+
+    if trash_store.is_deleted(order_id):
+        raise HTTPException(
+            status_code=410,
+            detail="This order has been soft-deleted. Restore it via POST /restore-trash.",
+        )
 
     patch: dict = {}
     sent = data.model_fields_set
@@ -642,18 +790,92 @@ async def get_profile_orders(
     if date_filter:
         where["date"] = date_filter
 
-    total   = await db.upworkorder.count(where=where)
-    find_kw = dict(where=where, order={"date": "desc"})
-    if pagination:
-        find_kw["skip"] = pagination.skip
-        find_kw["take"] = pagination.take
+    all_orders  = await db.upworkorder.find_many(where=where, order={"date": "desc"})
+    live_orders = [o for o in all_orders if not trash_store.is_deleted(o.id)]
+    total       = len(live_orders)
 
-    orders = await db.upworkorder.find_many(**find_kw)
+    if pagination:
+        live_orders = live_orders[pagination.skip: pagination.skip + pagination.take]
+
     return {
         "profileId":   profile_id,
         "profileName": profile.profileName,
+        "orderCount":  total,
         "pagination":  _pagination_meta(pagination, total),
-        "orders":      [_order_to_dict(o) for o in orders],
+        "orders":      [_order_to_dict(o) for o in live_orders],
+    }
+
+
+# ── Trash / Restore ───────────────────────────────────────────────────────────
+
+async def get_trash(record_type: Optional[str] = None) -> dict:
+    """
+    GET /trash — return all Upwork soft-deleted records.
+
+    Optionally filter by ``record_type`` ("profile" | "snapshot" | "order").
+    Results are sorted newest-deleted-first.
+    """
+    items = await trash_store.get_all(module="upwork", record_type=record_type)
+    return {
+        "total": len(items),
+        "items": items,
+    }
+
+
+async def restore_trash(db: Prisma, ids: list[str]) -> dict:
+    """
+    POST /restore-trash — restore one or more soft-deleted Upwork records (v14).
+
+    For each ID:
+    1. Look up the trash item.
+    2. If type="profile"  → set isActive=True in DB.
+    3. If type="snapshot" → the DB row still exists; simply remove from trash.
+    4. If type="order"    → the DB row still exists; simply remove from trash.
+    5. Remove from trash registry.
+
+    Returns lists of successfully restored IDs and failed IDs.
+    """
+    restored: list[str] = []
+    failed:   list[str] = []
+
+    for record_id in ids:
+        try:
+            item = await trash_store.get_by_id(record_id)
+            if not item or item.get("module") != "upwork":
+                failed.append(record_id)
+                continue
+
+            record_type = item.get("type")
+
+            if record_type == "profile":
+                # Restore isActive in DB
+                profile = await db.upworkprofile.find_unique(where={"id": record_id})
+                if profile:
+                    await db.upworkprofile.update(
+                        where={"id": record_id},
+                        data={"isActive": True},
+                    )
+
+            elif record_type in ("snapshot", "order"):
+                # DB row was never deleted — just remove from trash registry
+                pass
+
+            # Remove from trash registry
+            removed = await trash_store.remove(record_id)
+            if removed:
+                restored.append(record_id)
+            else:
+                failed.append(record_id)
+
+        except Exception as exc:
+            logger.error("restore_trash: failed to restore %s — %s", record_id, exc)
+            failed.append(record_id)
+
+    total = len(restored)
+    return {
+        "restored": restored,
+        "failed":   failed,
+        "message":  f"{total} record(s) restored successfully." if total else "No records were restored.",
     }
 
 
@@ -666,17 +888,15 @@ async def list_profiles_summary(
     pagination: Optional[PageParams] = None,
 ) -> dict:
     """
-    GET /profiles — combined totals + paginated per-profile breakdown (v13).
+    GET /profiles — combined totals + paginated per-profile breakdown (v14).
 
     revenueInPeriod formula (spec):
         revenueInPeriod = availableWithdraw + pending + inReview - withdrawn
 
-    ``withdrawn`` is subtracted so deducted amounts correctly reduce the
-    net platform balance.  Applied per-profile from the latest snapshot in
-    the selected window, then summed for cross-profile totals.
+    Soft-deleted snapshots and orders are excluded from all calculations
+    via ``trash_store.is_deleted()`` guards.
 
-    ``orderRevenueInPeriod`` (Σ afterUpwork) is surfaced separately for
-    full backwards compatibility.
+    ``orderCount`` is dynamic — counts only live (non-trashed) orders.
     """
     date_f = filters.to_prisma_filter()
 
@@ -685,6 +905,20 @@ async def list_profiles_summary(
         where["profileName"] = {"contains": name, "mode": "insensitive"}
 
     total_profiles = await db.upworkprofile.count(where=where)
+
+    # ── Global totalOrderCount ─────────────────────────────────────────────────
+    # Must be computed across ALL active profiles — not just the current page —
+    # so we fetch all matching profile IDs first, then count live (non-trashed)
+    # orders in a single query.  This keeps the value pagination-independent.
+    all_active_profiles_for_count = await db.upworkprofile.find_many(where=where)
+    active_profile_ids            = [p.id for p in all_active_profiles_for_count]
+    all_orders_for_count          = await db.upworkorder.find_many(
+        where={"profileId": {"in": active_profile_ids}}
+    ) if active_profile_ids else []
+    t_order_count = sum(
+        1 for o in all_orders_for_count if not trash_store.is_deleted(o.id)
+    )
+    # ─────────────────────────────────────────────────────────────────────────
 
     find_kw: dict = dict(
         where=where,
@@ -713,7 +947,12 @@ async def list_profiles_summary(
 
     summaries = []
     for p in profiles:
-        latest = p.entries[0] if p.entries else None
+        # Exclude trashed snapshots
+        live_entries = [e for e in p.entries if not trash_store.is_deleted(e.id)]
+        # Exclude trashed orders
+        live_orders  = [o for o in p.orders  if not trash_store.is_deleted(o.id)]
+
+        latest = live_entries[0] if live_entries else None
         aw     = _d(latest.availableWithdraw) if latest else _ZERO
         wdrawn = _d(latest.withdrawn)          if latest else _ZERO
 
@@ -725,8 +964,8 @@ async def list_profiles_summary(
         t_connects  += latest.connects            if latest else 0
 
         period_revenue       = _revenue_from_snapshot(latest)
-        period_order_revenue = sum((_d(o.afterUpwork) for o in p.orders), _ZERO)
-        period_active_amount = sum((_d(o.amount)      for o in p.orders), _ZERO)
+        period_order_revenue = sum((_d(o.afterUpwork) for o in live_orders), _ZERO)
+        period_active_amount = sum((_d(o.amount)      for o in live_orders), _ZERO)
 
         t_revenue       += period_revenue
         t_order_revenue += period_order_revenue
@@ -740,11 +979,11 @@ async def list_profiles_summary(
             "pending":                   float(_d(latest.pending)        if latest else _ZERO),
             "inReview":                  float(_d(latest.inReview)       if latest else _ZERO),
             "workInProgress":            wip_val,
-            "activeAmount":              wip_val,                        # always mirrors workInProgress
+            "activeAmount":              wip_val,
             "withdrawn":                 float(wdrawn),
-            "revenueInPeriod":           float(period_revenue),          # aw + pending + inReview - withdrawn
-            "orderRevenueInPeriod":      float(period_order_revenue),    # Σ afterUpwork
-            "totalActiveAmount":         float(period_active_amount),    # Σ order.amount
+            "revenueInPeriod":           float(period_revenue),
+            "orderRevenueInPeriod":      float(period_order_revenue),
+            "totalActiveAmount":         float(period_active_amount),
             "connects":                  latest.connects                  if latest else 0,
         }
 
@@ -754,10 +993,10 @@ async def list_profiles_summary(
             "isActive":        p.isActive,
             "latestSnapshot":  _entry_to_dict(latest, p.profileName) if latest else None,
             "periodTotals":    period_totals,
-            "snapshotCount":   len(p.entries),
-            "orderCount":      len(p.orders),
+            "snapshotCount":   len(live_entries),
+            "orderCount":      len(live_orders),          # dynamic — excludes trashed
             "revenueInPeriod": float(period_revenue),
-            "orders":          [_order_to_dict(o) for o in p.orders],
+            "orders":          [_order_to_dict(o) for o in live_orders],
         })
 
     return {
@@ -770,9 +1009,10 @@ async def list_profiles_summary(
             "totalWorkInProgress":            float(t_wip),
             "totalWithdrawn":                 float(t_withdrawn),
             "totalConnects":                  t_connects,
-            "totalRevenueInPeriod":           float(t_revenue),         # Σ (aw + pending + inReview - withdrawn)
-            "totalOrderRevenueInPeriod":      float(t_order_revenue),   # Σ afterUpwork
+            "totalRevenueInPeriod":           float(t_revenue),
+            "totalOrderRevenueInPeriod":      float(t_order_revenue),
             "totalActiveAmount":              float(t_active_amount),
+            "totalOrderCount":                t_order_count,   # dynamic — live orders across all active profiles
             "activeProfileCount":             total_profiles,
         },
         "pagination": _pagination_meta(pagination, total_profiles),
@@ -803,24 +1043,26 @@ async def get_profile_detail(
         snap_where["date"]  = date_f
         order_where["date"] = date_f
 
-    snap_total  = await db.upworkentry.count(where=snap_where)
-    order_total = await db.upworkorder.count(where=order_where)
+    all_entries = await db.upworkentry.find_many(where=snap_where, order={"date": "desc"})
+    all_orders  = await db.upworkorder.find_many(where=order_where, order={"date": "desc"})
 
-    snap_kw: dict  = dict(where=snap_where,  order={"date": "desc"})
-    order_kw: dict = dict(where=order_where, order={"date": "desc"})
+    # Exclude soft-deleted rows
+    live_entries = [e for e in all_entries if not trash_store.is_deleted(e.id)]
+    live_orders  = [o for o in all_orders  if not trash_store.is_deleted(o.id)]
+
+    snap_total  = len(live_entries)
+    order_total = len(live_orders)
+
     if pagination:
-        snap_kw["skip"]  = order_kw["skip"] = pagination.skip
-        snap_kw["take"]  = order_kw["take"] = pagination.take
+        live_entries = live_entries[pagination.skip: pagination.skip + pagination.take]
+        live_orders  = live_orders[pagination.skip:  pagination.skip + pagination.take]
 
-    entries = await db.upworkentry.find_many(**snap_kw)
-    orders  = await db.upworkorder.find_many(**order_kw)
-
-    latest        = entries[0] if entries else None
+    latest        = live_entries[0] if live_entries else None
     aw            = _d(latest.availableWithdraw) if latest else _ZERO
     wip           = _d(latest.workInProgress)    if latest else _ZERO
     revenue       = _revenue_from_snapshot(latest)
-    order_revenue = sum((_d(o.afterUpwork) for o in orders), _ZERO)
-    active_amount = sum((_d(o.amount)      for o in orders), _ZERO)
+    order_revenue = sum((_d(o.afterUpwork) for o in live_orders), _ZERO)
+    active_amount = sum((_d(o.amount)      for o in live_orders), _ZERO)
 
     return {
         "filter": filters.meta(),
@@ -835,18 +1077,18 @@ async def get_profile_detail(
             "pending":                   float(_d(latest.pending)        if latest else _ZERO),
             "inReview":                  float(_d(latest.inReview)       if latest else _ZERO),
             "workInProgress":            float(wip),
-            "activeAmount":              float(wip),                     # always mirrors workInProgress
+            "activeAmount":              float(wip),
             "withdrawn":                 float(_d(latest.withdrawn)      if latest else _ZERO),
-            "revenueInPeriod":           float(revenue),                 # aw + pending + inReview - withdrawn
-            "orderRevenueInPeriod":      float(order_revenue),           # Σ afterUpwork
+            "revenueInPeriod":           float(revenue),
+            "orderRevenueInPeriod":      float(order_revenue),
             "totalActiveAmount":         float(active_amount),
             "connects":                  latest.connects                  if latest else 0,
             "snapshotCount":             snap_total,
-            "orderCount":                order_total,
+            "orderCount":                order_total,          # dynamic
         },
         "pagination": _pagination_meta(pagination, max(snap_total, order_total)),
-        "snapshots":  [_entry_to_dict(e, profile.profileName) for e in entries],
-        "orders":     [_order_to_dict(o) for o in orders],
+        "snapshots":  [_entry_to_dict(e, profile.profileName) for e in live_entries],
+        "orders":     [_order_to_dict(o) for o in live_orders],
     }
 
 

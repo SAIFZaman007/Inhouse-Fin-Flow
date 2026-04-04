@@ -1,21 +1,11 @@
 """
 app/modules/card_sharing/router.py
-════════════════════════════════════════════════════════════════════════════════
-v5 — Transparent card data + structured DELETE responses
-
-Changes vs v4.1:
-  • cardNo and cardCvc are fully visible in all responses — no masking.
-  • GET /{card_id}/secure still exists for backward compatibility but now
-    returns the same unmasked data as GET /{card_id} (both use CEO_DIRECTOR).
-  • DELETE /{card_id}              → structured JSON response body.
-  • DELETE /{card_id}/screenshots  → structured JSON response body.
-  • service.py is NOT affected — include_sensitive flag is kept as-is so
-    the service signature remains stable.
-════════════════════════════════════════════════════════════════════════════════
+================================================================================
+v7 — Simplified input surface
+================================================================================
 """
-from datetime import date                               
 from decimal import Decimal
-from typing import List, Optional
+from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from fastapi.responses import Response
@@ -27,13 +17,22 @@ from app.shared.filters import DateRangeFilter
 
 from .schema import (
     CardSharingCreate,
-    CardSharingResponse, CardSharingSensitiveResponse,
+    CardSharingResponse,
+    CardSharingSensitiveResponse,
     CardSharingUpdate,
-    ScreenshotRemoveBody, ScreenshotUploadResponse,
+    ScreenshotRemoveBody,
+    ScreenshotUploadResponse,
 )
 from .service import (
-    add_screenshot, add_screenshots_bulk, create_card, delete_card,
-    export_cards, get_card, list_cards, remove_screenshot, update_card,
+    add_screenshot,
+    add_screenshots_bulk,
+    create_card,
+    delete_card,
+    export_cards,
+    get_card,
+    list_cards,
+    remove_screenshot,
+    update_card,
 )
 
 router = APIRouter(prefix="/card-sharing", tags=["Card Sharing"])
@@ -47,31 +46,35 @@ _XLSX_MEDIA_TYPE = (
 
 @router.get("", response_model=list[CardSharingResponse])
 async def get_cards(
-    serial_no:    Optional[str] = Query(
+    serial_no: Optional[str] = Query(
         default=None,
-        description="Partial / case-insensitive match on serial number",
+        description="Partial / case-insensitive match on serial number.",
     ),
-    account_name: Optional[str] = Query(
+    card_name: Optional[str] = Query(
         default=None,
-        description="Partial / case-insensitive match on Payoneer account name",
+        description="Partial / case-insensitive match on the card's own label (``cardName``).",
     ),
     filters: DateRangeFilter = Depends(),
-    db:      Prisma = Depends(get_db),
+    db:      Prisma          = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
 ):
     """
     List all card sharing records — all fields fully visible.
 
-    Filters (all combinable):
-    - `serial_no`    — case-insensitive substring search
-    - `account_name` — case-insensitive substring search on the linked account name
-    - Date filters   — period (daily/weekly/monthly/yearly) or explicit from/to
+    ``cardNo`` and ``cardCvc`` are returned **decrypted** in every row.
+
+    ### Filters (all combinable)
+    | Parameter   | Behaviour                                        |
+    |-------------|--------------------------------------------------|
+    | `serial_no` | Case-insensitive substring match                 |
+    | `card_name` | Case-insensitive substring match on card label   |
+    | Date filters| Period (daily/weekly/monthly/yearly) or from/to  |
     """
     return await list_cards(
         db,
         include_sensitive=True,
         serial_no=serial_no,
-        account_name=account_name,
+        account_name=card_name,        # service param name kept for compatibility
         date_filter=filters.to_prisma_filter() or None,
     )
 
@@ -81,19 +84,31 @@ async def get_cards(
 @router.get(
     "/export",
     summary="Export card sharing records to Excel",
-    response_description="Excel workbook download",
+    response_description="Excel workbook (.xlsx) download",
 )
 async def export_cards_endpoint(
-    serial_no:    Optional[str] = Query(default=None, description="Partial match on serial number"),
-    account_name: Optional[str] = Query(default=None, description="Partial match on account name"),
-    filters:      DateRangeFilter = Depends(),
-    db:           Prisma = Depends(get_db),
+    serial_no: Optional[str] = Query(
+        default=None,
+        description="Partial match on serial number.",
+    ),
+    card_name: Optional[str] = Query(
+        default=None,
+        description="Partial match on card name / label.",
+    ),
+    filters: DateRangeFilter = Depends(),
+    db:      Prisma          = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
 ):
     """
-    Export filtered card records to Excel.
+    Export filtered card records to an Excel workbook.
 
-    All card fields are included in the export.
+    ### Included columns
+    Date · Serial No · Card Name · Card Vendor · Card Expire ·
+    Card Limit · Payment Received · Receiver Bank · Screenshots · Details · Mail Details
+
+    ### Security
+    ``cardNo`` and ``cardCvc`` are **intentionally excluded** from the
+    export — sensitive PAN / CVC data must not appear in downloadable files.
     Screenshot URLs are replaced with a count for readability.
     """
     meta     = filters.meta()
@@ -104,7 +119,7 @@ async def export_cards_endpoint(
         db,
         date_filter=filters.to_prisma_filter() or None,
         serial_no=serial_no,
-        account_name=account_name,
+        account_name=card_name,        # service param name kept for compatibility
         label=label,
     )
     return Response(
@@ -114,79 +129,111 @@ async def export_cards_endpoint(
     )
 
 
-# ── Create  (multipart/form-data — supports optional screenshot uploads) ──────
+# ── Create ────────────────────────────────────────────────────────────────────
 
 @router.post("", response_model=CardSharingResponse, status_code=201)
 async def add_card(
-    # ── Card fields ────────────────────────────────────────────────────────────
-    serial_no:             str            = Form(..., description="Unique card serial number"),
-    date:                  date           = Form(..., description="Card date (YYYY-MM-DD)"),
-    account_name:          str            = Form(..., description="Payoneer accountName (not UUID)"),
-    card_no:               str            = Form(..., description="Card number"),
-    card_expire:           str            = Form(..., description="Expiry (MM/YY)"),
-    card_cvc:              str            = Form(..., description="CVC"),
-    card_vendor:           str            = Form(..., description="Card vendor / issuer"),
-    card_limit:            float          = Form(..., description="Card spending limit"),
-    card_payment_received: float          = Form(0.0, description="Amount already received"),
-    card_receiver_bank:    str            = Form("",  description="Receiver bank / channel"),
-    details:               Optional[str]  = Form(None, description="General notes"),
-    mail_details:          Optional[str]  = Form(None, description="Mail / email notes"),
-    # ── Optional screenshot uploads ────────────────────────────────────────────
-    screenshots: List[UploadFile] = File(
-        default=[],
-        description="Optional screenshot images (JPG/PNG/WebP). "
-                    "Uploaded to Cloudinary; URLs appended to cardDetails.",
+    # ── Only required field ───────────────────────────────────────────────────
+    card_name: str = Form(
+        ...,
+        description=(
+            "Human-readable card label — the only required field.  "
+            "e.g. 'Marketing VISA', 'Team Payoneer #3'.  "
+            "Standalone — no relation to Payoneer or any other module."
+        ),
     ),
-    db:  Prisma = Depends(get_db),
+    # ── All remaining fields are optional ─────────────────────────────────────
+    serial_no: Optional[str] = Form(
+        default=None,
+        description="Unique card serial number. Auto-generated (UUID) if not supplied.",
+    ),
+    card_no: Optional[str] = Form(
+        default=None,
+        description="Card number — transmitted plain-text, stored encrypted, returned decrypted.",
+    ),
+    card_expire: Optional[str] = Form(
+        default=None,
+        description="Expiry date (MM/YY).",
+    ),
+    card_cvc: Optional[str] = Form(
+        default=None,
+        description="CVC — transmitted plain-text, stored encrypted, returned decrypted.",
+    ),
+    card_vendor: Optional[str] = Form(
+        default=None,
+        description="Card vendor / issuer.",
+    ),
+    card_limit: Optional[float] = Form(
+        default=None,
+        description="Card spending limit in USD.",
+    ),
+    card_payment_received: Optional[float] = Form(
+        default=None,
+        description="Amount already received from the vendor.",
+    ),
+    card_receiver_bank: Optional[str] = Form(
+        default=None,
+        description="Receiver bank / channel (e.g. 'bKash', 'Payoneer Sub').",
+    ),
+    details: Optional[str] = Form(
+        default=None,
+        description="General notes.",
+    ),
+    mail_details: Optional[str] = Form(
+        default=None,
+        description="Mail / email notes.",
+    ),
+    db: Prisma = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
 ):
     """
-    Create a card record.
+    Create a new card record.
 
-    • Provide **accountName** (human-readable) — the system looks up the
-      matching PayoneerAccount automatically.
-    • Optionally attach one or more screenshot files in the same request.
-    • `date` must be a valid ISO-8601 date string: YYYY-MM-DD.
-    • cardNo and cardCvc are stored and returned as plain text — no encryption.
+    ### Only ``card_name`` is required
+    Every other field is optional — the server applies safe defaults for
+    anything not supplied.
+
+    ### Date
+    Automatically set to the current server timestamp — callers do not
+    supply this field.
+
+    ### Screenshots
+    Screenshots are managed separately via the dedicated
+    ``POST /{id}/screenshots`` endpoint — they are not part of this request.
+
+    ### Sensitive fields
+    ``card_no`` and ``card_cvc`` are encrypted at rest.  The response always
+    returns the **decrypted** values — no client-side work required.
     """
     payload = CardSharingCreate(
+        card_name=card_name,
         serial_no=serial_no,
-        date=date,
-        details=details,
-        account_name=account_name,
         card_no=card_no,
         card_expire=card_expire,
         card_cvc=card_cvc,
-        card_details=[],
         card_vendor=card_vendor,
-        card_limit=Decimal(str(card_limit)),
-        card_payment_received=Decimal(str(card_payment_received)),
+        card_limit=Decimal(str(card_limit)) if card_limit is not None else None,
+        card_payment_received=Decimal(str(card_payment_received)) if card_payment_received is not None else None,
         card_receiver_bank=card_receiver_bank,
+        details=details,
         mail_details=mail_details,
     )
-
-    card_response = await create_card(db, payload)
-
-    # Upload screenshots immediately after creation if any were attached
-    if screenshots:
-        valid_files = [f for f in screenshots if f.filename]
-        if valid_files:
-            await add_screenshots_bulk(db, card_response["id"], valid_files)
-            # Refresh card to include uploaded screenshot URLs
-            card_response = await get_card(db, card_response["id"], include_sensitive=True)
-
-    return card_response
+    return await create_card(db, payload)
 
 
 # ── Detail ────────────────────────────────────────────────────────────────────
 
 @router.get("/{card_id}", response_model=CardSharingResponse)
-async def get_card_masked(
+async def get_card_detail(
     card_id: str,
     db:      Prisma = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
 ):
-    """Get a single card — all fields fully visible."""
+    """
+    Get a single card record — all fields fully visible.
+
+    ``cardNo`` and ``cardCvc`` are returned **decrypted**.
+    """
     return await get_card(db, card_id, include_sensitive=True)
 
 
@@ -200,40 +247,67 @@ async def get_card_secure(
     db:      Prisma = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
 ):
-    """Returns full card data. Kept for backward compatibility."""
+    """
+    Returns full card data including decrypted sensitive fields.
+
+    Kept for backward compatibility — identical response to ``GET /{card_id}``.
+    """
     return await get_card(db, card_id, include_sensitive=True)
 
 
-# ── Update  (multipart/form-data — supports optional screenshot uploads) ──────
+# ── Update ────────────────────────────────────────────────────────────────────
 
 @router.patch("/{card_id}", response_model=CardSharingResponse)
 async def update_card_endpoint(
-    card_id:               str,
-    details:               Optional[str]   = Form(None),
-    card_no:               Optional[str]   = Form(None, description="New card number"),
-    card_expire:           Optional[str]   = Form(None),
-    card_cvc:              Optional[str]   = Form(None, description="New CVC"),
-    card_vendor:           Optional[str]   = Form(None),
-    card_limit:            Optional[float] = Form(None),
-    card_payment_received: Optional[float] = Form(None),
-    card_receiver_bank:    Optional[str]   = Form(None),
-    mail_details:          Optional[str]   = Form(None),
-    # ── Optional screenshot uploads ────────────────────────────────────────────
-    screenshots: List[UploadFile] = File(
-        default=[],
-        description="New screenshot images to append to this card's cardDetails.",
+    card_id: str,
+    card_name: Optional[str] = Form(
+        default=None,
+        description="Updated card label — standalone, no relational lookup.",
     ),
-    db:  Prisma = Depends(get_db),
+    serial_no: Optional[str] = Form(
+        default=None,
+        description="Updated serial number.",
+    ),
+    card_no: Optional[str] = Form(
+        default=None,
+        description="Updated card number — stored encrypted, returned decrypted.",
+    ),
+    card_expire: Optional[str] = Form(
+        default=None,
+        description="Updated expiry date (MM/YY).",
+    ),
+    card_cvc: Optional[str] = Form(
+        default=None,
+        description="Updated CVC — stored encrypted, returned decrypted.",
+    ),
+    card_vendor: Optional[str] = Form(
+        default=None,
+        description="Updated card vendor / issuer.",
+    ),
+    card_limit: Optional[float] = Form(default=None),
+    card_payment_received: Optional[float] = Form(default=None),
+    card_receiver_bank: Optional[str] = Form(default=None),
+    details: Optional[str] = Form(default=None),
+    mail_details: Optional[str] = Form(default=None),
+    db: Prisma = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
 ):
     """
     Partial update — only provided fields are changed.
 
-    Attach screenshot files to append them to the card's Cloudinary gallery
-    without a separate API call.
+    Sending an empty body ``{}`` is idempotent.
+
+    ### Screenshots
+    Use the dedicated ``POST / DELETE /{id}/screenshots`` endpoints to
+    manage the card's Cloudinary screenshot gallery — screenshots are not
+    part of this request.
+
+    ``cardNo`` and ``cardCvc``, when supplied, are re-encrypted before
+    being stored.
     """
     payload = CardSharingUpdate(
-        details=details,
+        card_name=card_name,
+        serial_no=serial_no,
         card_no=card_no,
         card_expire=card_expire,
         card_cvc=card_cvc,
@@ -241,24 +315,14 @@ async def update_card_endpoint(
         card_limit=Decimal(str(card_limit)) if card_limit is not None else None,
         card_payment_received=Decimal(str(card_payment_received)) if card_payment_received is not None else None,
         card_receiver_bank=card_receiver_bank,
+        details=details,
         mail_details=mail_details,
     )
 
-    # Only call update_card if there are actual field changes
     raw = payload.model_dump(exclude_none=True)
     if raw:
-        card_response = await update_card(db, card_id, payload)
-    else:
-        card_response = await get_card(db, card_id, include_sensitive=True)
-
-    # Upload any attached screenshots
-    if screenshots:
-        valid_files = [f for f in screenshots if f.filename]
-        if valid_files:
-            await add_screenshots_bulk(db, card_id, valid_files)
-            card_response = await get_card(db, card_id, include_sensitive=True)
-
-    return card_response
+        return await update_card(db, card_id, payload)
+    return await get_card(db, card_id, include_sensitive=True)
 
 
 # ── Delete ────────────────────────────────────────────────────────────────────
@@ -270,18 +334,19 @@ async def delete_card_endpoint(
     _=Depends(CEO_DIRECTOR),
 ):
     """
-    Delete a card record and all associated data.
-    Returns a structured success message.
+    Hard-delete a card record and all associated data.
+
+    Returns a structured success envelope.
     """
     await delete_card(db, card_id)
     return {
         "success": True,
         "message": "Card record deleted successfully.",
-        "id": card_id,
+        "id":      card_id,
     }
 
 
-# ── Screenshot management  (dedicated endpoints still available) ───────────────
+# ── Screenshot management  (dedicated endpoints — unchanged) ──────────────────
 
 @router.post(
     "/{card_id}/screenshots",
@@ -291,15 +356,15 @@ async def delete_card_endpoint(
 )
 async def upload_screenshot(
     card_id: str,
-    file:    UploadFile = File(..., description="Image file (JPG, PNG, WebP)"),
-    db:      Prisma = Depends(get_db),
+    file:    UploadFile = File(..., description="Image file (JPG, PNG, WebP)."),
+    db:      Prisma     = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
 ):
     """
-    Upload one screenshot file. The secure_url is appended to cardDetails.
+    Upload one screenshot file.
 
-    Tip: You can also upload screenshots directly in the POST / PATCH endpoints
-    by attaching files to the `screenshots` field — avoids a second round-trip.
+    The Cloudinary ``secure_url`` is appended to ``cardDetails``.
+    Use this endpoint to attach screenshots after a card has been created.
     """
     return await add_screenshot(db, card_id, file)
 
@@ -316,13 +381,14 @@ async def delete_screenshot(
     _=Depends(CEO_DIRECTOR),
 ):
     """
-    Remove a Cloudinary URL from the card's cardDetails list.
-    Returns a structured success message confirming the removed URL.
+    Remove a Cloudinary URL from the card's ``cardDetails`` list.
+
+    Returns a structured success envelope confirming the removed URL.
     """
     await remove_screenshot(db, card_id, body.url)
     return {
-        "success": True,
-        "message": "Screenshot removed successfully.",
-        "card_id": card_id,
+        "success":     True,
+        "message":     "Screenshot removed successfully.",
+        "card_id":     card_id,
         "removed_url": body.url,
     }

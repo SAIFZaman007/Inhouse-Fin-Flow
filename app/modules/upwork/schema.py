@@ -1,27 +1,7 @@
 """
 app/modules/upwork/schema.py
 ════════════════════════════════════════════════════════════════════════════════
-v9 — Enterprise Edition
-
-Changes vs v8
-─────────────
-UpworkSnapshotCreate      NEW OPTIONAL FIELD — ``active_amount``
-                            Optional alias for ``work_in_progress``.  Both map
-                            to the same ``workInProgress`` DB column.
-                            • Only ``work_in_progress`` supplied  → unchanged behaviour.
-                            • Only ``active_amount``   supplied   → treated as wip.
-                            • Both supplied                       → values are summed.
-                            Omitting ``active_amount`` has zero effect on existing flows.
-
-UpworkSnapshotResponse    NEW FIELD — ``activeAmount``
-UpworkSnapshotInProfile   Always equals ``workInProgress``; surfaced as a sibling
-                            key so all consumer endpoints expose both names.
-
-UpworkProfileDetailTotals Field order aligned with list response for consistency.
-
-UpworkOrderCreate         Doc-string updated to describe order → snapshot sync.
-
-Everything else is unchanged from v8.
+v10 — Enterprise Edition
 ════════════════════════════════════════════════════════════════════════════════
 """
 from datetime import date, datetime
@@ -46,7 +26,7 @@ class UpworkProfileCreate(BaseModel):
     If ``available_withdraw`` is supplied, an initial snapshot is recorded
     for ``snapshot_date`` (defaults to today).
     """
-    profileName: str = Field(..., min_length=1, max_length=100)
+    profileName: Optional[str] = Field(default=None, min_length=1, max_length=100)
 
     # Optional initial-snapshot fields ───────────────────────────────────────
     snapshot_date:      Optional[date]    = Field(default=None, description="Defaults to today.")
@@ -73,17 +53,7 @@ class UpworkProfileUpdate(BaseModel):
     Snapshot fields  (v7 addition)
     ──────────────────────────────
     When any snapshot field is supplied the service performs an **upsert** on
-    today's snapshot (or ``snapshot_date`` if provided), so a single PATCH
-    keeps both profile metadata and the current-day balance in sync.
-
-    ``snapshot_date``    Target date for the upsert (defaults to today).
-    ``available_withdraw`` Current available-withdraw balance.
-    ``pending``          Funds pending clearance.
-    ``in_review``        Funds currently in review.
-    ``work_in_progress`` Active contract work-in-progress value.
-    ``withdrawn``        Total withdrawn amount.
-    ``connects``         Available Connects count.
-    ``upwork_plus``      Upwork Plus subscription flag.
+    today's snapshot (or ``snapshot_date`` if provided).
     """
     # ── Profile metadata ─────────────────────────────────────────────────────
     profileName: Optional[str]  = Field(default=None, min_length=1, max_length=100)
@@ -103,7 +73,7 @@ class UpworkProfileUpdate(BaseModel):
     work_in_progress:   Optional[Decimal] = Field(default=None, ge=0)
     withdrawn:          Optional[Decimal] = Field(default=None, ge=0)
     connects:           Optional[int]     = Field(default=None, ge=0)
-    upwork_plus:        Optional[bool]    = None                          # FIXED: no bare Field()
+    upwork_plus:        Optional[bool]    = None
 
 
 class UpworkProfileResponse(BaseModel):
@@ -124,9 +94,6 @@ class UpworkSnapshotCreate(BaseModel):
     """
     Daily financial snapshot — additive accumulation on (profileName, date).
 
-    ``profile_name`` replaced ``profile_id`` in v5.
-    The service resolves the name to a profile record server-side.
-
     Submission behaviour
     ────────────────────
     • First submission for (profileName, date)
@@ -136,70 +103,78 @@ class UpworkSnapshotCreate(BaseModel):
           values rather than replacing them.
         → ``upwork_plus`` uses OR semantics: once True for the day it stays True.
 
-    This ensures that multiple HR inputs throughout the same day accumulate
-    into a running total rather than silently overwriting previous entries.
-    The response always reflects the current accumulated state of the row.
-
     ``active_amount`` / ``work_in_progress`` duality
     ─────────────────────────────────────────────────
     ``active_amount`` is an **optional alias** for ``work_in_progress``.
     Both fields map to the same ``workInProgress`` DB column.
-
-    • Only ``work_in_progress`` supplied  → stored as-is (unchanged behaviour).
-    • Only ``active_amount``   supplied   → treated identically to ``work_in_progress``.
+    • Only ``work_in_progress`` supplied  → stored as-is.
+    • Only ``active_amount``   supplied   → treated identically.
     • Both supplied                       → their values are **summed** before storage.
-    • Neither supplied                    → defaults to 0.
-
-    Both ``workInProgress`` and ``activeAmount`` are always returned in every
-    response with identical values, for full forward/backward compatibility.
     """
-    profile_name:       str     = Field(
-        ..., min_length=1, max_length=100,
+    profile_name:       Optional[str]     = Field(
+        default=None, min_length=1, max_length=100,
         description="Exact Upwork profile name (case-insensitive match).",
     )
     date:               date
-    available_withdraw: Decimal = Field(..., ge=0)
-    pending:            Decimal = Field(default=Decimal("0"), ge=0)
-    in_review:          Decimal = Field(default=Decimal("0"), ge=0)
-    work_in_progress:   Decimal = Field(default=Decimal("0"), ge=0)
+    available_withdraw: Optional[Decimal] = Field(default=Decimal("0"), ge=0)
+    pending:            Optional[Decimal] = Field(default=Decimal("0"), ge=0)
+    in_review:          Optional[Decimal] = Field(default=Decimal("0"), ge=0)
+    work_in_progress:   Optional[Decimal] = Field(default=Decimal("0"), ge=0)
     # Optional alias ──────────────────────────────────────────────────────────
     active_amount:      Optional[Decimal] = Field(
         default=None, ge=0,
         description=(
             "Optional alias for work_in_progress. "
-            "When supplied its value is added to work_in_progress before storage. "
-            "The response always reflects the merged value under both keys."
+            "When supplied its value is added to work_in_progress before storage."
         ),
     )
-    withdrawn:          Decimal = Field(default=Decimal("0"), ge=0)
-    connects:           int     = Field(default=0, ge=0)
-    upwork_plus:        bool    = False
+    withdrawn:          Optional[Decimal] = Field(default=Decimal("0"), ge=0)
+    connects:           Optional[int]     = Field(default=0, ge=0)
+    upwork_plus:        Optional[bool]    = Field(default=False)
 
     @model_validator(mode="after")
     def _merge_active_amount(self) -> "UpworkSnapshotCreate":
-        """
-        Collapse ``active_amount`` into ``work_in_progress`` so the service
-        layer always works through a single field name.
-        """
+        """Collapse ``active_amount`` into ``work_in_progress``."""
+        wip = self.work_in_progress or Decimal("0")
         if self.active_amount is not None:
-            self.work_in_progress = self.work_in_progress + self.active_amount
-        # Mirror back so the response always carries both keys.
-        self.active_amount = self.work_in_progress
+            wip = wip + self.active_amount
+        self.work_in_progress = wip
+        self.active_amount    = wip
         return self
+
+
+class UpworkSnapshotUpdate(BaseModel):
+    """
+    ``PATCH /snapshots/{id}`` — partial update (SET semantics, not additive).
+
+    All fields are optional — only supplied fields are overwritten.
+    This allows HR to correct a previously submitted snapshot without
+    re-entering unrelated values.
+
+    ``profile_name`` and ``date`` are immutable after creation and are
+    not accepted by this endpoint.
+    """
+    available_withdraw: Optional[Decimal] = Field(default=None, ge=0)
+    pending:            Optional[Decimal] = Field(default=None, ge=0)
+    in_review:          Optional[Decimal] = Field(default=None, ge=0)
+    work_in_progress:   Optional[Decimal] = Field(default=None, ge=0)
+    withdrawn:          Optional[Decimal] = Field(default=None, ge=0)
+    connects:           Optional[int]     = Field(default=None, ge=0)
+    upwork_plus:        Optional[bool]    = Field(default=None)
 
 
 class UpworkSnapshotResponse(BaseModel):
     """Full snapshot row returned by POST /snapshots and GET .../snapshots."""
     id:                        str
     profileId:                 str
-    profileName:               str      # ← v5: human-readable label
+    profileName:               str
     date:                      date
     availableWithdraw:         Decimal
     availableWithdrawAfterFee: Decimal  # computed: × 0.90
     pending:                   Decimal
     inReview:                  Decimal
     workInProgress:            Decimal
-    activeAmount:              Decimal  # v9: alias — always equals workInProgress
+    activeAmount:              Decimal  # alias — always equals workInProgress
     withdrawn:                 Decimal
     connects:                  int
     upworkPlus:                bool
@@ -217,33 +192,22 @@ class UpworkOrderCreate(BaseModel):
     """
     Log a new Upwork order.
 
-    ``profile_name`` replaced ``profile_id`` in v5.
     ``afterUpwork`` (amount × 0.90) is always computed server-side.
 
-    Automatic snapshot sync
-    ───────────────────────
+    ### Automatic snapshot sync
     After persisting the order row the service additively updates the snapshot
     for ``(profileName, date)``:
-
-    • ``workInProgress`` and ``activeAmount`` on the matching snapshot are
-      each incremented by ``amount`` (they are the same DB column; both
-      response keys reflect the updated value).
-    • If no snapshot exists yet for that date one is **upserted** automatically
-      with the order amount seeding ``workInProgress`` / ``activeAmount``.
-    • The aggregated ``periodTotals`` and ``totals`` values returned by
-      GET /profiles update automatically to reflect the new order.
-
-    No extra API call is needed after POST /orders — the platform stays
-    fully in-sync with a single request.
+    • ``workInProgress`` and ``activeAmount`` each incremented by ``amount``.
+    • If no snapshot exists yet for that date one is upserted automatically.
     """
-    profile_name: str     = Field(
-        ..., min_length=1, max_length=100,
+    profile_name: Optional[str]     = Field(
+        default=None, min_length=1, max_length=100,
         description="Exact Upwork profile name (case-insensitive match).",
     )
     date:         date
-    client_name:  str     = Field(..., min_length=1)
-    order_id:     str     = Field(..., min_length=1)
-    amount:       Decimal = Field(..., gt=0)
+    client_name:  Optional[str]     = Field(default=None, min_length=1)
+    order_id:     Optional[str]     = Field(default=None, min_length=1)
+    amount:       Optional[Decimal] = Field(default=None, gt=0)
 
 
 class UpworkOrderUpdate(BaseModel):
@@ -252,10 +216,7 @@ class UpworkOrderUpdate(BaseModel):
 
     All fields are optional — only supplied fields are written.
     If ``amount`` is updated, ``afterUpwork`` is automatically re-computed
-    server-side (amount × 0.90) — clients must never send ``afterUpwork``.
-    ``order_id`` uniqueness is enforced server-side on rename.
-
-    Sending an empty body ``{}`` returns the current order unchanged (idempotent).
+    server-side (amount × 0.90).
     """
     date:        date
     client_name: Optional[str]     = Field(default=None, min_length=1)
@@ -279,20 +240,60 @@ class UpworkOrderResponse(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Trash  (soft-delete registry)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class UpworkTrashItem(BaseModel):
+    """
+    One soft-deleted record as stored in the trash registry.
+
+    ``type``      ``"profile"`` | ``"snapshot"`` | ``"order"``
+    ``snapshot``  Full record dict captured at deletion time.
+    """
+    id:        str
+    module:    str
+    type:      str
+    deletedAt: str
+    snapshot:  Dict[str, Any]
+
+
+class UpworkTrashResponse(BaseModel):
+    """Envelope for ``GET /trash``."""
+    total: int
+    items: List[UpworkTrashItem]
+
+
+class UpworkRestoreRequest(BaseModel):
+    """
+    ``POST /restore-trash`` — restore one or more soft-deleted records.
+
+    ``ids``  List of original DB primary keys to restore.
+    """
+    ids: List[str] = Field(..., min_length=1, description="List of trash record IDs to restore.")
+
+
+class UpworkRestoreResponse(BaseModel):
+    """Result envelope for ``POST /restore-trash``."""
+    restored: List[str]
+    failed:   List[str]
+    message:  str
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Embedded sub-types (profile list / detail responses)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class UpworkSnapshotInProfile(BaseModel):
     """Snapshot row embedded within profile list / detail responses."""
     id:                        str
-    profileName:               str    # ← v5
+    profileName:               str
     date:                      date
     availableWithdraw:         float
-    availableWithdrawAfterFee: float  # view-only, not stored
+    availableWithdrawAfterFee: float
     pending:                   float
     inReview:                  float
     workInProgress:            float
-    activeAmount:              float  # v9: alias — always equals workInProgress
+    activeAmount:              float   # alias — always equals workInProgress
     withdrawn:                 float
     connects:                  int
     upworkPlus:                bool
@@ -323,8 +324,9 @@ class UpworkTotals(BaseModel):
     totalWorkInProgress:            float
     totalWithdrawn:                 float
     totalConnects:                  int
-    totalRevenueInPeriod:           float   # Σ afterUpwork
-    totalActiveAmount:              float   # v8: Σ order.amount across all profiles
+    totalRevenueInPeriod:           float
+    totalActiveAmount:              float
+    totalOrderCount:                int     # dynamic — live orders across ALL active profiles
     activeProfileCount:             int
 
 
@@ -359,7 +361,7 @@ class UpworkProfileDetailTotals(BaseModel):
     pending:                   float
     inReview:                  float
     workInProgress:            float
-    activeAmount:              float   # v8: Σ order.amount for this profile
+    activeAmount:              float
     withdrawn:                 float
     connects:                  int
     revenueInPeriod:           float

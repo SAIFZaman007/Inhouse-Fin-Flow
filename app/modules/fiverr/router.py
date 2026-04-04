@@ -1,29 +1,7 @@
 """
 app/modules/fiverr/router.py
 ════════════════════════════════════════════════════════════════════════════════
-v1 — Enterprise Edition
-
-Endpoint matrix
-───────────────────────────────────────────────────────────────────────────────
-GET    /profiles                 HR_AND_ABOVE  Combined totals + all profiles
-                                              Paginated (50/page). ?name= search.
-GET    /profiles/{id}            HR_AND_ABOVE  Single-profile drill-down (paginated)
-                                              + optional ?name= filter
-POST   /profiles                 HR_AND_ABOVE  Create + optional initial snapshot
-PATCH  /profiles/{id}            HR_AND_ABOVE  Partial update (rename / isActive /
-                                              snapshot fields — all optional)
-DELETE /profiles/{id}            CEO_DIRECTOR  Soft-delete — returns JSON message
-
-POST   /snapshots                HR_AND_ABOVE  Additive daily snapshot (by profileName)
-GET    /profiles/{id}/snapshots  HR_AND_ABOVE  Paginated snapshots — includes profileName
-
-POST   /orders                   HR_AND_ABOVE  Log order (by profileName, afterFiverr computed)
-                                              Automatically syncs snapshot activeOrders +
-                                              activeOrderAmount for the same date.
-PATCH  /orders/{id}              HR_AND_ABOVE  Partial update (date/buyer/orderId/amount)
-GET    /profiles/{id}/orders     HR_AND_ABOVE  Paginated orders for one profile
-
-GET    /export/{profile_id}      CEO_DIRECTOR  Single-profile Excel (period-aware)
+v3 — Enterprise Edition
 ════════════════════════════════════════════════════════════════════════════════
 """
 from typing import Annotated, Optional
@@ -42,20 +20,26 @@ from .schema import (
     FiverrOrderUpdate,
     FiverrProfileCreate,
     FiverrProfileUpdate,
+    FiverrRestoreRequest,
     FiverrSnapshotCreate,
+    FiverrSnapshotUpdate,
 )
 from .service import (
     add_order,
     create_profile,
     create_snapshot,
-    deactivate_profile,
     export_profile_excel,
     get_profile_detail,
     get_profile_orders,
     get_profile_snapshots,
+    get_trash,
     list_profiles_summary,
+    restore_trash,
+    soft_delete_profile,
+    soft_delete_snapshot,
     update_order,
     update_profile,
+    update_snapshot,
 )
 
 router = APIRouter(prefix="/fiverr", tags=["Fiverr"])
@@ -83,14 +67,16 @@ def _xlsx(data: bytes, filename: str) -> Response:
     description="""
 Returns a **single response** containing:
 
-- **Combined totals** across all active profiles for the selected period —
-  `totalAvailableWithdraw`, `totalNotCleared`, `totalActiveOrders`,
-  `totalActiveOrderAmount`, `totalSubmitted`, `totalWithdrawn`, `totalPromotion`,
-  `totalRevenueInPeriod` (Σ afterFiverr), `totalOrderAmount` (Σ order.amount).
-- **Paginated per-profile breakdown** with the latest snapshot + all orders
-  for the selected window (50 profiles per page by default).
+- **Combined totals** across all active profiles for the selected period.
+- **Paginated per-profile breakdown** with the latest snapshot + all live orders.
 
-Use `?name=` for a case-insensitive search on profile name.
+### Dynamic `totalActiveOrders`
+`totalActiveOrders` is **fully dynamic**:
+- **+1** whenever an order is posted (snapshot sync increments `activeOrders`).
+- **-1** whenever a snapshot or order is soft-deleted.
+- **-N** (N = profile's active order count) whenever a profile is soft-deleted.
+
+Soft-deleted records are excluded automatically from all calculations.
 
 Period params: `daily` | `weekly` | `monthly` | `yearly` | `all` (default).
     """,
@@ -113,15 +99,11 @@ async def get_profiles(
     summary="Single Fiverr profile — full drill-down (paginated)",
     description="""
 Returns a complete breakdown for **one profile**:
-- Period-scoped `periodTotals` (availableWithdraw, notCleared, activeOrders,
-  activeOrderAmount, submitted, withdrawn, promotion, revenueInPeriod,
-  totalOrderAmount, snapshotCount, orderCount)
-- Paginated daily snapshots in the window (newest first, 50 per page)
-- Paginated orders in the window (newest first, 50 per page)
+- Period-scoped totals (availableWithdraw, notCleared, activeOrders …)
+- Paginated daily **live** snapshots in the window (newest first)
+- Paginated **live** orders in the window (newest first)
 
-Use `?name=` for an optional case-insensitive filter on profile name.
-
-Same period + pagination query params as GET /profiles.
+`orderCount` and `snapshotCount` are **dynamic** — soft-deleted records excluded.
     """,
 )
 async def get_profile(
@@ -145,13 +127,10 @@ async def get_profile(
     description="""
 Creates a new Fiverr profile.
 
-If `available_withdraw` is provided, an initial snapshot is recorded immediately —
-no separate POST /snapshots call needed. `snapshot_date` defaults to today.
+If any snapshot field is provided, an initial snapshot is recorded immediately.
+`snapshot_date` defaults to today.
 
-**Required:** `profileName`
-**Optional snapshot fields:** `snapshot_date`, `available_withdraw`, `not_cleared`,
-`active_orders`, `active_order_amount`, `submitted`, `withdrawn`, `seller_plus`,
-`promotion`
+All fields are optional — supply only what you need.
 
 **Access:** CEO, Director, and HR.
     """,
@@ -173,31 +152,16 @@ Performs a **partial update** on an existing Fiverr profile.
 All fields are optional — only supplied fields are changed.
 
 ### Profile metadata
-
 | Field | Effect |
 |---|---|
 | `profileName` | Renames the profile; uniqueness enforced (409 on conflict). |
-| `isActive` | `false` soft-deletes the profile; `true` restores a deactivated one. |
+| `isActive` | `false` soft-deletes; `true` restores a deactivated profile. |
 
 ### Snapshot fields
+When any snapshot field is present, the service performs an **upsert** on the
+snapshot for `snapshot_date` (defaults to today).
 
-When any snapshot field is present the service performs an **upsert** on the
-snapshot for `snapshot_date` (defaults to **today**).
-
-| Field | Description |
-|---|---|
-| `snapshot_date` | Target date for the upsert (defaults to today). |
-| `available_withdraw` | Current available-withdraw balance. |
-| `not_cleared` | Funds not yet cleared. |
-| `active_orders` | Count of active (in-progress) orders. |
-| `active_order_amount` | Total $ value of active orders. |
-| `submitted` | Submitted-for-clearance amount. |
-| `withdrawn` | Total withdrawn amount. |
-| `seller_plus` | Fiverr Seller Plus subscription flag. |
-| `promotion` | Promotion credit balance. |
-
-Sending an empty body `{}` is accepted and returns the current profile state
-unchanged (idempotent).
+Sending an empty body `{}` is idempotent.
 
 **Access:** CEO, Director, and HR.
     """,
@@ -214,14 +178,16 @@ async def patch_profile(
 @router.delete(
     "/profiles/{profile_id}",
     status_code=200,
-    summary="Soft-delete a Fiverr profile (sets isActive = false)",
+    summary="Soft-delete a Fiverr profile — full trash registry entry",
     description="""
-Soft-deletes a Fiverr profile by setting `isActive` to `false`.
+**Fully soft-deletes** a Fiverr profile:
 
-The profile and all its historical snapshots/orders remain intact in the
-database and can be restored via `PATCH /profiles/{id}` with `isActive: true`.
+1. Sets `isActive = false` in the database.
+2. Writes the profile + **all its snapshots** + **all its orders** to the persistent trash registry.
+3. All trashed records are excluded from every live calculation immediately,
+   including `totalActiveOrders`.
 
-Returns a JSON confirmation message on success.
+The data is never hard-deleted — restore via `POST /restore-trash`.
 
 **Access:** CEO and Director only.
     """,
@@ -231,12 +197,7 @@ async def remove_profile(
     db: Prisma = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
 ):
-    await deactivate_profile(db, profile_id)
-    return {
-        "success":   True,
-        "message":   "Fiverr profile has been deactivated successfully.",
-        "profileId": profile_id,
-    }
+    return await soft_delete_profile(db, profile_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -250,27 +211,16 @@ async def remove_profile(
     description="""
 **Additively accumulates** a daily financial snapshot for the specified profile + date.
 
-### Submission behaviour
-
 | Scenario | Result |
 |---|---|
-| **First submission** for `(profileName, date)` | Row is **inserted** with the incoming values as-is. |
-| **Subsequent submission** for the same `(profileName, date)` | Incoming numeric values are **added** to the existing stored values. The response reflects the new running total. |
+| **First submission** for `(profile_name, date)` | Row is **inserted** with the incoming values as-is. |
+| **Subsequent submission** for the same pair | Incoming numeric values are **added** to the existing stored values. |
 
-> **`seller_plus`** uses OR semantics — once `true` for the day it remains `true`
-> regardless of subsequent submissions.
+`seller_plus` uses OR semantics — once `true` for the day it remains `true`.
 
-This design ensures that multiple HR inputs throughout the same day accumulate
-into a running total rather than silently overwriting previous entries.
+All fields are optional — supply only what you need.
 
-The response includes a **`syncedTotals`** block (`revenueAllTime`,
-`orderAmountAllTime`) for immediate dashboard refresh.
-
-After this call, `latestSnapshot`, `periodTotals`, and cross-profile `totals`
-in `GET /profiles` all reflect the new values on the very next request.
-
-**`profile_name`** — the human-readable profile name (case-insensitive).
-The system resolves it to an internal profile record automatically.
+**Access:** HR and above.
     """,
 )
 async def add_snapshot(
@@ -281,15 +231,62 @@ async def add_snapshot(
     return await create_snapshot(db, body)
 
 
+@router.patch(
+    "/snapshots/{snapshot_id}",
+    summary="Edit a daily Fiverr snapshot (SET semantics — correction mode)",
+    description="""
+Performs a **partial update** on an existing Fiverr snapshot.
+
+**SET semantics** — unlike `POST /snapshots` (which *adds* to existing values),
+this endpoint *replaces* only the supplied fields. Use it to correct a
+previously submitted snapshot.
+
+All fields are optional — only supplied fields are overwritten.
+Sending an empty body `{}` is idempotent.
+
+`profile_name` and `date` are **immutable** after creation and are not accepted.
+
+**Access:** HR and above.
+    """,
+)
+async def patch_snapshot(
+    snapshot_id: str,
+    body: FiverrSnapshotUpdate,
+    db:   Prisma = Depends(get_db),
+    _=Depends(HR_AND_ABOVE),
+):
+    return await update_snapshot(db, snapshot_id, body)
+
+
+@router.delete(
+    "/snapshots/{snapshot_id}",
+    status_code=200,
+    summary="Soft-delete a daily Fiverr snapshot",
+    description="""
+**Soft-deletes** a snapshot by writing it to the trash registry.
+
+The database row is **not** removed — the record is excluded from all
+live calculations (including `totalActiveOrders`) until restored via
+`POST /restore-trash`.
+
+**Access:** CEO and Director only.
+    """,
+)
+async def delete_snapshot(
+    snapshot_id: str,
+    db: Prisma = Depends(get_db),
+    _=Depends(CEO_DIRECTOR),
+):
+    return await soft_delete_snapshot(db, snapshot_id)
+
+
 @router.get(
     "/profiles/{profile_id}/snapshots",
-    summary="All snapshots for one Fiverr profile (period-aware, paginated)",
+    summary="All live snapshots for one Fiverr profile (period-aware, paginated)",
     description="""
-Returns paginated daily snapshots for a single profile.
+Returns paginated **live** (non-deleted) daily snapshots for a single profile.
 
-Each snapshot row includes **`profileName`** so clients always have full
-context without a secondary profile lookup.
-
+Each snapshot row includes **`profileName`** for full client context.
 Default: 50 snapshots per page, newest first.
     """,
 )
@@ -316,35 +313,20 @@ async def profile_snapshots(
     description="""
 Logs an individual Fiverr order and **automatically syncs** the daily snapshot.
 
-**`profile_name`** — the human-readable profile name (case-insensitive).
-The system resolves it to an internal profile record automatically.
-
-`afterFiverr` (net after Fiverr's 20 % platform fee) is **computed server-side**
-as `amount × 0.80` — it is never accepted from the client.
+`afterFiverr` (net after 20 % platform fee) is **computed server-side**.
 
 ### Automatic snapshot sync
+After the order row is persisted:
+- `activeOrders` on the matching snapshot is incremented by **+1**.
+- `activeOrderAmount` is incremented by `amount`.
+- If no snapshot exists yet for that date one is **upserted automatically**.
 
-After the order row is persisted the system **additively updates** the snapshot
-for `(profileName, date)`:
+### Dynamic `totalActiveOrders`
+`totalActiveOrders` in all profile responses updates **immediately** after each order.
 
-| Field | Change |
-|---|---|
-| `activeOrders` | **+1** |
-| `activeOrderAmount` | **+order.amount** |
+All fields are optional — supply only what you need.
 
-If no snapshot exists yet for that date one is **upserted automatically**
-with the order amount seeding both fields.
-
-No extra API call is needed — the platform stays fully in-sync in a single request.
-
-The response includes a **`snapshotSync`** summary (date, updated `activeOrders`
-and `activeOrderAmount`) and a **`syncedTotals`** block (`revenueAllTime`,
-`orderAmountAllTime`) for immediate dashboard display.
-
-After this call, `latestSnapshot`, `periodTotals`, and the cross-profile `totals`
-block in `GET /profiles` all reflect the new values on the very next request.
-
-**Access:** CEO, Director, and HR.
+**Access:** HR and above.
     """,
 )
 async def add_order_entry(
@@ -388,8 +370,8 @@ async def patch_order(
 
 @router.get(
     "/profiles/{profile_id}/orders",
-    summary="All orders for one Fiverr profile (period-aware, paginated)",
-    description="Returns paginated orders. Default: 50 orders per page, newest first.",
+    summary="All live orders for one Fiverr profile (period-aware, paginated)",
+    description="Returns paginated **live** (non-deleted) orders. Default: 50 per page, newest first.",
 )
 async def profile_orders(
     profile_id: str,
@@ -404,6 +386,61 @@ async def profile_orders(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Trash & Restore
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/trash",
+    summary="Get all soft-deleted Fiverr records",
+    description="""
+Returns all soft-deleted Fiverr records from the persistent trash registry,
+sorted **newest-deleted-first**.
+
+Use `?type=` to filter by record type:
+- `profile`  — deleted profiles
+- `snapshot` — deleted daily snapshots
+- `order`    — deleted orders
+
+Each item includes a full `snapshot` dict of the record at deletion time.
+
+**Access:** CEO and Director only.
+    """,
+)
+async def fiverr_trash(
+    type: Annotated[
+        Optional[str],
+        Query(description="Filter by record type: profile | snapshot | order"),
+    ] = None,
+    _=Depends(CEO_DIRECTOR),
+):
+    return await get_trash(record_type=type)
+
+
+@router.post(
+    "/restore-trash",
+    summary="Restore soft-deleted Fiverr records by ID",
+    description="""
+Restores one or more soft-deleted Fiverr records from the trash registry.
+
+- **Profiles** — `isActive` is set back to `true` in the database.
+- **Snapshots** / **Orders** — the database rows were never removed; they are
+  simply removed from the trash registry and immediately re-appear in all live
+  calculations, including `totalActiveOrders`.
+
+Returns lists of successfully `restored` IDs and `failed` IDs.
+
+**Access:** CEO and Director only.
+    """,
+)
+async def fiverr_restore_trash(
+    body: FiverrRestoreRequest,
+    db:   Prisma = Depends(get_db),
+    _=Depends(CEO_DIRECTOR),
+):
+    return await restore_trash(db, body.ids)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Export
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -412,10 +449,8 @@ async def profile_orders(
     summary="Export a single Fiverr profile to Excel (period-aware)",
     description="""
 Downloads a two-sheet Excel workbook for **one profile**:
-- **Sheet 1** — Daily Snapshots (all snapshot fields)
-- **Sheet 2** — Orders (date, buyer, orderId, amount, afterFiverr)
-
-Supports the same period query parameters as all other endpoints.
+- **Sheet 1** — Daily Snapshots (live records only)
+- **Sheet 2** — Orders (live records only)
 
 **Access:** CEO and Director only.
     """,

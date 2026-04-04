@@ -1,31 +1,10 @@
 """
 app/modules/upwork/router.py
 ════════════════════════════════════════════════════════════════════════════════
-v8 — Enterprise Edition
-
-Endpoint matrix
-───────────────────────────────────────────────────────────────────────────────
-GET    /profiles                 HR_AND_ABOVE  Combined totals + all profiles
-                                              Paginated (50/page). ?name= search.
-GET    /profiles/{id}            HR_AND_ABOVE  Single-profile drill-down (paginated)
-                                              + optional ?name= filter
-POST   /profiles                 HR_AND_ABOVE  Create + optional initial snapshot
-PATCH  /profiles/{id}            HR_AND_ABOVE  Partial update (rename / isActive /
-                                              snapshot fields — all optional)
-DELETE /profiles/{id}            CEO_DIRECTOR  Soft-delete — returns JSON message
-
-POST   /snapshots                HR_AND_ABOVE  Additive daily snapshot (by profileName)
-GET    /profiles/{id}/snapshots  HR_AND_ABOVE  Paginated snapshots — includes profileName
-
-POST   /orders                   HR_AND_ABOVE  Log order (by profileName, afterUpwork computed)
-PATCH  /orders/{id}              HR_AND_ABOVE  Partial update (date/client/orderId/amount)
-GET    /profiles/{id}/orders     HR_AND_ABOVE  Paginated orders for one profile
-
-GET    /export                   CEO_DIRECTOR  All-profiles Excel (period-aware)
-GET    /export/{profile_id}      CEO_DIRECTOR  Single-profile Excel (period-aware)
+v9 — Enterprise Edition
 ════════════════════════════════════════════════════════════════════════════════
 """
-from typing import Annotated, Optional
+from typing import Annotated, List, Optional
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import Response
@@ -43,20 +22,26 @@ from .schema import (
     UpworkOrderUpdate,
     UpworkProfileCreate,
     UpworkProfileUpdate,
+    UpworkRestoreRequest,
     UpworkSnapshotCreate,
+    UpworkSnapshotUpdate,
 )
 from .service import (
     add_order,
     create_profile,
     create_snapshot,
-    deactivate_profile,
     export_profile_excel,
     get_profile_detail,
     get_profile_orders,
     get_profile_snapshots,
+    get_trash,
     list_profiles_summary,
+    restore_trash,
+    soft_delete_profile,
+    soft_delete_snapshot,
     update_order,
     update_profile,
+    update_snapshot,
 )
 
 router = APIRouter(prefix="/upwork", tags=["Upwork"])
@@ -84,12 +69,11 @@ def _xlsx(data: bytes, filename: str) -> Response:
     description="""
 Returns a **single response** containing:
 
-- **Combined totals** across all active profiles for the selected period —
-  `totalAvailableWithdraw`, `totalAvailableWithdrawAfterFee` (×0.90),
-  `totalPending`, `totalInReview`, `totalWorkInProgress`, `totalWithdrawn`,
-  `totalConnects`, `totalRevenueInPeriod`, `totalActiveAmount` (Σ order.amount).
-- **Paginated per-profile breakdown** with the latest snapshot + all orders
+- **Combined totals** across all active profiles for the selected period.
+- **Paginated per-profile breakdown** with the latest snapshot + all live orders
   for the selected window (50 profiles per page by default).
+
+`orderCount` is **dynamic** — soft-deleted orders are excluded automatically.
 
 Use `?name=` for a case-insensitive search on profile name.
 
@@ -114,15 +98,13 @@ async def get_profiles(
     summary="Single Upwork profile — full drill-down (paginated)",
     description="""
 Returns a complete breakdown for **one profile**:
-- Period-scoped totals (availableWithdraw, afterFee, pending, inReview, wip,
-  revenue, `activeAmount` …)
-- Paginated daily snapshots in the window (newest first, 50 per page)
-- Paginated orders in the window (newest first, 50 per page)
+- Period-scoped totals (availableWithdraw, afterFee, pending, inReview, wip, revenue …)
+- Paginated daily **live** snapshots in the window (newest first, 50 per page)
+- Paginated **live** orders in the window (newest first, 50 per page)
 
-Use `?name=` for an optional case-insensitive filter on profile name
-(useful when resolving a profile by name instead of ID).
+`orderCount` and `snapshotCount` are **dynamic** — soft-deleted records excluded.
 
-Same period + pagination query params as GET /profiles.
+Use `?name=` for an optional case-insensitive filter on profile name.
     """,
 )
 async def get_profile(
@@ -146,12 +128,10 @@ async def get_profile(
     description="""
 Creates a new Upwork profile.
 
-If `available_withdraw` is provided, an initial snapshot is recorded immediately —
-no separate POST /snapshots call needed. `snapshot_date` defaults to today.
+If `available_withdraw` is provided, an initial snapshot is recorded immediately.
+`snapshot_date` defaults to today.
 
-**Required:** `profileName`
-**Optional snapshot fields:** `snapshot_date`, `available_withdraw`, `pending`,
-`in_review`, `work_in_progress`, `withdrawn`, `connects`, `upwork_plus`
+All fields are optional — supply only what you need.
 
 **Access:** CEO, Director, and HR.
     """,
@@ -173,32 +153,16 @@ Performs a **partial update** on an existing Upwork profile.
 All fields are optional — only supplied fields are changed.
 
 ### Profile metadata
-
 | Field | Effect |
 |---|---|
 | `profileName` | Renames the profile; uniqueness enforced (409 on conflict). |
-| `isActive` | `false` soft-deletes the profile; `true` restores a deactivated one. |
+| `isActive` | `false` soft-deletes; `true` restores a deactivated profile. |
 
-### Snapshot fields *(v7 addition)*
+### Snapshot fields
+When any snapshot field is present, the service performs an **upsert** on the
+snapshot for `snapshot_date` (defaults to today).
 
-When any of the following fields are present the service performs an **upsert**
-on the snapshot for `snapshot_date` (defaults to **today**).  This allows a
-single PATCH call to update both the profile name and the current-day balance
-without a separate POST /snapshots round-trip.
-
-| Field | Description |
-|---|---|
-| `snapshot_date` | Target date for the upsert (defaults to today). |
-| `available_withdraw` | Current available-withdraw balance. |
-| `pending` | Funds pending clearance. |
-| `in_review` | Funds currently in review. |
-| `work_in_progress` | Active contract work-in-progress value. |
-| `withdrawn` | Total withdrawn amount. |
-| `connects` | Available Connects count. |
-| `upwork_plus` | Upwork Plus subscription flag. |
-
-Sending an empty body `{}` is accepted and returns the current profile state
-unchanged (idempotent).
+Sending an empty body `{}` is idempotent.
 
 **Access:** CEO, Director, and HR.
     """,
@@ -215,14 +179,16 @@ async def patch_profile(
 @router.delete(
     "/profiles/{profile_id}",
     status_code=200,
-    summary="Soft-delete an Upwork profile (sets isActive = false)",
+    summary="Soft-delete an Upwork profile — full trash registry entry",
     description="""
-Soft-deletes an Upwork profile by setting `isActive` to `false`.
+**Fully soft-deletes** an Upwork profile:
 
-The profile and all its historical snapshots/orders remain intact in the
-database and can be restored via `PATCH /profiles/{id}` with `isActive: true`.
+1. Sets `isActive = false` in the database.
+2. Writes the profile record + **all its snapshots** + **all its orders**
+   to the persistent trash registry (`GET /trash`).
+3. All trashed records are excluded from every live calculation immediately.
 
-Returns a JSON confirmation message on success.
+The data is never hard-deleted — restore via `POST /restore-trash`.
 
 **Access:** CEO and Director only.
     """,
@@ -232,12 +198,7 @@ async def remove_profile(
     db: Prisma = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
 ):
-    await deactivate_profile(db, profile_id)
-    return {
-        "success": True,
-        "message": "Upwork profile has been deactivated successfully.",
-        "profileId": profile_id,
-    }
+    return await soft_delete_profile(db, profile_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -251,36 +212,16 @@ async def remove_profile(
     description="""
 **Additively accumulates** a daily financial snapshot for the specified profile + date.
 
-### Submission behaviour
-
 | Scenario | Result |
 |---|---|
 | **First submission** for `(profileName, date)` | Row is **inserted** with the incoming values as-is. |
-| **Subsequent submission** for the same `(profileName, date)` | Incoming numeric values are **added** to the existing stored values. The response reflects the new running total. |
+| **Subsequent submission** for the same pair | Incoming numeric values are **added** to the existing stored values. |
 
-> **`upwork_plus`** uses OR semantics — once `true` for the day it remains `true`
-> regardless of subsequent submissions.
+`upwork_plus` uses OR semantics — once `true` for the day it remains `true`.
 
-This design ensures that multiple HR inputs throughout the same day accumulate
-into a running total rather than silently overwriting previous entries.
+All fields are optional — supply only what you need.
 
-### `active_amount` / `work_in_progress` duality
-
-`active_amount` is an **optional alias** for `work_in_progress`. Both map to
-the same database column.
-
-| Scenario | Result |
-|---|---|
-| Only `work_in_progress` supplied | Stored as-is — no change to existing behaviour. |
-| Only `active_amount` supplied | Treated identically to `work_in_progress`. |
-| Both supplied | Values are **summed** before storage. |
-
-Both `workInProgress` and `activeAmount` are always returned in every response
-with identical values for full forward/backward compatibility.
-
-**`profile_name`** — the human-readable profile name (case-insensitive).
-The system resolves it to an internal profile record automatically.
-HR staff never need to know or handle internal profile UUIDs.
+**Access:** HR and above.
     """,
 )
 async def add_snapshot(
@@ -291,14 +232,62 @@ async def add_snapshot(
     return await create_snapshot(db, body)
 
 
+@router.patch(
+    "/snapshots/{snapshot_id}",
+    summary="Edit a daily Upwork snapshot (SET semantics — correction mode)",
+    description="""
+Performs a **partial update** on an existing Upwork snapshot.
+
+**SET semantics** — unlike `POST /snapshots` (which *adds* to existing values),
+this endpoint *replaces* only the supplied fields. Use it to correct a
+previously submitted snapshot.
+
+All fields are optional — only supplied fields are overwritten.
+Sending an empty body `{}` is idempotent.
+
+`profile_name` and `date` are **immutable** after creation and are not accepted.
+
+**Access:** HR and above.
+    """,
+)
+async def patch_snapshot(
+    snapshot_id: str,
+    body: UpworkSnapshotUpdate,
+    db:   Prisma = Depends(get_db),
+    _=Depends(HR_AND_ABOVE),
+):
+    return await update_snapshot(db, snapshot_id, body)
+
+
+@router.delete(
+    "/snapshots/{snapshot_id}",
+    status_code=200,
+    summary="Soft-delete a daily Upwork snapshot",
+    description="""
+**Soft-deletes** a snapshot by writing it to the trash registry.
+
+The database row is **not** removed — the record is excluded from all
+live calculations, `orderCount`, `snapshotCount`, and API responses
+until restored via `POST /restore-trash`.
+
+**Access:** CEO and Director only.
+    """,
+)
+async def delete_snapshot(
+    snapshot_id: str,
+    db: Prisma = Depends(get_db),
+    _=Depends(CEO_DIRECTOR),
+):
+    return await soft_delete_snapshot(db, snapshot_id)
+
+
 @router.get(
     "/profiles/{profile_id}/snapshots",
-    summary="All snapshots for one Upwork profile (period-aware, paginated)",
+    summary="All live snapshots for one Upwork profile (period-aware, paginated)",
     description="""
-Returns paginated daily snapshots for a single profile.
+Returns paginated **live** (non-deleted) daily snapshots for a single profile.
 
-Each snapshot row includes **`profileName`** so clients always have full
-context without a secondary profile lookup.
+Each snapshot row includes **`profileName`** so clients always have full context.
 
 Default: 50 snapshots per page, newest first.
     """,
@@ -326,27 +315,19 @@ async def profile_snapshots(
     description="""
 Logs an individual Upwork order and **automatically syncs** the daily snapshot.
 
-**`profile_name`** — the human-readable profile name (case-insensitive).
-The system resolves it to an internal profile record automatically.
-
-`afterUpwork` (net after 10 % service fee) is **computed server-side** —
-it is never accepted from the client.
+`afterUpwork` (net after 10 % service fee) is **computed server-side**.
 
 ### Automatic snapshot sync
+After the order row is persisted:
+- `workInProgress` and `activeAmount` on the matching snapshot are incremented by `amount`.
+- If no snapshot exists yet for that date one is **upserted automatically**.
 
-After the order row is persisted the system **additively updates** the snapshot
-for `(profileName, date)`:
+### Dynamic orderCount
+`orderCount` in all profile responses is **live-computed** and updates immediately.
 
-- `workInProgress` and `activeAmount` on the matching snapshot are each
-  incremented by `amount` (they are the same DB column).
-- If no snapshot exists yet for that date one is **upserted automatically**
-  with the order amount seeding both fields.
+All fields are optional — supply only what you need.
 
-No extra API call is needed — the platform stays fully in-sync in a single request.
-
-The response includes a **`snapshotSync`** summary (date, updated
-`workInProgress` / `activeAmount`) and a **`syncedTotals`** block
-(`revenueAllTime`, `activeAmountAllTime`) for immediate dashboard display.
+**Access:** HR and above.
     """,
 )
 async def add_order_entry(
@@ -369,7 +350,7 @@ All fields are optional — only supplied fields are changed:
 |---|---|
 | `date` | Changes the order date. |
 | `client_name` | Updates the client display name. |
-| `order_id` | Renames the Upwork contract/order ID; uniqueness enforced (409 on conflict). |
+| `order_id` | Renames the contract ID; uniqueness enforced (409 on conflict). |
 | `amount` | Updates gross amount **and** auto-recomputes `afterUpwork` (×0.90). |
 
 `afterUpwork` is **always server-computed** — never accepted from the client.
@@ -390,8 +371,8 @@ async def patch_order(
 
 @router.get(
     "/profiles/{profile_id}/orders",
-    summary="All orders for one Upwork profile (period-aware, paginated)",
-    description="Returns paginated orders. Default: 50 orders per page, newest first.",
+    summary="All live orders for one Upwork profile (period-aware, paginated)",
+    description="Returns paginated **live** (non-deleted) orders. Default: 50 per page, newest first.",
 )
 async def profile_orders(
     profile_id: str,
@@ -406,6 +387,61 @@ async def profile_orders(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Trash & Restore
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/trash",
+    summary="Get all soft-deleted Upwork records",
+    description="""
+Returns all soft-deleted Upwork records from the persistent trash registry,
+sorted **newest-deleted-first**.
+
+Use `?type=` to filter by record type:
+- `profile`  — deleted profiles
+- `snapshot` — deleted daily snapshots
+- `order`    — deleted orders
+
+Each item includes a full `snapshot` dict of the record at deletion time.
+
+**Access:** CEO and Director only.
+    """,
+)
+async def upwork_trash(
+    type: Annotated[
+        Optional[str],
+        Query(description="Filter by record type: profile | snapshot | order"),
+    ] = None,
+    _=Depends(CEO_DIRECTOR),
+):
+    return await get_trash(record_type=type)
+
+
+@router.post(
+    "/restore-trash",
+    summary="Restore soft-deleted Upwork records by ID",
+    description="""
+Restores one or more soft-deleted Upwork records from the trash registry.
+
+- **Profiles** — `isActive` is set back to `true` in the database.
+- **Snapshots** / **Orders** — the database rows were never removed; they are
+  simply removed from the trash registry and immediately re-appear in all live
+  calculations, `orderCount`, and API responses.
+
+Returns lists of successfully `restored` IDs and `failed` IDs.
+
+**Access:** CEO and Director only.
+    """,
+)
+async def upwork_restore_trash(
+    body: UpworkRestoreRequest,
+    db:   Prisma = Depends(get_db),
+    _=Depends(CEO_DIRECTOR),
+):
+    return await restore_trash(db, body.ids)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Export
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -415,9 +451,6 @@ async def profile_orders(
     description="""
 Downloads a multi-sheet Excel workbook covering **all active Upwork profiles**
 for the selected period.
-
-Supports the same `period` / `from` / `to` / `year` / `month` / `export_date`
-query parameters as all other endpoints.
 
 **Access:** CEO and Director only.
     """,
@@ -436,10 +469,8 @@ async def export_all_profiles(
     summary="Export a single Upwork profile to Excel (period-aware)",
     description="""
 Downloads a two-sheet Excel workbook for **one profile**:
-- **Sheet 1** — Daily Snapshots (all fields + After Fee column + Active Amount column)
-- **Sheet 2** — Orders (date, client, orderId, amount, afterUpwork)
-
-Supports the same period query parameters as all other endpoints.
+- **Sheet 1** — Daily Snapshots
+- **Sheet 2** — Orders
 
 **Access:** CEO and Director only.
     """,
