@@ -496,13 +496,13 @@ async def export_cards(
         values = [
             _fmt(card.date),
             _fmt(card.serialNo),
-            _fmt(card_name),               # via account relation → "Card Name" column
+            _fmt(card_name),              
             _fmt(card.cardVendor),
             _fmt(card.cardExpire),
             float(card.cardLimit),
             float(card.cardPaymentReceive),
             _fmt(card.cardReceiveBank),
-            len(details_list),             # screenshot count — not raw URLs
+            len(details_list),           
             _fmt(card.details),
             _fmt(card.mailDetails),
         ]
@@ -524,7 +524,7 @@ async def export_cards(
 def _build_where(
     date_filter:  Optional[dict],
     serial_no:    Optional[str],
-    account_name: Optional[str],   # filters via the account relation
+    account_name: Optional[str],   
 ) -> dict:
     """Build the Prisma ``where`` clause from the supplied filter arguments."""
     where: dict = {}

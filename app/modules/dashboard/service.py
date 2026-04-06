@@ -5,15 +5,15 @@ Enterprise Dashboard — full KPI summary with per-module drill-down and
 time-period filtering (DAILY | WEEKLY | MONTHLY | YEARLY).
 
 Modules covered:
-  ✅ Fiverr Profiles      — availableWithdraw, notCleared, activeOrders, activeOrderAmount
-  ✅ Upwork Profiles      — availableWithdraw, pending, inReview, workInProgress
-  ✅ Outside Orders       — orderAmount, receiveAmount, dueAmount (by status)
-  ✅ Card Sharing         — cardLimit, cardPaymentReceive
-  ✅ Payoneer             — balance (last remainingBalance per account)
-  ✅ PMAK                 — balance + inhouse totals
-  ✅ Dollar Exchange      — totalBdt exchanged, DUE vs RECEIVED
-  ✅ HR Expense           — totalDebits, totalCredits, totalRemainingBalance
-  ✅ Inventory            — total item count, total value
+  Fiverr Profiles      — availableWithdraw, notCleared, activeOrders, activeOrderAmount
+  Upwork Profiles      — availableWithdraw, pending, inReview, workInProgress
+  Outside Orders       — orderAmount, receiveAmount, dueAmount (by status)
+  Card Sharing         — cardLimit, cardPaymentReceive
+  Payoneer             — balance (last remainingBalance per account, always global-latest)
+  PMAK                 — balance + inhouse totals
+  Dollar Exchange      — totalBdt exchanged, DUE vs RECEIVED
+  HR Expense           — totalDebits, totalCredits, totalRemainingBalance
+  Inventory            — total item count, total value
 """
 from __future__ import annotations
 
@@ -395,28 +395,55 @@ async def _payoneer_summary(
     date_filter: dict,
 ) -> dict[str, Any]:
     """
-    Balance = the most recent remainingBalance per account.
-    Within a date window we take the last entry in that window;
-    for 'all' we take the latest overall.
+    Balance = the **global** latest remainingBalance per account (not
+    period-filtered), matching exactly what GET /api/v1/payoneer/accounts
+    returns as ``totalBalance``.
+
+    ### Why balance ignores the date filter
+    ``remainingBalance`` is a running ledger balance, not a periodic metric.
+    Filtering it by date would return the balance at the end of that window,
+    not the true current balance — causing the dashboard KPI to diverge from
+    the dedicated Payoneer accounts endpoint.  The correct approach (used here
+    and in the accounts endpoint) is always to take the single most recent
+    transaction row per account, regardless of the selected period.
+
+    Period-scoped transaction stats (count, credit, debit) are computed
+    separately using ``date_filter`` and surfaced alongside the balance so
+    callers have both current state and period activity in one payload.
     """
     accounts = await db.payoneeraccount.find_many(
         where={"isActive": True},
         include={
+            # ── Balance: always global latest — date filter intentionally omitted ──
             "transactions": {
-                "where": date_filter if date_filter else {},
                 "order_by": {"date": "desc"},
                 "take": 1,
             },
         },
     )
 
+    # ── Period-scoped transaction aggregates (credit / debit / count) ────────
+    # Fetched in a single extra query rather than per-account to stay O(1) DB
+    # round-trips.  Only executed when a date filter is active; for period='all'
+    # this is a no-op (date_filter == {}) and the query covers the full table.
+    period_tx = await db.payoneertransaction.find_many(
+        where={
+            "account": {"isActive": True},
+            **date_filter,
+        },
+    )
+    period_credit = sum(_d(tx.credit) for tx in period_tx)
+    period_debit  = sum(_d(tx.debit)  for tx in period_tx)
+
     account_list  = []
     total_balance = _ZERO
 
     for a in accounts:
+        # Always the true current balance — latest transaction across all time
         latest_tx = a.transactions[0] if a.transactions else None
         balance   = _d(latest_tx.remainingBalance) if latest_tx else _ZERO
         total_balance += balance
+
         account_list.append({
             "accountId":   a.id,
             "accountName": a.accountName,
@@ -426,8 +453,13 @@ async def _payoneer_summary(
 
     return {
         "totals": {
-            "totalBalance": float(total_balance),
-            "accountCount": len(accounts),
+            # Current balance — always global latest, consistent with /payoneer/accounts
+            "totalBalance":        float(total_balance),
+            "accountCount":        len(accounts),
+            # Period-scoped activity (informational; does not affect balance KPI)
+            "periodTotalCredit":   float(period_credit),
+            "periodTotalDebit":    float(period_debit),
+            "periodTransactions":  len(period_tx),
         },
         "accounts": account_list,
     }
@@ -597,15 +629,16 @@ async def get_dashboard_summary(
     from_date_str: explicit range start (ISO date) — overrides period
     to_date_str  : explicit range end   (ISO date) — overrides period
 
-    ### totalActiveOrders — KPI derivation (v3)
-    ``totalActiveOrders = fiverr.totals.activeOrders      ← live order count (v3 fix)
-                        + upwork.totals.orderCount         ← live order count (unchanged)
-                        + outsideOrders.totals.orderCount  ← live order count (unchanged)``
+    ### KPI derivations
+    totalActiveOrders  = fiverr.totals.activeOrders      ← live order count (v3 fix)
+                       + upwork.totals.orderCount         ← live order count (unchanged)
+                       + outsideOrders.totals.orderCount  ← live order count (unchanged)
 
-    Because ``fiverr.totals.activeOrders`` is now derived from actual
-    ``FiverrOrder`` rows (not the snapshot field), this KPI is automatically
-    correct and reactive to every order create / soft-delete / profile
-    soft-delete operation.
+    hrExpenseTotal     = hrExpense.totals.totalDebits     ← FIX: was totalRemainingBalance
+
+    payoneerBalance    = payoneer.totals.totalBalance     ← FIX: now always global-latest
+                                                             remainingBalance per account,
+                                                             matching /payoneer/accounts
     """
     ref_date  = _parse_date(ref_date_str)
     from_date = _parse_date(from_date_str) if from_date_str else None
@@ -650,7 +683,7 @@ async def get_dashboard_summary(
 
     # ── Cross-module KPI roll-ups ─────────────────────────────────────────────
 
-    # FIX 1 ─ totalRevenue = Fiverr.revenueInPeriod + Upwork.revenueInPeriod
+    # totalRevenue = Fiverr.revenueInPeriod + Upwork.revenueInPeriod
     #                        + Payoneer.totalBalance
     total_revenue = (
         fiverr["totals"]["revenueInPeriod"]
@@ -658,7 +691,7 @@ async def get_dashboard_summary(
         + payoneer["totals"]["totalBalance"]
     )
 
-    # FIX 2 ─ totalAvailableWithdraw = (Fiverr.aw + Upwork.aw)
+    # totalAvailableWithdraw = (Fiverr.aw + Upwork.aw)
     #                                  - (Fiverr.withdrawn + Upwork.withdrawn)
     total_available_withdraw = (
         fiverr["totals"]["availableWithdraw"]
@@ -667,14 +700,14 @@ async def get_dashboard_summary(
         - upwork["totals"]["totalWithdrawn"]
     )
 
-    # FIX 3 ─ totalNotCleared = Fiverr.notCleared + Upwork.pending + Upwork.inReview
+    # totalNotCleared = Fiverr.notCleared + Upwork.pending + Upwork.inReview
     total_not_cleared = (
         fiverr["totals"]["notCleared"]
         + upwork["totals"]["pending"]
         + upwork["totals"]["inReview"]
     )
 
-    # FIX 4 ─ totalActiveOrders = Fiverr.activeOrders  ← NOW live order count (v3)
+    # totalActiveOrders = Fiverr.activeOrders  ← NOW live order count (v3)
     #                             + Upwork.orderCount   ← already live order count
     #                             + OutsideOrders.orderCount
     # No formula change needed here — fixing _fiverr_summary upstream is sufficient.
@@ -684,7 +717,7 @@ async def get_dashboard_summary(
         + outside["totals"]["orderCount"]
     )
 
-    # FIX 5 ─ dollarExchangeTotal = totalBdt  (BDT amount, not USD exchanged)
+    # dollarExchangeTotal = totalBdt  (BDT amount, not USD exchanged)
     dollar_exchange_total = dollar["totals"]["totalBdt"]
 
     # NEW KPI 1 ─ totalOutsideOrderAmount = orderAmount - receiveAmount (unpaid portion)
@@ -706,14 +739,15 @@ async def get_dashboard_summary(
         "filter":  filter_meta,
         "kpis": {
             # ── Existing KPIs (corrected formulas) ───────────────────────────
-            "totalRevenue":            round(total_revenue, 2),            # FIX 1
-            "totalAvailableWithdraw":  round(total_available_withdraw, 2), # FIX 2
-            "totalNotCleared":         round(total_not_cleared, 2),        # FIX 3
-            "totalActiveOrders":       total_active_orders,                 # FIX 4 (v3: live)
+            "totalRevenue":            round(total_revenue, 2),            
+            "totalAvailableWithdraw":  round(total_available_withdraw, 2), 
+            "totalNotCleared":         round(total_not_cleared, 2),        
+            "totalActiveOrders":       total_active_orders,                 
             "payoneerBalance":         payoneer["totals"]["totalBalance"],
             "pmakBalance":             pmak["totals"]["totalBalance"],
-            "dollarExchangeTotal":     dollar_exchange_total,               # FIX 5
-            "hrExpenseTotal":          hr["totals"]["totalRemainingBalance"],
+            "dollarExchangeTotal":     dollar_exchange_total,               
+            "hrExpenseTotal":          hr["totals"]["totalDebits"],
+
             # ── New KPIs ─────────────────────────────────────────────────────
             "totalOutsideOrderAmount": round(total_outside_order_amount, 2),
             "totalActiveOrderAmount":  round(total_active_order_amount, 2),
