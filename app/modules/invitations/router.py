@@ -4,12 +4,13 @@ app/modules/invitations/router.py
 Invitation-based user onboarding — replaces the old temp-password user creation.
 
 Endpoints:
-  POST   /api/v1/users/invitations              → Send invitation email     [CEO only]
-  GET    /api/v1/users/invitations              → List invitations          [CEO only]
-  POST   /api/v1/users/invitations/{id}/resend → Resend invitation email   [CEO only]
-  DELETE /api/v1/users/invitations/{id}         → Cancel invitation         [CEO only]
-  GET    /api/v1/users/invitations/accept-form  → HTML acceptance page      [PUBLIC]
-  POST   /api/v1/users/invitations/accept       → Create account from token [PUBLIC]
+  POST   /api/v1/users/invitations                        → Send invitation email          [CEO only]
+  GET    /api/v1/users/invitations                        → List invitations               [CEO only]
+  POST   /api/v1/users/invitations/{id}/resend            → Resend invitation email        [CEO only]
+  DELETE /api/v1/users/invitations/{id}                   → Cancel pending invitation      [CEO only]
+  DELETE /api/v1/users/invitations/{id}/accepted          → Hard-delete accepted record    [CEO only]
+  GET    /api/v1/users/invitations/accept-form            → HTML acceptance page           [PUBLIC]
+  POST   /api/v1/users/invitations/accept                 → Create account from token      [PUBLIC]
 
 Mounted under the /users router so all invitation management lives at /api/v1/users/...
 """
@@ -27,6 +28,7 @@ from .service import (
     accept_invitation,
     cancel_invitation,
     create_invitation,
+    delete_accepted_invitation,
     list_invitations,
     resend_invitation,
 )
@@ -95,6 +97,27 @@ async def cancel(
     return await cancel_invitation(db, invitation_id)
 
 
+@router.delete(
+    "/{invitation_id}/accepted",
+    status_code=200,
+    summary="Permanently delete an accepted invitation record",
+)
+async def delete_accepted(
+    invitation_id: str,
+    db: Prisma = Depends(get_db),
+    _: User    = Depends(CEO_ONLY),
+):
+    """
+    Hard-deletes an **ACCEPTED** invitation from the database.
+
+    - Only ACCEPTED invitations qualify — use `DELETE /{id}` to cancel PENDING ones.
+    - The linked user account is **not** affected; only the invitation audit record is removed.
+    - Irreversible — use only when the record is no longer needed for auditing.
+    - CEO only.
+    """
+    return await delete_accepted_invitation(db, invitation_id)
+
+
 # ── Public endpoints — no auth ────────────────────────────────────────────────
 
 @router.get(
@@ -114,7 +137,7 @@ async def accept_form(
     """
     base_url  = str(request.base_url).rstrip("/")
     accept_api = f"{base_url}/api/v1/users/invitations/accept"
-    login_url  = f"{base_url}/docs"   # swap to frontend login URL when available
+    login_url  = f"https://finflow.maktechgroup.com/sign-in"  
 
     html = f"""<!DOCTYPE html>
 <html lang="en">

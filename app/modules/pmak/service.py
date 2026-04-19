@@ -1,19 +1,7 @@
 """
 app/modules/pmak/service.py
 ════════════════════════════════════════════════════════════════════════════════
-v5 — Enterprise Edition
-
-Changes vs v4.3
-───────────────
-update_account()     ADDED — PATCH /accounts/{id}: rename with uniqueness check.
-update_transaction() ADDED — PATCH /transactions/{id}: partial update any field.
-add_inhouse          ALIAS → create_inhouse_deal
-update_inhouse       ALIAS → update_inhouse_deal
-delete_inhouse       ALIAS → delete_inhouse_deal
-get_all_inhouse      ALIAS → list_all_inhouse_deals
-get_account_inhouse  ALIAS → get_account_inhouse_deals
-
-All existing functions are unchanged.
+v6.3 — Enterprise Edition
 ════════════════════════════════════════════════════════════════════════════════
 """
 import io
@@ -33,6 +21,7 @@ from app.shared.pagination import PageParams
 from .schema import (
     PmakAccountCreate,
     PmakInhouseCreate,
+    PmakInhouseFullUpdate,
     PmakInhouseStatusUpdate,
     PmakTransactionCreate,
     PmakTransactionStatusUpdate,
@@ -127,9 +116,6 @@ async def list_accounts(
 ):
     """
     Combined totals + paginated per-account breakdown.
-
-    v4.2: Removed `order` from nested includes (not supported by prisma-client-py).
-          Eliminated N+1 query for balance lookups.
     """
     date_filter = filters.to_prisma_filter()
 
@@ -159,17 +145,33 @@ async def list_accounts(
         },
     )
 
-    # N+1 FIX: single query for latest balance across all accounts on page
+    # ── Latest stored balance per account (single query, no N+1) ─────────────
+    # Order by createdAt DESC — date is @db.Date (day-level only) and cannot
+    # break ties between same-day transactions. createdAt is a full-precision
+    # timestamp that always identifies the true latest row per account.
     account_ids = [a.id for a in accounts]
     latest_balance_map: dict[str, float] = {}
     if account_ids:
         all_latest = await db.pmaktransaction.find_many(
             where={"accountId": {"in": account_ids}},
-            order={"date": "desc"},
+            order={"createdAt": "desc"},
         )
         for txn in all_latest:
             if txn.accountId not in latest_balance_map:
                 latest_balance_map[txn.accountId] = float(txn.remainingBalance)
+
+    # ── All-time inhouse order totals per account (single query, no N+1) ─────
+    # Not period-scoped — we want the lifetime deal volume per account for the
+    # accounts table column (totalInhouseOrderAmount).
+    all_time_inhouse_map: dict[str, float] = {}
+    if account_ids:
+        all_inhouse = await db.pmakinhouse.find_many(
+            where={"accountId": {"in": account_ids}},
+        )
+        for deal in all_inhouse:
+            all_time_inhouse_map[deal.accountId] = (
+                all_time_inhouse_map.get(deal.accountId, 0.0) + float(deal.orderAmount)
+            )
 
     combined_balance      = 0.0
     combined_credit       = 0.0
@@ -184,11 +186,18 @@ async def list_accounts(
         txns  = sorted(acct.transactions or [], key=lambda t: t.createdAt, reverse=True)
         deals = sorted(acct.inhouseDeals or [], key=lambda d: d.createdAt, reverse=True)
 
-        current_balance   = latest_balance_map.get(acct.id, 0.0)
-        period_credit     = sum(float(t.credit)      for t in txns)
-        period_debit      = sum(float(t.debit)       for t in txns)
-        inhouse_by_status = _build_inhouse_by_status(deals)
-        inhouse_total_amt = sum(float(d.orderAmount) for d in deals)
+        # currentBalance = remainingBalance of the most recent transaction.
+        # That stored value already IS the running total (computed at write-time as
+        # previous_balance − debit + credit). Adding period figures again would
+        # double-count them. Zero is the correct default when no transactions exist.
+        latest_stored_balance = latest_balance_map.get(acct.id, 0.0)
+        period_credit         = sum(float(t.credit) for t in txns)
+        period_debit          = sum(float(t.debit)  for t in txns)
+        current_balance       = round(latest_stored_balance, 2)
+
+        inhouse_by_status        = _build_inhouse_by_status(deals)
+        inhouse_total_amt        = sum(float(d.orderAmount) for d in deals)
+        total_inhouse_order_amt  = round(all_time_inhouse_map.get(acct.id, 0.0), 2)
 
         combined_balance      += current_balance
         combined_credit       += period_credit
@@ -202,15 +211,16 @@ async def list_accounts(
             combined_by_status[status_key]["totalAmount"] += v["totalAmount"]
 
         account_summaries.append({
-            "id":               acct.id,
-            "accountName":      acct.accountName,
-            "isActive":         acct.isActive,
-            "currentBalance":   current_balance,
-            "periodCredit":     period_credit,
-            "periodDebit":      period_debit,
-            "transactionCount": len(txns),
-            "inhouseCount":     len(deals),
-            "inhouseByStatus":  inhouse_by_status,
+            "id":                      acct.id,
+            "accountName":             acct.accountName,
+            "isActive":                acct.isActive,
+            "currentBalance":          current_balance,
+            "periodCredit":            period_credit,
+            "periodDebit":             period_debit,
+            "transactionCount":        len(txns),
+            "inhouseCount":            len(deals),
+            "totalInhouseOrderAmount": total_inhouse_order_amt,   # ← NEW
+            "inhouseByStatus":         inhouse_by_status,
             "recentTransactions": [_serialize_txn(t, acct.accountName) for t in txns[:5]],
             "recentInhouse":      [_serialize_inhouse(d, acct.accountName) for d in deals[:5]],
         })
@@ -220,7 +230,7 @@ async def list_accounts(
     return {
         "filter": filters.meta(),
         "totals": {
-            "totalBalance":       combined_balance,
+            "totalBalance":       round(combined_balance, 2),
             "totalCredit":        combined_credit,
             "totalDebit":         combined_debit,
             "totalTransactions":  combined_transactions,
@@ -244,6 +254,28 @@ async def list_accounts(
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def add_transaction(db: Prisma, data: PmakTransactionCreate):
+    """
+    POST /transactions — Add a ledger entry.
+
+    remainingBalance is auto-computed server-side:
+      latest_balance − debit + credit
+
+    The latest balance is resolved by ordering on (createdAt DESC) so that
+    same-day transactions are always sequenced correctly — `date` is a
+    @db.Date (day-level precision) and cannot break ties on its own.
+
+    [FIX-C] The caller may pass `remaining_balance` explicitly to override the
+    auto-computed value (e.g. for manual balance corrections), BUT only a
+    non-zero, non-None value is treated as a deliberate override.  A value of
+    exactly 0 is interpreted as "not provided" — this prevents tools like
+    Swagger UI from accidentally short-circuiting the auto-computation when
+    they echo back the field's numeric default (0) in the request body.
+
+    Three-layer defence ensures the response always matches the DB:
+      1. computed_balance written to the DB via create()
+      2. Transaction re-fetched via find_unique() after create()
+      3. computed_balance injected directly into the response dict
+    """
     account = await db.pmakaccount.find_first(
         where={
             "accountName": {"equals": data.account_name, "mode": "insensitive"},
@@ -256,6 +288,29 @@ async def add_transaction(db: Prisma, data: PmakTransactionCreate):
             detail=f"Active PMAK account '{data.account_name}' not found",
         )
 
+    # ── Resolve the latest stored balance (createdAt tiebreaker) ─────────────
+    # `date` is @db.Date — day-level only. Multiple transactions on the same
+    # calendar day would be indistinguishable without the createdAt tiebreaker.
+    latest_txn = await db.pmaktransaction.find_first(
+        where={"accountId": account.id},
+        order={"createdAt": "desc"},
+    )
+    latest_balance = float(latest_txn.remainingBalance) if latest_txn else 0.0
+
+    # ── Compute remainingBalance; honour caller override only when non-zero ───
+    caller_override = (
+        data.remaining_balance is not None
+        and data.remaining_balance != Decimal("0")
+    )
+
+    if caller_override:
+        computed_balance = Decimal(str(data.remaining_balance))
+    else:
+        computed_balance = Decimal(str(round(
+            latest_balance - float(data.debit) + float(data.credit), 2
+        )))
+
+    # ── Persist ───────────────────────────────────────────────────────────────
     txn = await db.pmaktransaction.create(
         data={
             "date":             _to_dt(data.date),
@@ -264,12 +319,24 @@ async def add_transaction(db: Prisma, data: PmakTransactionCreate):
             "accountTo":        data.accountTo,
             "debit":            data.debit,
             "credit":           data.credit,
-            "remainingBalance": data.remaining_balance,
+            "remainingBalance": computed_balance,
             "status":           data.status.value,
             "account":          {"connect": {"id": account.id}},
         },
     )
-    return _serialize_txn(txn, account.accountName)
+
+    # ── Re-fetch to get the exact persisted DB state (belt-and-suspenders) ───
+    # Prisma's create() return object can have ORM-coercion artefacts on Decimal
+    # fields.  A find_unique() immediately after the write guarantees we read
+    # exactly what was committed to the database.
+    persisted_txn = await db.pmaktransaction.find_unique(where={"id": txn.id})
+
+    # ── Serialise; inject computed_balance as the authoritative balance ───────
+    # Three-layer defence: DB write (computed_balance) → re-fetch → override.
+    # The override is the final safety net in case of any ORM round-trip delta.
+    response = _serialize_txn(persisted_txn, account.accountName)
+    response["remainingBalance"] = computed_balance
+    return response
 
 
 async def get_account_transactions(
@@ -297,13 +364,20 @@ async def get_account_transactions(
         take=take,
     )
 
+    # Dynamic balance — same formula as list_accounts [FIX-1]
+    # Order by createdAt DESC (not date DESC) to correctly resolve the latest
+    # row when multiple transactions share the same calendar day.
     latest = await db.pmaktransaction.find_first(
         where={"accountId": account_id},
-        order={"date": "desc"},
+        order={"createdAt": "desc"},
     )
-    current_balance = float(latest.remainingBalance) if latest else 0.0
+    # currentBalance = remainingBalance of the most recent transaction.
+    # That stored value was written as: previous_balance − debit + credit, so it
+    # already IS the full running total. Re-applying period figures would double-count.
+    latest_stored   = float(latest.remainingBalance) if latest else 0.0
     period_credit   = sum(float(t.credit) for t in txns)
     period_debit    = sum(float(t.debit)  for t in txns)
+    current_balance = round(latest_stored, 2)
 
     return {
         "account":        {"id": account.id, "accountName": account.accountName, "isActive": account.isActive},
@@ -424,7 +498,7 @@ async def get_account_inhouse_deals(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Inhouse Deals — ALL accounts (NEW endpoint: GET /pmak/inhouse)
+# Inhouse Deals — ALL accounts (GET /pmak/inhouse)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def list_all_inhouse_deals(
@@ -454,7 +528,6 @@ async def list_all_inhouse_deals(
     """
     date_filter = filters.to_prisma_filter()
 
-    # ── Build WHERE clause ────────────────────────────────────────────────────
     where: dict = {}
 
     if date_filter:
@@ -467,7 +540,6 @@ async def list_all_inhouse_deals(
         where["sellerName"] = {"contains": seller_name, "mode": "insensitive"}
 
     if order_status:
-        # Validate against known enum values — return 400 for garbage input
         valid = {"PENDING", "IN_PROGRESS", "COMPLETED", "CANCELLED"}
         normalised = order_status.upper()
         if normalised not in valid:
@@ -478,16 +550,13 @@ async def list_all_inhouse_deals(
             )
         where["orderStatus"] = normalised
 
-    # Always scope to active accounts; optionally filter by name
     account_filter: dict = {"isActive": True}
     if account_name:
         account_filter["accountName"] = {"contains": account_name, "mode": "insensitive"}
     where["account"] = {"is": account_filter}
 
-    # ── Count for pagination ──────────────────────────────────────────────────
     total = await db.pmakinhouse.count(where=where)
 
-    # ── Paginated fetch ───────────────────────────────────────────────────────
     deals = await db.pmakinhouse.find_many(
         where=where,
         order={"date": "desc"},
@@ -496,10 +565,6 @@ async def list_all_inhouse_deals(
         include={"account": True},
     )
 
-    # ── Totals: fetch all matching deals (no pagination) for accurate sums ────
-    # We only need orderAmount + orderStatus — a lightweight projection.
-    # prisma-client-py doesn't support select projections on find_many for
-    # related models, but the fields are small scalars so this is efficient.
     all_for_totals = await db.pmakinhouse.find_many(where=where)
 
     total_amount       = sum(float(d.orderAmount) for d in all_for_totals)
@@ -530,26 +595,73 @@ async def list_all_inhouse_deals(
 async def update_inhouse_deal(
     db:      Prisma,
     deal_id: str,
-    data:    PmakInhouseStatusUpdate,
+    data:    PmakInhouseFullUpdate,
 ):
-    deal = await db.pmakinhouse.find_unique(where={"id": deal_id})
+    """
+    PATCH /inhouse/{deal_id} — Full optional-field update.
+
+    [FIX-3] All seven inhouse fields are now individually patchable.
+    If account_name is supplied the deal is re-linked to the new account.
+    Sending an empty body {} is idempotent — returns current state unchanged.
+    """
+    deal = await db.pmakinhouse.find_unique(
+        where={"id": deal_id},
+        include={"account": True},
+    )
     if not deal:
         raise HTTPException(status_code=404, detail="Inhouse deal not found")
 
     update_data: dict = {}
-    if data.order_status is not None:
-        update_data["orderStatus"] = data.order_status.value
+
+    # Re-assign to a different account if requested
+    new_account = None
+    if data.account_name is not None:
+        new_account = await db.pmakaccount.find_first(
+            where={
+                "accountName": {"equals": data.account_name, "mode": "insensitive"},
+                "isActive":    True,
+            }
+        )
+        if not new_account:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Active PMAK account '{data.account_name}' not found",
+            )
+        update_data["account"] = {"connect": {"id": new_account.id}}
+
+    if data.date is not None:
+        update_data["date"] = _to_dt(data.date)
     if data.details is not None:
         update_data["details"] = data.details
+    if data.buyer_name is not None:
+        update_data["buyerName"] = data.buyer_name
+    if data.seller_name is not None:
+        update_data["sellerName"] = data.seller_name
+    if data.order_amount is not None:
+        update_data["orderAmount"] = data.order_amount
+    if data.order_status is not None:
+        update_data["orderStatus"] = data.order_status.value
+
+    # Idempotent — return current state if nothing changed
     if not update_data:
-        raise HTTPException(status_code=400, detail="No fields to update")
+        account_name = deal.account.accountName if deal.account else ""
+        return _serialize_inhouse(deal, account_name)
 
     updated = await db.pmakinhouse.update(
         where={"id": deal_id},
         data=update_data,
     )
-    account = await db.pmakaccount.find_unique(where={"id": updated.accountId})
-    return _serialize_inhouse(updated, account.accountName if account else "")
+
+    # Resolve account name for serialisation
+    if new_account:
+        resolved_account_name = new_account.accountName
+    elif deal.account:
+        resolved_account_name = deal.account.accountName
+    else:
+        acct = await db.pmakaccount.find_unique(where={"id": updated.accountId})
+        resolved_account_name = acct.accountName if acct else ""
+
+    return _serialize_inhouse(updated, resolved_account_name)
 
 
 async def delete_inhouse_deal(db: Prisma, deal_id: str):
@@ -695,18 +807,14 @@ def _serialize_inhouse(deal, account_name: str) -> dict:
         "updatedAt":   deal.updatedAt,
     }
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# v5 additions — functions required by pmak/router.py v5
+# v5 additions — PATCH /accounts/{account_id}  &  PATCH /transactions/{id}
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def update_account(db: Prisma, account_id: str, data: PmakAccountCreate):
     """
     PATCH /accounts/{account_id} — rename or toggle isActive on a PMAK account.
-
-    Accepts PmakAccountCreate (accountName only) — the same schema already used
-    by the router's patch_account handler.  Only accountName is written; the
-    field is optional in practice because the router passes the parsed body.
-
     Raises 404 if the account does not exist.
     Raises 409 if the new name collides with an existing account.
     """
@@ -746,8 +854,21 @@ async def update_transaction(
     """
     PATCH /transactions/{transaction_id} — partial update of any transaction field.
 
-    Accepts PmakTransactionCreate; only fields explicitly set by the caller are
-    written (idempotent if body is empty relative to current values).
+    remainingBalance auto-recalculation when debit/credit changes.
+
+    If the caller updates `debit` and/or `credit` but does NOT supply an
+    explicit `remaining_balance` override, the service now automatically
+    recomputes the running balance using the reverse of the ledger formula:
+
+        balance_before_this_txn = old_remainingBalance + old_debit − old_credit
+        new_remainingBalance     = balance_before_this_txn − new_debit + new_credit
+
+    This guarantees the balance stored in the DB and returned in the response
+    always reflects the actual debit/credit values on the row, regardless of
+    whether the caller remembered to supply `remaining_balance`.
+
+    The caller may still pass `remaining_balance` explicitly (non-zero, non-None)
+    to force a manual correction — that value takes precedence.
 
     Raises 404 if the transaction does not exist.
     """
@@ -769,11 +890,50 @@ async def update_transaction(
         patch["debit"] = data.debit
     if data.credit is not None:
         patch["credit"] = data.credit
-    if data.remaining_balance is not None:
-        patch["remainingBalance"] = data.remaining_balance
+
+    # ── remainingBalance resolution (three-way priority) ─────────────────────
+    # Priority 1: explicit non-zero caller override → trust it as a correction
+    # Priority 2: debit or credit changed → auto-recompute from stored state
+    # Priority 3: neither → leave remainingBalance unchanged in the DB
+
+    computed_balance: Optional[Decimal] = None
+
+    caller_override = (
+        data.remaining_balance is not None
+        and data.remaining_balance != Decimal("0")
+    )
+
+    if caller_override:
+        # [Priority 1] Manual balance correction supplied by the caller.
+        computed_balance           = Decimal(str(data.remaining_balance))
+        patch["remainingBalance"]  = computed_balance
+
+    elif "debit" in patch or "credit" in patch:
+        # [Priority 2] Debit or credit changed — auto-derive the new balance.
+        #
+        # Reverse the stored formula to recover the balance BEFORE this entry:
+        #   stored formula:  remainingBalance = balance_before − debit + credit
+        #   reversed:        balance_before   = remainingBalance + debit − credit
+        #
+        # Then apply the updated values:
+        #   new_remainingBalance = balance_before − new_debit + new_credit
+        old_remaining   = float(txn.remainingBalance)
+        old_debit       = float(txn.debit)
+        old_credit      = float(txn.credit)
+        balance_before  = old_remaining + old_debit - old_credit
+
+        new_debit  = float(patch.get("debit",  txn.debit))
+        new_credit = float(patch.get("credit", txn.credit))
+
+        computed_balance           = Decimal(str(round(
+            balance_before - new_debit + new_credit, 2
+        )))
+        patch["remainingBalance"]  = computed_balance
+
     if data.status is not None:
         patch["status"] = data.status.value
 
+    # Idempotent — nothing changed
     if not patch:
         account = await db.pmakaccount.find_unique(where={"id": txn.accountId})
         return _serialize_txn(txn, account.accountName if account else "")
@@ -783,13 +943,22 @@ async def update_transaction(
         data=patch,
     )
     account = await db.pmakaccount.find_unique(where={"id": updated.accountId})
-    return _serialize_txn(updated, account.accountName if account else "")
+
+    response = _serialize_txn(updated, account.accountName if account else "")
+
+    # ── Inject computed balance into response (belt-and-suspenders) ───────────
+    # If we auto-computed or accepted a caller override, inject it directly so
+    # the response always reflects the exact value written to the DB, regardless
+    # of any ORM Decimal coercion in the update() return object.
+    if computed_balance is not None:
+        response["remainingBalance"] = computed_balance
+
+    return response
 
 
-# ── Name aliases — router v5 uses short names; service v4.3 used long names.
-# These one-liners keep both sides in sync without touching either file's logic.
-add_inhouse           = create_inhouse_deal
-update_inhouse        = update_inhouse_deal
-delete_inhouse        = delete_inhouse_deal
-get_all_inhouse       = list_all_inhouse_deals
-get_account_inhouse   = get_account_inhouse_deals
+# ── Name aliases — router uses short names; keep both sides in sync ───────────
+add_inhouse         = create_inhouse_deal
+update_inhouse      = update_inhouse_deal
+delete_inhouse      = delete_inhouse_deal
+get_all_inhouse     = list_all_inhouse_deals
+get_account_inhouse = get_account_inhouse_deals

@@ -1,7 +1,8 @@
 """
 app/modules/hr_expense/service.py
-========================================
-v3 — full PATCH support + GET totals
+════════════════════════════════════════════════════════════════════════════════
+v5 — Three-Layer Defence (mirrors pmak/service.py enterprise pattern)
+════════════════════════════════════════════════════════════════════════════════
 """
 from datetime import date as dt_date, datetime, time
 from decimal import Decimal
@@ -15,21 +16,23 @@ from .schema import HrExpenseCreate, HrExpenseListResponse, HrExpenseTotals, HrE
 _ZERO = Decimal("0")
 
 
-# ── Date helper ───────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _dt(d: dt_date) -> datetime:
     """
     Convert datetime.date → datetime.datetime at midnight.
 
     prisma-py v0.14.0 requires a full datetime object for every
-    DateTime @db.Date field — the same pattern used across the Fiverr
-    module: datetime.combine(d, time.min).
+    DateTime @db.Date field — the same pattern used across all modules:
+    datetime.combine(d, time.min).
     """
+    if isinstance(d, datetime):
+        return d
     return datetime.combine(d, time.min)
 
 
 def _d(v) -> Decimal:
-    """Safely coerce a Prisma Decimal/None to Python Decimal."""
+    """Safely coerce a Prisma Decimal / None → Python Decimal."""
     if v is None:
         return _ZERO
     return Decimal(str(v))
@@ -41,6 +44,29 @@ _FIELD_MAP: dict[str, str] = {
 }
 
 
+# ── Serialiser — mirrors PMAK's _serialize_txn() ─────────────────────────────
+
+def _serialize_expense(row) -> dict:
+    """
+    Serialise a HrExpense ORM row into a plain dict.
+    Using a dict (not the ORM object) lets us inject the authoritative
+    computed_balance in Layer 3 without fighting Pydantic / ORM coercions.
+    """
+    return {
+        "id":               row.id,
+        "date":             row.date.date() if hasattr(row.date, "date") else row.date,
+        "details":          row.details,
+        "accountFrom":      row.accountFrom,
+        "accountTo":        row.accountTo,
+        "debit":            _d(row.debit),
+        "credit":           _d(row.credit),
+        "remainingBalance": _d(row.remainingBalance),
+        "remarks":          row.remarks,
+        "createdAt":        row.createdAt,
+        "updatedAt":        row.updatedAt,
+    }
+
+
 # ── CRUD ──────────────────────────────────────────────────────────────────────
 
 async def list_expenses(db: Prisma, date_filter: dict) -> HrExpenseListResponse:
@@ -48,7 +74,7 @@ async def list_expenses(db: Prisma, date_filter: dict) -> HrExpenseListResponse:
     Fetch all HR expense records matching the date filter and compute
     aggregate totals in a single pass.
 
-    totalRemainingBalance = sum(remainingBalance) + totalCredits - totalDebits
+    totalRemainingBalance = sum(remainingBalance) + totalCredits − totalDebits
     This reflects the net effective balance after all movements in the window.
     """
     where: dict = {}
@@ -81,26 +107,74 @@ async def list_expenses(db: Prisma, date_filter: dict) -> HrExpenseListResponse:
 async def create_expense(db: Prisma, data: HrExpenseCreate):
     """
     Create an HR expense record.
-    All fields are optional — omitted fields fall back to safe defaults:
-      • date              → today
-      • details           → empty string
-      • debit / credit    → 0
-      • remaining_balance → 0
+
+    remainingBalance is auto-computed as:
+        prev_record.remainingBalance − debit + credit
+
+    where prev_record is the most-recent expense entry (ordered by createdAt desc).
+    If no prior records exist, the opening balance is treated as 0.
+
+    Caller may still override by explicitly supplying a non-zero remaining_balance
+    in the request body — the system will use that value as-is.
+
+    Three-layer defence (mirrors PMAK add_transaction):
+      Layer 1 — computed_balance written into .create()
+      Layer 2 — .find_unique() re-fetch immediately after write
+      Layer 3 — computed_balance injected into the response dict
+
+    Other optional fields:
+      • date    → today  (if omitted)
+      • details → ""     (if omitted)
+      • debit / credit → 0 (if omitted)
     """
     entry_date = data.date or dt_date.today()
+    debit_val  = _d(data.debit  or _ZERO)
+    credit_val = _d(data.credit or _ZERO)
 
-    return await db.hrexpense.create(
+    # ── Fetch previous record to continue the running balance ──────────────────
+    # Order by createdAt DESC — same-day entries are indistinguishable by date alone.
+    latest = await db.hrexpense.find_first(order={"createdAt": "desc"})
+    latest_balance = float(latest.remainingBalance) if latest else 0.0
+
+    # ── caller_override guard (mirrors PMAK add_transaction [FIX-C]) ──────────
+    # Only a non-None AND non-zero value is treated as a deliberate override.
+    # Decimal("0") == "not provided" — prevents Swagger UI echoing the numeric
+    # default from short-circuiting the auto-compute path.
+    caller_override = (
+        data.remaining_balance is not None
+        and data.remaining_balance != Decimal("0")
+    )
+
+    if caller_override:
+        # [Priority 1] Manual balance correction supplied by the caller.
+        computed_balance = Decimal(str(data.remaining_balance))
+    else:
+        # [Priority 2] Auto-compute: previous balance − debit + credit
+        computed_balance = Decimal(str(round(
+            latest_balance - float(debit_val) + float(credit_val), 2
+        )))
+
+    # ── Layer 1: persist with the correct computed_balance ────────────────────
+    created = await db.hrexpense.create(
         data={
             "date":             _dt(entry_date),
             "details":          data.details or "",
             "accountFrom":      data.accountFrom,
             "accountTo":        data.accountTo,
-            "debit":            float(data.debit  or _ZERO),
-            "credit":           float(data.credit or _ZERO),
-            "remainingBalance": float(data.remaining_balance or _ZERO),
+            "debit":            float(debit_val),
+            "credit":           float(credit_val),
+            "remainingBalance": float(computed_balance),
             "remarks":          data.remarks,
         }
     )
+
+    # ── Layer 2: re-fetch the exact DB-committed row ───────────────────────────
+    persisted = await db.hrexpense.find_unique(where={"id": created.id})
+
+    # ── Layer 3: serialise + inject authoritative balance ─────────────────────
+    response = _serialize_expense(persisted)
+    response["remainingBalance"] = computed_balance
+    return response
 
 
 async def update_expense(db: Prisma, expense_id: str, data: HrExpenseUpdate):
@@ -110,32 +184,94 @@ async def update_expense(db: Prisma, expense_id: str, data: HrExpenseUpdate):
     Supports patching: date, details, accountFrom, accountTo,
     debit, credit, remaining_balance, remarks.
     Only fields explicitly supplied in the request body are written.
+
+    remainingBalance resolution (three-way priority — mirrors PMAK update_transaction):
+      Priority 1 — explicit non-zero caller override  → trust it as a correction
+      Priority 2 — debit or credit changed            → auto-recompute from stored state
+      Priority 3 — neither                            → leave remainingBalance unchanged
+
+    Auto-recompute formula:
+        balance_before = existing.remainingBalance + existing.debit − existing.credit
+        new_remaining  = balance_before − new_debit + new_credit
+
+    Three-layer defence (mirrors PMAK update_transaction):
+      Layer 1 — computed_balance written into .update()
+      Layer 2 — .find_unique() re-fetch immediately after write
+      Layer 3 — computed_balance injected into the response dict
     """
     existing = await db.hrexpense.find_unique(where={"id": expense_id})
     if not existing:
         raise HTTPException(status_code=404, detail="Expense not found")
 
-    # Dump only the fields the caller actually provided
-    update_data = data.model_dump(exclude_none=True)
+    patch: dict = {}
 
-    if not update_data:
-        # Nothing to update — return the record as-is
-        return existing
+    # ── Build patch dict field-by-field (mirrors PMAK explicit field checks) ──
+    if data.date is not None:
+        patch["date"] = _dt(data.date)
+    if data.details is not None:
+        patch["details"] = data.details
+    if data.accountFrom is not None:
+        patch["accountFrom"] = data.accountFrom
+    if data.accountTo is not None:
+        patch["accountTo"] = data.accountTo
+    if data.debit is not None:
+        patch["debit"] = float(data.debit)
+    if data.credit is not None:
+        patch["credit"] = float(data.credit)
 
-    # Remap snake_case keys → Prisma camelCase field names
-    mapped: dict = {}
-    for k, v in update_data.items():
-        prisma_key = _FIELD_MAP.get(k, k)
+    # ── remainingBalance resolution (three-way priority) ─────────────────────
+    computed_balance: Optional[Decimal] = None
 
-        # date must be serialised to datetime for prisma-py
-        if prisma_key == "date":
-            mapped[prisma_key] = _dt(v)
-        elif prisma_key in ("debit", "credit", "remainingBalance"):
-            mapped[prisma_key] = float(v)
-        else:
-            mapped[prisma_key] = v
+    caller_override = (
+        data.remaining_balance is not None
+        and data.remaining_balance != Decimal("0")
+    )
 
-    return await db.hrexpense.update(where={"id": expense_id}, data=mapped)
+    if caller_override:
+        # [Priority 1] Manual balance correction supplied by the caller.
+        computed_balance          = Decimal(str(data.remaining_balance))
+        patch["remainingBalance"] = float(computed_balance)
+
+    elif "debit" in patch or "credit" in patch:
+        # [Priority 2] Debit or credit changed — auto-derive the new balance.
+        #
+        # Reverse the stored formula to recover the balance BEFORE this entry:
+        #   stored formula:  remainingBalance = balance_before − debit + credit
+        #   reversed:        balance_before   = remainingBalance + debit − credit
+        #
+        # Then apply the updated values:
+        #   new_remainingBalance = balance_before − new_debit + new_credit
+        balance_before = (
+            float(_d(existing.remainingBalance))
+            + float(_d(existing.debit))
+            - float(_d(existing.credit))
+        )
+        new_debit  = float(patch.get("debit",  float(_d(existing.debit))))
+        new_credit = float(patch.get("credit", float(_d(existing.credit))))
+
+        computed_balance          = Decimal(str(round(
+            balance_before - new_debit + new_credit, 2
+        )))
+        patch["remainingBalance"] = float(computed_balance)
+
+    if data.remarks is not None:
+        patch["remarks"] = data.remarks
+
+    # ── Idempotent: nothing changed ────────────────────────────────────────────
+    if not patch:
+        return _serialize_expense(existing)
+
+    # ── Layer 1: persist the patch (with correct remainingBalance) ────────────
+    await db.hrexpense.update(where={"id": expense_id}, data=patch)
+
+    # ── Layer 2: re-fetch the exact DB-committed row ───────────────────────────
+    persisted = await db.hrexpense.find_unique(where={"id": expense_id})
+
+    # ── Layer 3: serialise + inject authoritative balance ─────────────────────
+    response = _serialize_expense(persisted)
+    if computed_balance is not None:
+        response["remainingBalance"] = computed_balance
+    return response
 
 
 async def delete_expense(db: Prisma, expense_id: str) -> None:

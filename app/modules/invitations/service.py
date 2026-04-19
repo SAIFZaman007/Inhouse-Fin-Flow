@@ -244,6 +244,51 @@ async def cancel_invitation(
     return {"message": f"Invitation for '{invitation.email}' has been cancelled."}
 
 
+# ── Delete Accepted ───────────────────────────────────────────────────────────
+
+async def delete_accepted_invitation(
+    db: Prisma,
+    invitation_id: str,
+) -> dict:
+    """
+    Hard-deletes an ACCEPTED invitation record from the database.
+
+    Guards:
+      - 404 if the invitation does not exist.
+      - 400 if the invitation is NOT in ACCEPTED status (wrong endpoint).
+
+    The linked User account is intentionally untouched — the user continues
+    to exist independently. Only the invitation audit row is purged.
+    """
+    invitation = await db.invitation.find_unique(where={"id": invitation_id})
+    if not invitation:
+        raise HTTPException(status_code=404, detail="Invitation not found")
+    if invitation.status != "ACCEPTED":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Only ACCEPTED invitations can be deleted via this endpoint "
+                f"(current status: {invitation.status}). "
+                f"Use DELETE /{invitation_id} to cancel a PENDING invitation."
+            ),
+        )
+
+    await db.invitation.delete(where={"id": invitation_id})
+
+    logger.info(
+        "Accepted invitation hard-deleted: id=%s email=%s",
+        invitation_id,
+        invitation.email,
+    )
+
+    return {
+        "message": (
+            f"Accepted invitation record for '{invitation.email}' has been permanently deleted. "
+            f"The associated user account remains active."
+        )
+    }
+
+
 # ── List ──────────────────────────────────────────────────────────────────────
 
 async def list_invitations(

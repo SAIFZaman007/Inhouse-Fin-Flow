@@ -1,30 +1,7 @@
 """
 app/modules/pmak/router.py
 ════════════════════════════════════════════════════════════════════════════════
-v5 — Enterprise Edition
-
-Endpoint matrix
-───────────────────────────────────────────────────────────────────────────────
-GET    /accounts                      HR_AND_ABOVE   Combined totals + all accounts
-                                                     Period-aware. Paginated.
-POST   /accounts                      HR_AND_ABOVE   Create PMAK account
-PATCH  /accounts/{account_id}         ALL_ROLES      Rename / toggle isActive
-DELETE /accounts/{account_id}         CEO_DIRECTOR   Soft-delete — returns JSON message
-
-POST   /transactions                  ALL_ROLES      Add ledger transaction
-PATCH  /transactions/{id}             HR_AND_ABOVE   Full field update
-PATCH  /transactions/{id}/status      BDEV_AND_ABOVE Status-only update (BDev entry-point)
-GET    /accounts/{id}/transactions    HR_AND_ABOVE   Paginated transactions for one account
-DELETE /transactions/{id}             CEO_DIRECTOR   Hard delete — returns JSON message
-
-POST   /inhouse                       ALL_ROLES      Add inhouse deal
-PATCH  /inhouse/{deal_id}             ALL_ROLES      Partial update (status / details)
-GET    /inhouse                       HR_AND_ABOVE   All inhouse deals (period-aware, paginated)
-GET    /accounts/{id}/inhouse         HR_AND_ABOVE   Inhouse deals for one account
-DELETE /inhouse/{deal_id}             CEO_DIRECTOR   Hard delete — returns JSON message
-
-GET    /export                        CEO_DIRECTOR   All-accounts Excel (period-aware)
-GET    /export/{account_id}           CEO_DIRECTOR   Single-account Excel (period-aware)
+v6.0 — Enterprise Edition
 ════════════════════════════════════════════════════════════════════════════════
 """
 from typing import Annotated, Optional
@@ -43,7 +20,7 @@ from app.modules.export.service import export_pmak
 from .schema import (
     PmakAccountCreate,
     PmakInhouseCreate,
-    PmakInhouseStatusUpdate,
+    PmakInhouseFullUpdate,        
     PmakTransactionCreate,
     PmakTransactionStatusUpdate,
 )
@@ -94,7 +71,9 @@ Returns a **single response** containing:
   `totalBalance`, `totalCredit`, `totalDebit`, `totalTransactions`,
   `totalInhouse`, `totalInhouseAmount`, `inhouseByStatus`, `activeAccountCount`.
 - **Paginated per-account breakdown** (50 accounts per page by default),
-  each including `currentBalance`, period credit/debit, transaction count,
+  each including `currentBalance` *(dynamically computed as:
+  latest_balance − period_debit + period_credit)*, `periodCredit`, `periodDebit`,
+  transaction count, `totalInhouseOrderAmount` (all-time inhouse deal volume),
   inhouse deal summary, and the 5 most recent transactions/deals.
 
 Use `?name=` for a case-insensitive partial search on account name.
@@ -205,8 +184,11 @@ Adds a ledger transaction for the specified PMAK account.
 **`account_name`** — the human-readable account name (case-insensitive).
 The system resolves it to an internal record automatically.
 
-`remainingBalance` must be supplied by the caller (balance *after* this
-transaction). `status` defaults to `PENDING`.
+`remainingBalance` is **auto-computed** server-side using the formula:
+> `latest_balance − debit + credit`
+
+You may still pass `remaining_balance` in the body to override this
+(useful for manual balance corrections). `status` defaults to `PENDING`.
 
 **Access:** All roles (CEO, Director, HR, and BDev).
     """,
@@ -236,7 +218,7 @@ All fields are optional — only supplied fields are changed:
 | `debit` | Updates the debit amount. |
 | `credit` | Updates the credit amount. |
 | `remaining_balance` | Corrects the post-transaction balance (not auto-recomputed). |
-| `status` | Updates lifecycle status: `PENDING` \| `CLEARED` \| `ON_HOLD` \| `REJECTED`. |
+| `status` | Updates lifecycle status: `PENDING` \\| `CLEARED` \\| `ON_HOLD` \\| `REJECTED`. |
 
 Sending an empty body `{}` returns the current transaction state unchanged
 (idempotent).
@@ -257,16 +239,13 @@ async def patch_transaction(
     "/transactions/{transaction_id}/status",
     summary="Update PMAK transaction status only (BDev entry-point)",
     description="""
-**Restricted PATCH** — exposes only the `status` field.
-
-Intended for BDev staff who need to mark transactions as `CLEARED`, `ON_HOLD`,
-or `REJECTED` without access to financial field edits.
+Restricted status-only update for a PMAK transaction.
 
 | Status | Meaning |
 |---|---|
 | `PENDING` | Awaiting clearance (default). |
-| `CLEARED` | Funds confirmed and settled. |
-| `ON_HOLD` | Flagged for review. |
+| `CLEARED` | Funds confirmed / settled. |
+| `ON_HOLD` | Temporarily suspended. |
 | `REJECTED` | Transaction rejected / reversed. |
 
 Sending an empty body `{}` is accepted and returns the current status unchanged
@@ -293,8 +272,9 @@ Returns paginated transactions for a single PMAK account.
 Each transaction row includes **`accountName`** so clients always have full
 context without a secondary account lookup.
 
-Response also contains `currentBalance` (latest balance across all time),
-`periodCredit`, and `periodDebit` for the selected window.
+Response also contains `currentBalance` *(dynamically computed as:
+latest_balance − period_debit + period_credit)*, `periodCredit`, and
+`periodDebit` for the selected window.
 
 Default: 50 transactions per page, newest first.
 
@@ -371,7 +351,7 @@ async def add_inhouse_entry(
 
 @router.patch(
     "/inhouse/{deal_id}",
-    summary="Partially update a PMAK inhouse deal",
+    summary="Partially update a PMAK inhouse deal (all fields)",
     description="""
 Performs a **partial update** on an existing inhouse deal.
 
@@ -379,8 +359,13 @@ All fields are optional — only supplied fields are changed:
 
 | Field | Effect |
 |---|---|
-| `order_status` | Updates lifecycle status: `PENDING` \| `IN_PROGRESS` \| `COMPLETED` \| `CANCELLED`. |
+| `account_name` | Reassigns the deal to a different active PMAK account. |
+| `date` | Updates the deal date (YYYY-MM-DD). |
 | `details` | Updates the free-text notes / reference code. |
+| `buyer_name` | Updates the buyer name. |
+| `seller_name` | Updates the seller / service-provider name. |
+| `order_amount` | Updates the deal value in USD (must be > 0). |
+| `order_status` | Updates lifecycle status: `PENDING` \\| `IN_PROGRESS` \\| `COMPLETED` \\| `CANCELLED`. |
 
 Sending an empty body `{}` returns the current deal state unchanged (idempotent).
 
@@ -389,7 +374,7 @@ Sending an empty body `{}` returns the current deal state unchanged (idempotent)
 )
 async def patch_inhouse(
     deal_id: str,
-    body: PmakInhouseStatusUpdate,
+    body: PmakInhouseFullUpdate,            # ← upgraded from PmakInhouseStatusUpdate
     db:   Prisma = Depends(get_db),
     _=Depends(ALL_ROLES),
 ):

@@ -1,3 +1,275 @@
 {
-  "items": []
+  "items": [
+    {
+      "id": "cmne8nzxr0004da5letwl220p",
+      "module": "fiverr",
+      "type": "profile",
+      "deletedAt": "2026-04-07T09:39:42.594281+00:00",
+      "snapshot": {
+        "id": "cmne8nzxr0004da5letwl220p",
+        "profileName": "maktech_designn",
+        "isActive": true
+      }
+    },
+    {
+      "id": "cmnh625ic00046evih6drefa7",
+      "module": "fiverr",
+      "type": "snapshot",
+      "deletedAt": "2026-04-07T09:39:42.596286+00:00",
+      "snapshot": {
+        "id": "cmnh625ic00046evih6drefa7",
+        "profileId": "cmne8nzxr0004da5letwl220p",
+        "profileName": "maktech_designn",
+        "date": "2026-04-02",
+        "availableWithdraw": 0.0,
+        "notCleared": 0.0,
+        "activeOrders": 0,
+        "activeOrderAmount": 0.0,
+        "withdrawn": 0.0,
+        "sellerPlus": true,
+        "promotion": 0.0,
+        "createdAt": "2026-04-02 07:41:46.981000+00:00"
+      }
+    },
+    {
+      "id": "cmne8nzxu0006da5lddsis6xc",
+      "module": "fiverr",
+      "type": "snapshot",
+      "deletedAt": "2026-04-07T09:39:42.598279+00:00",
+      "snapshot": {
+        "id": "cmne8nzxu0006da5lddsis6xc",
+        "profileId": "cmne8nzxr0004da5letwl220p",
+        "profileName": "maktech_designn",
+        "date": "2026-03-31",
+        "availableWithdraw": 1250.0,
+        "notCleared": 320.0,
+        "activeOrders": 5,
+        "activeOrderAmount": 0.0,
+        "withdrawn": 400.0,
+        "sellerPlus": true,
+        "promotion": 75.0,
+        "createdAt": "2026-03-31 06:31:26.898000+00:00"
+      }
+    },
+    {
+      "id": "cmne8nzxx0008da5lb9vr6m5v",
+      "module": "fiverr",
+      "type": "snapshot",
+      "deletedAt": "2026-04-07T09:39:42.599279+00:00",
+      "snapshot": {
+        "id": "cmne8nzxx0008da5lb9vr6m5v",
+        "profileId": "cmne8nzxr0004da5letwl220p",
+        "profileName": "maktech_designn",
+        "date": "2026-03-30",
+        "availableWithdraw": 1180.0,
+        "notCleared": 295.0,
+        "activeOrders": 4,
+        "activeOrderAmount": 0.0,
+        "withdrawn": 350.0,
+        "sellerPlus": true,
+        "promotion": 60.0,
+        "createdAt": "2026-03-31 06:31:26.902000+00:00"
+      }
+    },
+    {
+      "id": "cmne8nzy0000ada5lkstdx0th",
+      "module": "fiverr",
+      "type": "snapshot",
+      "deletedAt": "2026-04-07T09:39:42.601284+00:00",
+      "snapshot": {
+        "id": "cmne8nzy0000ada5lkstdx0th",
+        "profileId": "cmne8nzxr0004da5letwl220p",
+        "profileName": "maktech_designn",
+        "date": "2026-03-29",
+        "availableWithdraw": 1100.0,
+        "notCleared": 250.0,
+        "activeOrders": 6,
+        "activeOrderAmount": 0.0,
+        "withdrawn": 300.0,
+        "sellerPlus": true,
+        "promotion": 80.0,
+        "createdAt": "2026-03-31 06:31:26.904000+00:00"
+      }
+    },
+    {
+      "id": "cmne8nzy1000cda5l43pp5ar7",
+      "module": "fiverr",
+      "type": "snapshot",
+      "deletedAt": "2026-04-07T09:39:42.602281+00:00",
+      "snapshot": {
+        "id": "cmne8nzy1000cda5l43pp5ar7",
+        "profileId": "cmne8nzxr0004da5letwl220p",
+        "profileName": "maktech_designn",
+        "date": "2026-03-28",
+        "availableWithdraw": 980.0,
+        "notCleared": 210.0,
+        "activeOrders": 3,
+        "activeOrderAmount": 0.0,
+        "withdrawn": 250.0,
+        "sellerPlus": true,
+        "promotion": 55.0,
+        "createdAt": "2026-03-31 06:31:26.906000+00:00"
+      }
+    },
+    {
+      "id": "cmne8nzy3000eda5l1nu4w9li",
+      "module": "fiverr",
+      "type": "snapshot",
+      "deletedAt": "2026-04-07T09:39:42.604535+00:00",
+      "snapshot": {
+        "id": "cmne8nzy3000eda5l1nu4w9li",
+        "profileId": "cmne8nzxr0004da5letwl220p",
+        "profileName": "maktech_designn",
+        "date": "2026-03-24",
+        "availableWithdraw": 850.0,
+        "notCleared": 180.0,
+        "activeOrders": 2,
+        "activeOrderAmount": 0.0,
+        "withdrawn": 200.0,
+        "sellerPlus": false,
+        "promotion": 0.0,
+        "createdAt": "2026-03-31 06:31:26.907000+00:00"
+      }
+    },
+    {
+      "id": "cmne8nzy5000gda5ldo8vo3t0",
+      "module": "fiverr",
+      "type": "snapshot",
+      "deletedAt": "2026-04-07T09:39:42.605535+00:00",
+      "snapshot": {
+        "id": "cmne8nzy5000gda5ldo8vo3t0",
+        "profileId": "cmne8nzxr0004da5letwl220p",
+        "profileName": "maktech_designn",
+        "date": "2026-03-17",
+        "availableWithdraw": 790.0,
+        "notCleared": 150.0,
+        "activeOrders": 2,
+        "activeOrderAmount": 0.0,
+        "withdrawn": 180.0,
+        "sellerPlus": false,
+        "promotion": 0.0,
+        "createdAt": "2026-03-31 06:31:26.910000+00:00"
+      }
+    },
+    {
+      "id": "cmne8nzy8000ida5llq8oeham",
+      "module": "fiverr",
+      "type": "snapshot",
+      "deletedAt": "2026-04-07T09:39:42.607535+00:00",
+      "snapshot": {
+        "id": "cmne8nzy8000ida5llq8oeham",
+        "profileId": "cmne8nzxr0004da5letwl220p",
+        "profileName": "maktech_designn",
+        "date": "2026-03-10",
+        "availableWithdraw": 710.0,
+        "notCleared": 120.0,
+        "activeOrders": 1,
+        "activeOrderAmount": 0.0,
+        "withdrawn": 160.0,
+        "sellerPlus": false,
+        "promotion": 0.0,
+        "createdAt": "2026-03-31 06:31:26.912000+00:00"
+      }
+    },
+    {
+      "id": "cmne8nzy9000kda5l9gd8r0ao",
+      "module": "fiverr",
+      "type": "snapshot",
+      "deletedAt": "2026-04-07T09:39:42.608535+00:00",
+      "snapshot": {
+        "id": "cmne8nzy9000kda5l9gd8r0ao",
+        "profileId": "cmne8nzxr0004da5letwl220p",
+        "profileName": "maktech_designn",
+        "date": "2026-03-01",
+        "availableWithdraw": 640.0,
+        "notCleared": 95.0,
+        "activeOrders": 1,
+        "activeOrderAmount": 0.0,
+        "withdrawn": 140.0,
+        "sellerPlus": false,
+        "promotion": 0.0,
+        "createdAt": "2026-03-31 06:31:26.914000+00:00"
+      }
+    },
+    {
+      "id": "cmne8nzyc000mda5lp6b0rco7",
+      "module": "fiverr",
+      "type": "order",
+      "deletedAt": "2026-04-07T09:39:42.610534+00:00",
+      "snapshot": {
+        "id": "cmne8nzyc000mda5lp6b0rco7",
+        "profileId": "cmne8nzxr0004da5letwl220p",
+        "date": "2026-03-30",
+        "buyerName": "BuyerAlpha",
+        "orderId": "FO-2024-0001",
+        "amount": 120.0,
+        "afterFiverr": 96.0,
+        "createdAt": "2026-03-31 06:31:26.916000+00:00"
+      }
+    },
+    {
+      "id": "cmne8nzye000oda5ll9ubywve",
+      "module": "fiverr",
+      "type": "order",
+      "deletedAt": "2026-04-07T09:39:42.611533+00:00",
+      "snapshot": {
+        "id": "cmne8nzye000oda5ll9ubywve",
+        "profileId": "cmne8nzxr0004da5letwl220p",
+        "date": "2026-03-29",
+        "buyerName": "BuyerBeta",
+        "orderId": "FO-2024-0002",
+        "amount": 85.0,
+        "afterFiverr": 68.0,
+        "createdAt": "2026-03-31 06:31:26.919000+00:00"
+      }
+    },
+    {
+      "id": "cmne8nzyg000qda5lce6my7gc",
+      "module": "fiverr",
+      "type": "order",
+      "deletedAt": "2026-04-07T09:39:42.613038+00:00",
+      "snapshot": {
+        "id": "cmne8nzyg000qda5lce6my7gc",
+        "profileId": "cmne8nzxr0004da5letwl220p",
+        "date": "2026-03-31",
+        "buyerName": "BuyerGamma",
+        "orderId": "FO-2024-0003",
+        "amount": 200.0,
+        "afterFiverr": 160.0,
+        "createdAt": "2026-03-31 06:31:26.920000+00:00"
+      }
+    },
+    {
+      "id": "cmne8nzyh000sda5lzey04xyx",
+      "module": "fiverr",
+      "type": "order",
+      "deletedAt": "2026-04-07T09:39:42.615045+00:00",
+      "snapshot": {
+        "id": "cmne8nzyh000sda5lzey04xyx",
+        "profileId": "cmne8nzxr0004da5letwl220p",
+        "date": "2026-03-26",
+        "buyerName": "BuyerDelta",
+        "orderId": "FO-2024-0004",
+        "amount": 55.0,
+        "afterFiverr": 44.0,
+        "createdAt": "2026-03-31 06:31:26.921000+00:00"
+      }
+    },
+    {
+      "id": "cmne8nzyi000uda5l53oe2lmf",
+      "module": "fiverr",
+      "type": "order",
+      "deletedAt": "2026-04-07T09:39:42.616550+00:00",
+      "snapshot": {
+        "id": "cmne8nzyi000uda5l53oe2lmf",
+        "profileId": "cmne8nzxr0004da5letwl220p",
+        "date": "2026-03-22",
+        "buyerName": "BuyerEpsilon",
+        "orderId": "FO-2024-0005",
+        "amount": 310.0,
+        "afterFiverr": 248.0,
+        "createdAt": "2026-03-31 06:31:26.923000+00:00"
+      }
+    }
+  ]
 }

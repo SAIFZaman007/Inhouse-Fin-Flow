@@ -1,16 +1,7 @@
 """
 app/modules/pmak/schema.py
 ════════════════════════════════════════════════════════════════════════════════
-v4.5 — Enterprise Edition
-
-Fix: `datetime.date` is now imported as `Date` to prevent Pydantic v2 from
-     confusing the *field name* ``date`` with the *type annotation* ``date``
-     during class construction (PydanticUserError / unevaluable-type-annotation).
-     All four affected classes are patched:
-       • PmakTransactionCreate   (field: date)
-       • PmakTransactionResponse (field: date)
-       • PmakInhouseCreate       (field: date)
-       • PmakInhouseResponse     (field: date)
+v5.0 — Enterprise Edition
 ════════════════════════════════════════════════════════════════════════════════
 """
 from datetime import date as Date, datetime
@@ -20,9 +11,6 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 # ── Enum imports — always use the prisma-generated source directly ────────────
-# prisma-client-py generates these from schema.prisma into prisma/enums.py.
-# Never re-export them through app.shared.constants — that indirection was the
-# root cause of the previous PydanticUserError crash.
 from prisma.enums import InhouseOrderStatus, PmakStatus
 
 
@@ -94,9 +82,13 @@ class PmakTransactionCreate(BaseModel):
         description="Credit amount in USD. Defaults to 0.",
         examples=[1200.00],
     )
-    remaining_balance: Decimal = Field(
-        ...,
-        description="Running balance after this entry, in USD.",
+    remaining_balance: Optional[Decimal] = Field(
+        default=None,
+        description=(
+            "Running balance after this entry, in USD. "
+            "If omitted, the server auto-computes it as: "
+            "previous_balance − debit + credit."
+        ),
         examples=[8750.00],
     )
     status: PmakStatus = Field(
@@ -181,7 +173,10 @@ class PmakInhouseCreate(BaseModel):
 
 
 class PmakInhouseStatusUpdate(BaseModel):
-    """Partial update payload for an inhouse deal — all PMAK roles."""
+    """
+    Legacy partial update payload — kept for backward compatibility.
+    Use PmakInhouseFullUpdate for the full PATCH endpoint instead.
+    """
 
     order_status: Optional[InhouseOrderStatus] = Field(
         default=None,
@@ -191,6 +186,53 @@ class PmakInhouseStatusUpdate(BaseModel):
         default=None,
         description="Updated notes or reference code.",
         examples=["SEO audit + 3-month plan – CLT-003"],
+    )
+
+
+class PmakInhouseFullUpdate(BaseModel):
+    """
+    Full optional-field PATCH payload for PATCH /inhouse/{deal_id}.
+
+    Every field is optional — only supplied fields are written.
+    Sending an empty body {} returns the current deal state unchanged (idempotent).
+    """
+
+    account_name: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="Reassign deal to a different active PMAK account (case-insensitive).",
+        examples=["PMAK Operations"],
+    )
+    date: Optional[Date] = Field(               # ← `Date` alias
+        default=None,
+        description="Updated deal date (YYYY-MM-DD).",
+        examples=["2026-04-01"],
+    )
+    details: Optional[str] = Field(
+        default=None,
+        description="Updated free-text notes or reference code.",
+        examples=["SEO audit + 3-month plan – CLT-003"],
+    )
+    buyer_name: Optional[str] = Field(
+        default=None,
+        description="Updated buyer name.",
+        examples=["Rahim Textiles"],
+    )
+    seller_name: Optional[str] = Field(
+        default=None,
+        description="Updated seller / service-provider name.",
+        examples=["maktech_design"],
+    )
+    order_amount: Optional[Decimal] = Field(
+        default=None,
+        gt=0,
+        description="Updated deal value in USD. Must be greater than 0.",
+        examples=[20000.00],
+    )
+    order_status: Optional[InhouseOrderStatus] = Field(
+        default=None,
+        description="New lifecycle status: PENDING | IN_PROGRESS | COMPLETED | CANCELLED.",
     )
 
 
@@ -249,29 +291,30 @@ class PmakInhouseByStatus(BaseModel):
 
 class PmakTotals(BaseModel):
     """Cross-account aggregate for the selected period."""
-    totalBalance:       float
-    totalCredit:        float
-    totalDebit:         float
-    totalTransactions:  int
-    totalInhouse:       int
-    totalInhouseAmount: float
-    inhouseByStatus:    PmakInhouseByStatus
-    activeAccountCount: int
+    totalBalance:           float
+    totalCredit:            float
+    totalDebit:             float
+    totalTransactions:      int
+    totalInhouse:           int
+    totalInhouseAmount:     float
+    inhouseByStatus:        PmakInhouseByStatus
+    activeAccountCount:     int
 
 
 class PmakAccountSummary(BaseModel):
     """Per-account row inside the GET /accounts response."""
-    id:                  str
-    accountName:         str
-    isActive:            bool
-    currentBalance:      float
-    periodCredit:        float
-    periodDebit:         float
-    transactionCount:    int
-    inhouseCount:        int
-    inhouseByStatus:     PmakInhouseByStatus
-    recentTransactions:  List[PmakTransactionResponse]
-    recentInhouse:       List[PmakInhouseResponse]
+    id:                      str
+    accountName:             str
+    isActive:                bool
+    currentBalance:          float
+    periodCredit:            float
+    periodDebit:             float
+    transactionCount:        int
+    inhouseCount:            int
+    totalInhouseOrderAmount: float          # ← NEW: sum of orderAmount for this account
+    inhouseByStatus:         PmakInhouseByStatus
+    recentTransactions:      List[PmakTransactionResponse]
+    recentInhouse:           List[PmakInhouseResponse]
 
 
 class PmakListResponse(BaseModel):
