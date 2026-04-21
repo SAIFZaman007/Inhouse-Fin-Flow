@@ -81,6 +81,8 @@ class UpworkProfileResponse(BaseModel):
     id:          str
     profileName: str
     isActive:    bool
+    createdAt:   Optional[datetime] = None   # raw column — None before bootstrap
+    updatedAt:   Optional[datetime] = None   # raw column — None before bootstrap
 
     class Config:
         from_attributes = True
@@ -179,6 +181,7 @@ class UpworkSnapshotResponse(BaseModel):
     connects:                  int
     upworkPlus:                bool
     createdAt:                 datetime
+    updatedAt:                 Optional[datetime] = None   # raw column — None before bootstrap
 
     class Config:
         from_attributes = True
@@ -234,6 +237,7 @@ class UpworkOrderResponse(BaseModel):
     amount:      Decimal
     afterUpwork: Decimal
     createdAt:   datetime
+    updatedAt:   Optional[datetime] = None   # raw column — None before bootstrap
 
     class Config:
         from_attributes = True
@@ -298,6 +302,7 @@ class UpworkSnapshotInProfile(BaseModel):
     connects:                  int
     upworkPlus:                bool
     createdAt:                 datetime
+    updatedAt:                 Optional[datetime] = None   # raw column
 
 
 class UpworkOrderInProfile(BaseModel):
@@ -309,6 +314,7 @@ class UpworkOrderInProfile(BaseModel):
     amount:      float
     afterUpwork: float
     createdAt:   datetime
+    updatedAt:   Optional[datetime] = None   # raw column
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -335,6 +341,8 @@ class UpworkProfileSummary(BaseModel):
     id:              str
     profileName:     str
     isActive:        bool
+    createdAt:       Optional[datetime] = None   # raw column
+    updatedAt:       Optional[datetime] = None   # raw column
     latestSnapshot:  Optional[UpworkSnapshotInProfile]
     periodTotals:    Dict[str, Any]
     snapshotCount:   int

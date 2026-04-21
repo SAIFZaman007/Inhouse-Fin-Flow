@@ -1,11 +1,13 @@
 """
 app/modules/hr_expense/router.py
 ========================================
-v3 — totals on GET + full PATCH support
+v4 — search/filter keyword on GET
 
   • GET    /hr-expense              → ALL_ROLES
       Returns HrExpenseListResponse: { totals: {...}, records: [...] }
       totals includes: totalRecords, totalDebits, totalCredits, totalRemainingBalance
+      Supports: search (OR across details, accountFrom, accountTo, remarks)
+                + all existing DateRangeFilter params (combinable freely)
 
   • POST   /hr-expense              → HR_AND_ABOVE (CEO, DIRECTOR, HR — excludes BDEV)
       All fields optional — safe defaults applied for omitted values.
@@ -16,7 +18,9 @@ v3 — totals on GET + full PATCH support
 
   • DELETE /hr-expense/{expense_id} → HR_AND_ABOVE + structured response body
 """
-from fastapi import APIRouter, Depends
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Query
 from prisma import Prisma
 
 from app.core.database import get_db
@@ -31,21 +35,34 @@ router = APIRouter(prefix="/hr-expense", tags=["HR Expense"])
 
 @router.get("", response_model=HrExpenseListResponse)
 async def get_expenses(
+    search:  Optional[str] = Query(
+        default=None,
+        description=(
+            "Partial / case-insensitive keyword search. "
+            "Matched against details, accountFrom, accountTo, and remarks "
+            "via a single OR condition — any field containing the keyword is returned."
+        ),
+    ),
     filters: DateRangeFilter = Depends(),
-    db: Prisma = Depends(get_db),
+    db:      Prisma = Depends(get_db),
     _=Depends(ALL_ROLES),
 ):
     """
     List all HR expense records within the requested date range.
 
+    Filters (all combinable):
+    - `search`      — single keyword matched across details, accountFrom,
+                      accountTo, and remarks (case-insensitive, partial match)
+    - Date filters  — period (daily/weekly/monthly/yearly) or explicit from/to
+
     Response envelope:
-    - **totals.totalRecords**          — number of records in the window
+    - **totals.totalRecords**          — number of records in the filtered window
     - **totals.totalDebits**           — sum of all debit entries
     - **totals.totalCredits**          — sum of all credit entries
     - **totals.totalRemainingBalance** — sum(remainingBalance) + totalCredits − totalDebits
     - **records**                      — full list of expense records (newest first)
     """
-    return await list_expenses(db, filters.to_prisma_filter())
+    return await list_expenses(db, filters.to_prisma_filter(), search=search)
 
 
 @router.post("", response_model=HrExpenseResponse, status_code=201)

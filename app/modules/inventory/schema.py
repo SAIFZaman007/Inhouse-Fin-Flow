@@ -21,18 +21,19 @@ Built directly from schema.prisma (source of truth):
 """
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Optional
+from typing import List, Optional
+
 from pydantic import BaseModel, model_validator
 
 
 class InventoryCreate(BaseModel):
     date: date
-    itemName: str                           
+    itemName: str
     category: Optional[str] = None
     quantity: int = 1
-    unitPrice: Decimal = Decimal("0")      
+    unitPrice: Decimal = Decimal("0")
     condition: Optional[str] = None
-    assignedTo: Optional[str] = None       
+    assignedTo: Optional[str] = None
     notes: Optional[str] = None
 
     @model_validator(mode="after")
@@ -40,7 +41,7 @@ class InventoryCreate(BaseModel):
         self.totalPrice = self.unitPrice * self.quantity
         return self
 
-    totalPrice: Decimal = Decimal("0")   
+    totalPrice: Decimal = Decimal("0")
 
 
 class InventoryUpdate(BaseModel):
@@ -56,16 +57,39 @@ class InventoryUpdate(BaseModel):
 class InventoryResponse(BaseModel):
     id: str
     date: date
-    itemName: str                           
+    itemName: str
     category: Optional[str]
     quantity: int
-    unitPrice: Decimal                      
-    totalPrice: Decimal                    
+    unitPrice: Decimal
+    totalPrice: Decimal
     condition: Optional[str]
-    assignedTo: Optional[str]             
+    assignedTo: Optional[str]
     notes: Optional[str]
     createdAt: datetime
     updatedAt: datetime
 
     class Config:
         from_attributes = True
+
+
+# ── Bulk import response ───────────────────────────────────────────────────────
+
+class InventoryImportError(BaseModel):
+    """Details of a single row that failed validation or insertion during bulk import."""
+    row:   int    # 1-based row number in the uploaded Excel sheet (header = row 1)
+    error: str    # human-readable reason for failure
+
+
+class InventoryBulkImportResponse(BaseModel):
+    """
+    Response envelope returned by POST /inventory when an Excel file is uploaded.
+
+    - importedCount — number of rows successfully inserted
+    - skippedCount  — number of rows that failed (see errors for details)
+    - records       — full InventoryResponse for every successfully imported row
+    - errors        — per-row failure details for every skipped row
+    """
+    importedCount: int
+    skippedCount:  int
+    records:       List[InventoryResponse]
+    errors:        List[InventoryImportError]

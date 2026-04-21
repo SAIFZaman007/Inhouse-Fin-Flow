@@ -16,7 +16,7 @@ DESIGN:
     via from_attributes=True — works because prisma-client-py exposes the field
     as a camelCase Python attribute matching the Pydantic field name.
 """
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Optional
@@ -89,5 +89,7 @@ class DollarExchangeResponse(BaseModel):
     rate:          Decimal
     totalBdt:      Decimal
     paymentStatus: str              # "RECEIVED" | "DUE"
+    createdAt:     Optional[datetime] = None   # native Prisma column
+    updatedAt:     Optional[datetime] = None   # raw column — None before bootstrap
 
     model_config = {"from_attributes": True}

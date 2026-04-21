@@ -1,11 +1,11 @@
 """
 app/modules/card_sharing/router.py
 ================================================================================
-v7 — Simplified input surface
+v8 — Multi-column OR keyword search on GET /card-sharing
 ================================================================================
 """
 from decimal import Decimal
-from typing import Optional
+from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from fastapi.responses import Response
@@ -54,6 +54,18 @@ async def get_cards(
         default=None,
         description="Partial / case-insensitive match on the card's own label (``cardName``).",
     ),
+    search: Annotated[
+        Optional[str],
+        Query(
+            description=(
+                "Case-insensitive keyword search across FIVE columns simultaneously "
+                "(OR logic — a single keyword matches any of these fields): "
+                "details | cardName | cardReceiveBank | mailDetails | cardVendor. "
+                "e.g. ?search=bKash returns every card where any of those fields "
+                "mentions 'bKash'."
+            )
+        ),
+    ] = None,
     filters: DateRangeFilter = Depends(),
     db:      Prisma          = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
@@ -64,11 +76,12 @@ async def get_cards(
     ``cardNo`` and ``cardCvc`` are returned **decrypted** in every row.
 
     ### Filters (all combinable)
-    | Parameter   | Behaviour                                        |
-    |-------------|--------------------------------------------------|
-    | `serial_no` | Case-insensitive substring match                 |
-    | `card_name` | Case-insensitive substring match on card label   |
-    | Date filters| Period (daily/weekly/monthly/yearly) or from/to  |
+    | Parameter   | Behaviour                                                        |
+    |-------------|------------------------------------------------------------------|
+    | `serial_no` | Case-insensitive substring match on serial number                |
+    | `card_name` | Case-insensitive substring match on card label (cardName)        |
+    | `search`    | OR keyword search across **details**, **cardName**, **cardReceiveBank**, **mailDetails**, **cardVendor** |
+    | Date filters| Period (daily/weekly/monthly/yearly) or explicit from/to range   |
     """
     return await list_cards(
         db,
@@ -76,6 +89,7 @@ async def get_cards(
         serial_no=serial_no,
         account_name=card_name,        # service param name kept for compatibility
         date_filter=filters.to_prisma_filter() or None,
+        search=search,
     )
 
 
@@ -95,12 +109,23 @@ async def export_cards_endpoint(
         default=None,
         description="Partial match on card name / label.",
     ),
+    search: Annotated[
+        Optional[str],
+        Query(
+            description=(
+                "Case-insensitive keyword search across details, cardName, "
+                "cardReceiveBank, mailDetails, and cardVendor (OR logic)."
+            )
+        ),
+    ] = None,
     filters: DateRangeFilter = Depends(),
     db:      Prisma          = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
 ):
     """
     Export filtered card records to an Excel workbook.
+
+    Supports the same ``search`` OR filter as ``GET /card-sharing``.
 
     ### Included columns
     Date · Serial No · Card Name · Card Vendor · Card Expire ·
@@ -120,6 +145,7 @@ async def export_cards_endpoint(
         date_filter=filters.to_prisma_filter() or None,
         serial_no=serial_no,
         account_name=card_name,        # service param name kept for compatibility
+        search=search,
         label=label,
     )
     return Response(

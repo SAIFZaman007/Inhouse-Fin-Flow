@@ -1,7 +1,7 @@
 """
 app/modules/hr_expense/service.py
 ════════════════════════════════════════════════════════════════════════════════
-v5 — Three-Layer Defence (mirrors pmak/service.py enterprise pattern)
+v6 — search/filter keyword on list_expenses (Three-Layer Defence intact)
 ════════════════════════════════════════════════════════════════════════════════
 """
 from datetime import date as dt_date, datetime, time
@@ -69,17 +69,34 @@ def _serialize_expense(row) -> dict:
 
 # ── CRUD ──────────────────────────────────────────────────────────────────────
 
-async def list_expenses(db: Prisma, date_filter: dict) -> HrExpenseListResponse:
+async def list_expenses(
+    db:          Prisma,
+    date_filter: dict,
+    search:      str | None = None,
+) -> HrExpenseListResponse:
     """
-    Fetch all HR expense records matching the date filter and compute
-    aggregate totals in a single pass.
+    Fetch all HR expense records matching the date filter and/or keyword search,
+    then compute aggregate totals in a single pass.
+
+    search — single case-insensitive keyword matched against details,
+             accountFrom, accountTo, and remarks via a single OR clause.
+             Combinable freely with date_filter (AND between the two conditions).
 
     totalRemainingBalance = sum(remainingBalance) + totalCredits − totalDebits
     This reflects the net effective balance after all movements in the window.
     """
     where: dict = {}
+
     if date_filter:
         where["date"] = date_filter
+
+    if search:
+        where["OR"] = [
+            {"details":     {"contains": search, "mode": "insensitive"}},
+            {"accountFrom": {"contains": search, "mode": "insensitive"}},
+            {"accountTo":   {"contains": search, "mode": "insensitive"}},
+            {"remarks":     {"contains": search, "mode": "insensitive"}},
+        ]
 
     rows = await db.hrexpense.find_many(where=where, order={"date": "desc"})
 

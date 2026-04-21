@@ -2,25 +2,7 @@
 app/modules/payoneer/router.py
 ════════════════════════════════════════════════════════════════════════════════
 v6 — Enterprise Edition
-
-Endpoint matrix
-───────────────────────────────────────────────────────────────────────────────
-GET    /accounts                        CEO_DIRECTOR  Combined totals + all accounts
-                                                      Period + ?name= filter. Paginated.
-POST   /accounts                        CEO_DIRECTOR  Create + optional opening balance
-GET    /accounts/{account_id}           CEO_DIRECTOR  Single-account detail — full filter
-                                                      system (period-aware, paginated)
-PATCH  /accounts/{account_id}           CEO_DIRECTOR  Partial update (rename / isActive /
-                                                      balance-adjustment — all optional)
-DELETE /accounts/{account_id}           CEO_DIRECTOR  Soft-delete — returns JSON message
-
-POST   /transactions                    CEO_DIRECTOR  Add transaction (auto-balance)
-PATCH  /transactions/{id}               CEO_DIRECTOR  Partial update (any field)
-DELETE /transactions/{id}               CEO_DIRECTOR  Hard delete — returns JSON message
-GET    /accounts/{id}/transactions      CEO_DIRECTOR  Paginated transactions + accountName
-
-GET    /export                          CEO_DIRECTOR  All-accounts Excel (period-aware)
-GET    /export/{account_id}             CEO_DIRECTOR  Single-account Excel (period-aware)
+(period-aware)
 ════════════════════════════════════════════════════════════════════════════════
 """
 from typing import Annotated, Optional
@@ -89,7 +71,10 @@ Returns a **single response** containing:
   each including `currentBalance`, period `credit`/`debit`, transaction count,
   and the 5 most recent transactions in the selected window.
 
-Use `?name=` for a case-insensitive partial search on account name.
+Each account row includes `createdAt` and `updatedAt`.
+Recent transactions in each row also include `createdAt` and `updatedAt`.
+
+**Search:** Use `?name=` for a case-insensitive partial search on account name.
 
 Period params: `daily` | `weekly` | `monthly` | `yearly` | `all` (default).
 
@@ -139,12 +124,14 @@ async def add_account(
     description="""
 Returns a complete breakdown for **one Payoneer account**:
 
-- Account metadata (`id`, `accountName`, `isActive`)
+- Account metadata (`id`, `accountName`, `isActive`, `createdAt`, `updatedAt`)
 - `currentBalance` — the latest `remainingBalance` across all time
 - Period-scoped `periodCredit` and `periodDebit` for the selected window
-- **Paginated transactions** in the selected period (newest first, 50 per page)
+- **Paginated transactions** in the selected period (newest first, 50 per page),
+  each with `createdAt` and `updatedAt`.
 
-Each transaction row includes `accountName` for full client context.
+**Search:**
+- `?search=<keyword>` — case-insensitive keyword search on the `details` field
 
 Period params: `daily` | `weekly` | `monthly` | `yearly` | `all` (default).
 
@@ -155,10 +142,14 @@ async def get_account(
     account_id: str,
     filters:    DateRangeFilter = Depends(),
     pagination: PageParams      = Depends(),
+    search: Annotated[
+        Optional[str],
+        Query(description="Case-insensitive keyword search on the details field."),
+    ] = None,
     db: Prisma = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
 ):
-    return await get_account_detail(db, account_id, filters, pagination=pagination)
+    return await get_account_detail(db, account_id, filters, pagination=pagination, search=search)
 
 
 @router.patch(
@@ -322,11 +313,14 @@ async def patch_transaction(
     description="""
 Returns paginated transactions for a single account.
 
-Each transaction row includes **`accountName`** so clients always have full
-context without a secondary account lookup.
+Each transaction row includes **`accountName`**, `createdAt`, and `updatedAt`.
 
-Response also contains `currentBalance` (latest balance across all time),
-`periodCredit`, and `periodDebit` for the selected window.
+Response also contains the account's `createdAt`/`updatedAt`, `currentBalance`
+(latest balance across all time), `periodCredit`, and `periodDebit`.
+
+**Search:**
+- `?search=<keyword>` — case-insensitive keyword search on the `details` field
+  (e.g. `?search=Adobe` returns all rows whose details mention "Adobe")
 
 Default: 50 transactions per page, newest first.
 
@@ -337,11 +331,15 @@ async def account_transactions(
     account_id: str,
     filters:    DateRangeFilter = Depends(),
     pagination: PageParams      = Depends(),
+    search: Annotated[
+        Optional[str],
+        Query(description="Case-insensitive keyword search on the details field."),
+    ] = None,
     db: Prisma = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
 ):
     return await get_account_transactions(
-        db, account_id, filters.to_prisma_filter(), pagination=pagination
+        db, account_id, filters.to_prisma_filter(), pagination=pagination, search=search,
     )
 
 

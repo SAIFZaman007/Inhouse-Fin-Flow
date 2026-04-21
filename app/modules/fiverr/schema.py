@@ -72,6 +72,8 @@ class FiverrProfileResponse(BaseModel):
     id:          str
     profileName: str
     isActive:    bool
+    createdAt:   Optional[datetime] = None   # raw column — None before bootstrap
+    updatedAt:   Optional[datetime] = None   # raw column — None before bootstrap
 
     class Config:
         from_attributes = True
@@ -151,6 +153,7 @@ class FiverrSnapshotResponse(BaseModel):
     sellerPlus:         bool
     promotion:          Decimal
     createdAt:          datetime
+    updatedAt:          Optional[datetime] = None   # raw column — None before bootstrap
 
     class Config:
         from_attributes = True
@@ -212,6 +215,7 @@ class FiverrOrderResponse(BaseModel):
     amount:      Decimal
     afterFiverr: Decimal
     createdAt:   datetime
+    updatedAt:   Optional[datetime] = None   # raw column — None before bootstrap
 
     class Config:
         from_attributes = True
@@ -284,6 +288,8 @@ class FiverrProfileSummary(BaseModel):
     id:              str
     profileName:     str
     isActive:        bool
+    createdAt:       Optional[datetime] = None   # raw column
+    updatedAt:       Optional[datetime] = None   # raw column
     latestSnapshot:  Optional[FiverrSnapshotResponse]
     periodTotals:    Dict[str, Any]
     snapshotCount:   int

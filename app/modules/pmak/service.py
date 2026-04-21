@@ -1,13 +1,14 @@
 """
 app/modules/pmak/service.py
 ════════════════════════════════════════════════════════════════════════════════
-v6.3 — Enterprise Edition
+v7.0 — Enterprise Edition
 ════════════════════════════════════════════════════════════════════════════════
 """
 import io
-from datetime import date as dt_date, datetime, time
+import uuid
+from datetime import date as dt_date, datetime, time, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import List, Optional
 
 import openpyxl
 from fastapi import HTTPException
@@ -23,12 +24,16 @@ from .schema import (
     PmakInhouseCreate,
     PmakInhouseFullUpdate,
     PmakInhouseStatusUpdate,
+    PmakToolCreate,
+    PmakToolUpdate,
     PmakTransactionCreate,
     PmakTransactionStatusUpdate,
 )
 
 
-# ── Date helper ───────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# § 0  Utilities
+# ═════════════════════════════════════════════════════════════════════════════
 
 def _to_dt(d: dt_date) -> datetime:
     """date → datetime midnight.  Prisma-client-py rejects bare date objects."""
@@ -37,7 +42,9 @@ def _to_dt(d: dt_date) -> datetime:
     return datetime.combine(d, time.min)
 
 
-# ── Inhouse status summary helpers ────────────────────────────────────────────
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
 
 def _empty_inhouse_by_status() -> dict:
     return {
@@ -59,7 +66,7 @@ def _build_inhouse_by_status(deals: list) -> dict:
 
 
 def _serialize_inhouse_with_account(d) -> dict:
-    """Serialise a PmakInhouse row that was fetched with include={"account": True}."""
+    """Serialise a PmakInhouse row fetched with include={"account": True}."""
     return {
         "id":          d.id,
         "accountId":   d.accountId,
@@ -75,11 +82,213 @@ def _serialize_inhouse_with_account(d) -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Accounts
+def _serialize_txn(txn, account_name: str) -> dict:
+    return {
+        "id":               txn.id,
+        "accountId":        txn.accountId,
+        "accountName":      account_name,
+        "date":             txn.date.date() if hasattr(txn.date, "date") else txn.date,
+        "details":          txn.details,
+        "accountFrom":      txn.accountFrom,
+        "accountTo":        txn.accountTo,
+        "debit":            txn.debit,
+        "credit":           txn.credit,
+        "remainingBalance": txn.remainingBalance,
+        "status":           txn.status if isinstance(txn.status, str) else txn.status.value,
+        "createdAt":        txn.createdAt,
+    }
+
+
+def _serialize_inhouse(deal, account_name: str) -> dict:
+    return {
+        "id":          deal.id,
+        "accountId":   deal.accountId,
+        "accountName": account_name,
+        "date":        deal.date.date() if hasattr(deal.date, "date") else deal.date,
+        "details":     deal.details,
+        "buyerName":   deal.buyerName,
+        "sellerName":  deal.sellerName,
+        "orderAmount": deal.orderAmount,
+        "orderStatus": deal.orderStatus if isinstance(deal.orderStatus, str) else deal.orderStatus.value,
+        "createdAt":   deal.createdAt,
+        "updatedAt":   deal.updatedAt,
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# § 1  Raw-SQL bootstrap for pmak_tools and pmak_accounts timestamps
+# ═════════════════════════════════════════════════════════════════════════════
 # ─────────────────────────────────────────────────────────────────────────────
 
+# pmak_accounts timestamp columns — two separate ALTER TABLE statements
+_ACCOUNT_TIMESTAMPS_DDL: list[str] = [
+    """
+    DO $$ BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_name='pmak_accounts' AND column_name='created_at'
+      ) THEN
+        ALTER TABLE pmak_accounts ADD COLUMN created_at TIMESTAMPTZ DEFAULT now();
+      END IF;
+    END $$
+    """,
+    """
+    DO $$ BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_name='pmak_accounts' AND column_name='updated_at'
+      ) THEN
+        ALTER TABLE pmak_accounts ADD COLUMN updated_at TIMESTAMPTZ DEFAULT now();
+      END IF;
+    END $$
+    """,
+]
+
+# pmak_tools table + two indexes — three separate statements
+_TOOLS_TABLE_DDL: list[str] = [
+    """
+    CREATE TABLE IF NOT EXISTS pmak_tools (
+        id           TEXT          PRIMARY KEY,
+        account_id   TEXT          NOT NULL REFERENCES pmak_accounts(id) ON DELETE CASCADE,
+        date         DATE          NOT NULL,
+        details      TEXT,
+        debit        NUMERIC(12,2) NOT NULL DEFAULT 0,
+        credit       NUMERIC(12,2) NOT NULL DEFAULT 0,
+        total        NUMERIC(12,2) NOT NULL DEFAULT 0,
+        created_at   TIMESTAMPTZ   NOT NULL DEFAULT now(),
+        updated_at   TIMESTAMPTZ   NOT NULL DEFAULT now()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_pmak_tools_account_id ON pmak_tools(account_id)",
+    "CREATE INDEX IF NOT EXISTS idx_pmak_tools_date        ON pmak_tools(date)",
+]
+
+_bootstrap_done = False
+
+
+async def _ensure_schema(db: Prisma) -> None:
+    """
+    Idempotent schema bootstrap — runs once per process lifetime.
+
+    Each statement is issued in its own execute_raw call so that PostgreSQL's
+    extended-query protocol never sees more than one command per round-trip.
+    The module-level flag prevents redundant DDL on subsequent requests.
+    """
+    global _bootstrap_done
+    if _bootstrap_done:
+        return
+    for stmt in _ACCOUNT_TIMESTAMPS_DDL:
+        await db.execute_raw(stmt)
+    for stmt in _TOOLS_TABLE_DDL:
+        await db.execute_raw(stmt)
+    _bootstrap_done = True
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# § 2  Account timestamps helper
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def _fetch_account_timestamps(db: Prisma, account_id: str) -> dict:
+    """
+    Return {'createdAt': datetime|None, 'updatedAt': datetime|None} for one
+    account.  Falls back to None if the columns are not yet present (pre-v7
+    deployment guard).
+    """
+    try:
+        rows = await db.query_raw(
+            "SELECT created_at, updated_at FROM pmak_accounts WHERE id = $1",
+            account_id,
+        )
+        if rows:
+            row = rows[0]
+            return {
+                "createdAt": row.get("created_at"),
+                "updatedAt": row.get("updated_at"),
+            }
+    except Exception:
+        pass
+    return {"createdAt": None, "updatedAt": None}
+
+
+async def _fetch_all_account_timestamps(db: Prisma, account_ids: list) -> dict:
+    """
+    Batch-fetch timestamps for a list of account IDs.
+    Returns {account_id: {'createdAt': ..., 'updatedAt': ...}}.
+    """
+    if not account_ids:
+        return {}
+    try:
+        placeholders = ", ".join(f"${i+1}" for i in range(len(account_ids)))
+        rows = await db.query_raw(
+            f"SELECT id, created_at, updated_at FROM pmak_accounts WHERE id IN ({placeholders})",
+            *account_ids,
+        )
+        return {
+            row["id"]: {
+                "createdAt": row.get("created_at"),
+                "updatedAt": row.get("updated_at"),
+            }
+            for row in rows
+        }
+    except Exception:
+        return {aid: {"createdAt": None, "updatedAt": None} for aid in account_ids}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# § 3  Tools raw-query helpers
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _serialize_tool_row(row: dict, account_name: str) -> dict:
+    """
+    Normalise a raw-SQL dict row from pmak_tools into the PmakToolResponse
+    shape.  Handles both string and datetime values for date columns.
+    """
+    raw_date = row.get("date")
+    if isinstance(raw_date, datetime):
+        tool_date = raw_date.date()
+    elif isinstance(raw_date, dt_date):
+        tool_date = raw_date
+    elif isinstance(raw_date, str):
+        tool_date = dt_date.fromisoformat(raw_date[:10])
+    else:
+        tool_date = dt_date.today()
+
+    return {
+        "id":          row["id"],
+        "accountId":   row["account_id"],
+        "accountName": account_name,
+        "date":        tool_date,
+        "details":     row.get("details"),
+        "debit":       Decimal(str(row["debit"])),
+        "credit":      Decimal(str(row["credit"])),
+        "total":       Decimal(str(row["total"])),
+        "createdAt":   row.get("created_at"),
+        "updatedAt":   row.get("updated_at"),
+    }
+
+
+async def _resolve_active_account(db: Prisma, account_name: str):
+    """Case-insensitive lookup of an active PmakAccount by name."""
+    account = await db.pmakaccount.find_first(
+        where={
+            "accountName": {"equals": account_name, "mode": "insensitive"},
+            "isActive":    True,
+        }
+    )
+    if not account:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Active PMAK account '{account_name}' not found",
+        )
+    return account
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# § 4  Accounts
+# ═════════════════════════════════════════════════════════════════════════════
+
 async def create_account(db: Prisma, data: PmakAccountCreate):
+    await _ensure_schema(db)
     existing = await db.pmakaccount.find_first(
         where={"accountName": {"equals": data.accountName, "mode": "insensitive"}}
     )
@@ -87,10 +296,13 @@ async def create_account(db: Prisma, data: PmakAccountCreate):
         raise HTTPException(status_code=409, detail="Account name already exists")
 
     account = await db.pmakaccount.create(data={"accountName": data.accountName})
+    ts = await _fetch_account_timestamps(db, account.id)
     return {
         "id":                account.id,
         "accountName":       account.accountName,
         "isActive":          account.isActive,
+        "createdAt":         ts["createdAt"],
+        "updatedAt":         ts["updatedAt"],
         "currentBalance":    0.0,
         "totalTransactions": 0,
         "totalInhouse":      0,
@@ -99,6 +311,7 @@ async def create_account(db: Prisma, data: PmakAccountCreate):
 
 
 async def deactivate_account(db: Prisma, account_id: str):
+    await _ensure_schema(db)
     account = await db.pmakaccount.find_unique(where={"id": account_id})
     if not account:
         raise HTTPException(status_code=404, detail="PMAK account not found")
@@ -106,6 +319,60 @@ async def deactivate_account(db: Prisma, account_id: str):
         where={"id": account_id},
         data={"isActive": False},
     )
+    # Touch updated_at on the raw column
+    try:
+        await db.execute_raw(
+            "UPDATE pmak_accounts SET updated_at = now() WHERE id = $1",
+            account_id,
+        )
+    except Exception:
+        pass
+
+
+async def update_account(db: Prisma, account_id: str, data: PmakAccountCreate):
+    """
+    PATCH /accounts/{account_id} — rename or toggle isActive on a PMAK account.
+    Raises 404 if the account does not exist.
+    Raises 409 if the new name collides with an existing account.
+    """
+    await _ensure_schema(db)
+    account = await db.pmakaccount.find_unique(where={"id": account_id})
+    if not account:
+        raise HTTPException(status_code=404, detail="PMAK account not found")
+
+    if data.accountName and data.accountName != account.accountName:
+        conflict = await db.pmakaccount.find_first(
+            where={
+                "accountName": {"equals": data.accountName, "mode": "insensitive"},
+                "id":          {"not": account_id},
+            }
+        )
+        if conflict:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Account name '{data.accountName}' is already taken.",
+            )
+
+    updated = await db.pmakaccount.update(
+        where={"id": account_id},
+        data={"accountName": data.accountName},
+    )
+    try:
+        await db.execute_raw(
+            "UPDATE pmak_accounts SET updated_at = now() WHERE id = $1",
+            account_id,
+        )
+    except Exception:
+        pass
+
+    ts = await _fetch_account_timestamps(db, account_id)
+    return {
+        "id":          updated.id,
+        "accountName": updated.accountName,
+        "isActive":    updated.isActive,
+        "createdAt":   ts["createdAt"],
+        "updatedAt":   ts["updatedAt"],
+    }
 
 
 async def list_accounts(
@@ -114,9 +381,8 @@ async def list_accounts(
     name:       Optional[str] = None,
     pagination: PageParams = None,
 ):
-    """
-    Combined totals + paginated per-account breakdown.
-    """
+    """Combined totals + paginated per-account breakdown."""
+    await _ensure_schema(db)
     date_filter = filters.to_prisma_filter()
 
     where: dict = {"isActive": True}
@@ -145,12 +411,10 @@ async def list_accounts(
         },
     )
 
-    # ── Latest stored balance per account (single query, no N+1) ─────────────
-    # Order by createdAt DESC — date is @db.Date (day-level only) and cannot
-    # break ties between same-day transactions. createdAt is a full-precision
-    # timestamp that always identifies the true latest row per account.
     account_ids = [a.id for a in accounts]
-    latest_balance_map: dict[str, float] = {}
+
+    # Latest stored balance per account (single query, no N+1)
+    latest_balance_map: dict = {}
     if account_ids:
         all_latest = await db.pmaktransaction.find_many(
             where={"accountId": {"in": account_ids}},
@@ -160,10 +424,8 @@ async def list_accounts(
             if txn.accountId not in latest_balance_map:
                 latest_balance_map[txn.accountId] = float(txn.remainingBalance)
 
-    # ── All-time inhouse order totals per account (single query, no N+1) ─────
-    # Not period-scoped — we want the lifetime deal volume per account for the
-    # accounts table column (totalInhouseOrderAmount).
-    all_time_inhouse_map: dict[str, float] = {}
+    # All-time inhouse order totals per account (single query, no N+1)
+    all_time_inhouse_map: dict = {}
     if account_ids:
         all_inhouse = await db.pmakinhouse.find_many(
             where={"accountId": {"in": account_ids}},
@@ -172,6 +434,9 @@ async def list_accounts(
             all_time_inhouse_map[deal.accountId] = (
                 all_time_inhouse_map.get(deal.accountId, 0.0) + float(deal.orderAmount)
             )
+
+    # Batch-fetch account timestamps (v7)
+    ts_map = await _fetch_all_account_timestamps(db, account_ids)
 
     combined_balance      = 0.0
     combined_credit       = 0.0
@@ -186,10 +451,6 @@ async def list_accounts(
         txns  = sorted(acct.transactions or [], key=lambda t: t.createdAt, reverse=True)
         deals = sorted(acct.inhouseDeals or [], key=lambda d: d.createdAt, reverse=True)
 
-        # currentBalance = remainingBalance of the most recent transaction.
-        # That stored value already IS the running total (computed at write-time as
-        # previous_balance − debit + credit). Adding period figures again would
-        # double-count them. Zero is the correct default when no transactions exist.
         latest_stored_balance = latest_balance_map.get(acct.id, 0.0)
         period_credit         = sum(float(t.credit) for t in txns)
         period_debit          = sum(float(t.debit)  for t in txns)
@@ -210,16 +471,20 @@ async def list_accounts(
             combined_by_status[status_key]["count"]       += v["count"]
             combined_by_status[status_key]["totalAmount"] += v["totalAmount"]
 
+        acct_ts = ts_map.get(acct.id, {"createdAt": None, "updatedAt": None})
+
         account_summaries.append({
             "id":                      acct.id,
             "accountName":             acct.accountName,
             "isActive":                acct.isActive,
+            "createdAt":               acct_ts["createdAt"],
+            "updatedAt":               acct_ts["updatedAt"],
             "currentBalance":          current_balance,
             "periodCredit":            period_credit,
             "periodDebit":             period_debit,
             "transactionCount":        len(txns),
             "inhouseCount":            len(deals),
-            "totalInhouseOrderAmount": total_inhouse_order_amt,   # ← NEW
+            "totalInhouseOrderAmount": total_inhouse_order_amt,
             "inhouseByStatus":         inhouse_by_status,
             "recentTransactions": [_serialize_txn(t, acct.accountName) for t in txns[:5]],
             "recentInhouse":      [_serialize_inhouse(d, acct.accountName) for d in deals[:5]],
@@ -249,9 +514,9 @@ async def list_accounts(
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Ledger Transactions
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# § 5  Ledger Transactions
+# ═════════════════════════════════════════════════════════════════════════════
 
 async def add_transaction(db: Prisma, data: PmakTransactionCreate):
     """
@@ -260,22 +525,9 @@ async def add_transaction(db: Prisma, data: PmakTransactionCreate):
     remainingBalance is auto-computed server-side:
       latest_balance − debit + credit
 
-    The latest balance is resolved by ordering on (createdAt DESC) so that
-    same-day transactions are always sequenced correctly — `date` is a
-    @db.Date (day-level precision) and cannot break ties on its own.
-
-    [FIX-C] The caller may pass `remaining_balance` explicitly to override the
-    auto-computed value (e.g. for manual balance corrections), BUT only a
-    non-zero, non-None value is treated as a deliberate override.  A value of
-    exactly 0 is interpreted as "not provided" — this prevents tools like
-    Swagger UI from accidentally short-circuiting the auto-computation when
-    they echo back the field's numeric default (0) in the request body.
-
-    Three-layer defence ensures the response always matches the DB:
-      1. computed_balance written to the DB via create()
-      2. Transaction re-fetched via find_unique() after create()
-      3. computed_balance injected directly into the response dict
+    The caller may pass remaining_balance explicitly to override (non-zero, non-None).
     """
+    await _ensure_schema(db)
     account = await db.pmakaccount.find_first(
         where={
             "accountName": {"equals": data.account_name, "mode": "insensitive"},
@@ -288,16 +540,12 @@ async def add_transaction(db: Prisma, data: PmakTransactionCreate):
             detail=f"Active PMAK account '{data.account_name}' not found",
         )
 
-    # ── Resolve the latest stored balance (createdAt tiebreaker) ─────────────
-    # `date` is @db.Date — day-level only. Multiple transactions on the same
-    # calendar day would be indistinguishable without the createdAt tiebreaker.
     latest_txn = await db.pmaktransaction.find_first(
         where={"accountId": account.id},
         order={"createdAt": "desc"},
     )
     latest_balance = float(latest_txn.remainingBalance) if latest_txn else 0.0
 
-    # ── Compute remainingBalance; honour caller override only when non-zero ───
     caller_override = (
         data.remaining_balance is not None
         and data.remaining_balance != Decimal("0")
@@ -310,7 +558,6 @@ async def add_transaction(db: Prisma, data: PmakTransactionCreate):
             latest_balance - float(data.debit) + float(data.credit), 2
         )))
 
-    # ── Persist ───────────────────────────────────────────────────────────────
     txn = await db.pmaktransaction.create(
         data={
             "date":             _to_dt(data.date),
@@ -325,15 +572,7 @@ async def add_transaction(db: Prisma, data: PmakTransactionCreate):
         },
     )
 
-    # ── Re-fetch to get the exact persisted DB state (belt-and-suspenders) ───
-    # Prisma's create() return object can have ORM-coercion artefacts on Decimal
-    # fields.  A find_unique() immediately after the write guarantees we read
-    # exactly what was committed to the database.
     persisted_txn = await db.pmaktransaction.find_unique(where={"id": txn.id})
-
-    # ── Serialise; inject computed_balance as the authoritative balance ───────
-    # Three-layer defence: DB write (computed_balance) → re-fetch → override.
-    # The override is the final safety net in case of any ORM round-trip delta.
     response = _serialize_txn(persisted_txn, account.accountName)
     response["remainingBalance"] = computed_balance
     return response
@@ -344,7 +583,16 @@ async def get_account_transactions(
     account_id:  str,
     date_filter: dict,
     pagination:  PageParams = None,
+    search:      Optional[str] = None,
 ):
+    """
+    GET /accounts/{id}/transactions
+
+    v7: Added ``search`` — case-insensitive substring match on details OR
+    a case-insensitive match on accountName (the account name is fixed per
+    endpoint so the useful search here is details-keyword).
+    """
+    await _ensure_schema(db)
     account = await db.pmakaccount.find_unique(where={"id": account_id})
     if not account:
         raise HTTPException(status_code=404, detail="PMAK account not found")
@@ -352,6 +600,8 @@ async def get_account_transactions(
     where: dict = {"accountId": account_id}
     if date_filter:
         where["date"] = date_filter
+    if search:
+        where["details"] = {"contains": search, "mode": "insensitive"}
 
     skip = pagination.skip if pagination else 0
     take = pagination.take if pagination else 50
@@ -364,23 +614,25 @@ async def get_account_transactions(
         take=take,
     )
 
-    # Dynamic balance — same formula as list_accounts [FIX-1]
-    # Order by createdAt DESC (not date DESC) to correctly resolve the latest
-    # row when multiple transactions share the same calendar day.
     latest = await db.pmaktransaction.find_first(
         where={"accountId": account_id},
         order={"createdAt": "desc"},
     )
-    # currentBalance = remainingBalance of the most recent transaction.
-    # That stored value was written as: previous_balance − debit + credit, so it
-    # already IS the full running total. Re-applying period figures would double-count.
     latest_stored   = float(latest.remainingBalance) if latest else 0.0
     period_credit   = sum(float(t.credit) for t in txns)
     period_debit    = sum(float(t.debit)  for t in txns)
     current_balance = round(latest_stored, 2)
 
+    ts = await _fetch_account_timestamps(db, account_id)
+
     return {
-        "account":        {"id": account.id, "accountName": account.accountName, "isActive": account.isActive},
+        "account": {
+            "id":          account.id,
+            "accountName": account.accountName,
+            "isActive":    account.isActive,
+            "createdAt":   ts["createdAt"],
+            "updatedAt":   ts["updatedAt"],
+        },
         "currentBalance": current_balance,
         "periodCredit":   period_credit,
         "periodDebit":    period_debit,
@@ -424,11 +676,86 @@ async def delete_transaction(db: Prisma, transaction_id: str):
     await db.pmaktransaction.delete(where={"id": transaction_id})
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Inhouse Deals — per-account
-# ─────────────────────────────────────────────────────────────────────────────
+async def update_transaction(
+    db:             Prisma,
+    transaction_id: str,
+    data:           PmakTransactionCreate,
+):
+    """
+    PATCH /transactions/{transaction_id} — partial update of any field.
+
+    remainingBalance auto-recomputation when debit/credit changes.
+    """
+    txn = await db.pmaktransaction.find_unique(where={"id": transaction_id})
+    if not txn:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    patch: dict = {}
+
+    if data.date is not None:
+        patch["date"] = _to_dt(data.date)
+    if data.details is not None:
+        patch["details"] = data.details
+    if data.accountFrom is not None:
+        patch["accountFrom"] = data.accountFrom
+    if data.accountTo is not None:
+        patch["accountTo"] = data.accountTo
+    if data.debit is not None:
+        patch["debit"] = data.debit
+    if data.credit is not None:
+        patch["credit"] = data.credit
+
+    computed_balance: Optional[Decimal] = None
+
+    caller_override = (
+        data.remaining_balance is not None
+        and data.remaining_balance != Decimal("0")
+    )
+
+    if caller_override:
+        computed_balance          = Decimal(str(data.remaining_balance))
+        patch["remainingBalance"] = computed_balance
+
+    elif "debit" in patch or "credit" in patch:
+        old_remaining  = float(txn.remainingBalance)
+        old_debit      = float(txn.debit)
+        old_credit     = float(txn.credit)
+        balance_before = old_remaining + old_debit - old_credit
+
+        new_debit  = float(patch.get("debit",  txn.debit))
+        new_credit = float(patch.get("credit", txn.credit))
+
+        computed_balance          = Decimal(str(round(
+            balance_before - new_debit + new_credit, 2
+        )))
+        patch["remainingBalance"] = computed_balance
+
+    if data.status is not None:
+        patch["status"] = data.status.value
+
+    if not patch:
+        account = await db.pmakaccount.find_unique(where={"id": txn.accountId})
+        return _serialize_txn(txn, account.accountName if account else "")
+
+    updated = await db.pmaktransaction.update(
+        where={"id": transaction_id},
+        data=patch,
+    )
+    account = await db.pmakaccount.find_unique(where={"id": updated.accountId})
+    response = _serialize_txn(updated, account.accountName if account else "")
+
+    if computed_balance is not None:
+        response["remainingBalance"] = computed_balance
+
+    return response
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# § 6  Inhouse Deals
+# ═════════════════════════════════════════════════════════════════════════════
 
 async def create_inhouse_deal(db: Prisma, data: PmakInhouseCreate):
+    await _ensure_schema(db)
     account = await db.pmakaccount.find_first(
         where={
             "accountName": {"equals": data.account_name, "mode": "insensitive"},
@@ -461,6 +788,7 @@ async def get_account_inhouse_deals(
     date_filter: dict,
     pagination:  PageParams = None,
 ):
+    await _ensure_schema(db)
     account = await db.pmakaccount.find_unique(where={"id": account_id})
     if not account:
         raise HTTPException(status_code=404, detail="PMAK account not found")
@@ -483,8 +811,16 @@ async def get_account_inhouse_deals(
     inhouse_by_status = _build_inhouse_by_status(deals)
     total_amount      = sum(float(d.orderAmount) for d in deals)
 
+    ts = await _fetch_account_timestamps(db, account_id)
+
     return {
-        "account":         {"id": account.id, "accountName": account.accountName, "isActive": account.isActive},
+        "account": {
+            "id":          account.id,
+            "accountName": account.accountName,
+            "isActive":    account.isActive,
+            "createdAt":   ts["createdAt"],
+            "updatedAt":   ts["updatedAt"],
+        },
         "inhouseByStatus": inhouse_by_status,
         "totalAmount":     total_amount,
         "pagination": {
@@ -497,10 +833,6 @@ async def get_account_inhouse_deals(
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Inhouse Deals — ALL accounts (GET /pmak/inhouse)
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def list_all_inhouse_deals(
     db:           Prisma,
     filters:      DateRangeFilter,
@@ -509,23 +841,20 @@ async def list_all_inhouse_deals(
     buyer_name:   Optional[str] = None,
     seller_name:  Optional[str] = None,
     order_status: Optional[str] = None,
+    search:       Optional[str] = None,
 ):
     """
     Cross-account flat deal list with combined totals.
-
-    Returns:
-      filter    — period metadata
-      totals    — totalDeals, totalAmount, byStatus (all 4 statuses with count + totalAmount)
-      pagination — page, pageSize, total, totalPages
-      deals     — paginated flat list, each row includes accountName
 
     Filters (all combinable):
       account_name  — case-insensitive substring on PmakAccount.accountName
       buyer_name    — case-insensitive substring on PmakInhouse.buyerName
       seller_name   — case-insensitive substring on PmakInhouse.sellerName
       order_status  — exact enum: PENDING | IN_PROGRESS | COMPLETED | CANCELLED
+      search        — case-insensitive keyword search on PmakInhouse.details
       period / from / to / year / month — standard DateRangeFilter
     """
+    await _ensure_schema(db)
     date_filter = filters.to_prisma_filter()
 
     where: dict = {}
@@ -539,8 +868,11 @@ async def list_all_inhouse_deals(
     if seller_name:
         where["sellerName"] = {"contains": seller_name, "mode": "insensitive"}
 
+    if search:
+        where["details"] = {"contains": search, "mode": "insensitive"}
+
     if order_status:
-        valid = {"PENDING", "IN_PROGRESS", "COMPLETED", "CANCELLED"}
+        valid     = {"PENDING", "IN_PROGRESS", "COMPLETED", "CANCELLED"}
         normalised = order_status.upper()
         if normalised not in valid:
             raise HTTPException(
@@ -599,10 +931,8 @@ async def update_inhouse_deal(
 ):
     """
     PATCH /inhouse/{deal_id} — Full optional-field update.
-
-    [FIX-3] All seven inhouse fields are now individually patchable.
     If account_name is supplied the deal is re-linked to the new account.
-    Sending an empty body {} is idempotent — returns current state unchanged.
+    Sending an empty body {} is idempotent.
     """
     deal = await db.pmakinhouse.find_unique(
         where={"id": deal_id},
@@ -613,7 +943,6 @@ async def update_inhouse_deal(
 
     update_data: dict = {}
 
-    # Re-assign to a different account if requested
     new_account = None
     if data.account_name is not None:
         new_account = await db.pmakaccount.find_first(
@@ -642,7 +971,6 @@ async def update_inhouse_deal(
     if data.order_status is not None:
         update_data["orderStatus"] = data.order_status.value
 
-    # Idempotent — return current state if nothing changed
     if not update_data:
         account_name = deal.account.accountName if deal.account else ""
         return _serialize_inhouse(deal, account_name)
@@ -652,7 +980,6 @@ async def update_inhouse_deal(
         data=update_data,
     )
 
-    # Resolve account name for serialisation
     if new_account:
         resolved_account_name = new_account.accountName
     elif deal.account:
@@ -671,9 +998,440 @@ async def delete_inhouse_deal(db: Prisma, deal_id: str):
     await db.pmakinhouse.delete(where={"id": deal_id})
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Excel Export — single account
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# § 7  Tools CRUD  (pmak_tools — raw SQL, schema.prisma untouched)
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def add_tool(db: Prisma, data: PmakToolCreate):
+    """
+    POST /tools — Add a PMAK Tools ledger entry.
+
+    total = latest_total_for_account − debit + credit
+    (same running-balance semantics as Transactions.remainingBalance).
+    """
+    await _ensure_schema(db)
+
+    account = await _resolve_active_account(db, data.account_name)
+
+    # Resolve latest stored total for this account
+    rows = await db.query_raw(
+        """
+        SELECT total FROM pmak_tools
+         WHERE account_id = $1
+         ORDER BY created_at DESC
+         LIMIT 1
+        """,
+        account.id,
+    )
+    latest_total = float(rows[0]["total"]) if rows else 0.0
+
+    debit  = float(data.debit  or 0)
+    credit = float(data.credit or 0)
+
+    caller_override = (
+        data.total is not None
+        and data.total != Decimal("0")
+    )
+    if caller_override:
+        computed_total = float(data.total)
+    else:
+        computed_total = round(latest_total - debit + credit, 2)
+
+    # Prisma execute_raw encodes params via its JSON builder.
+    # DATE columns require a "YYYY-MM-DD" string param with a ::date cast in SQL.
+    # TIMESTAMPTZ columns require an ISO-8601 string with a ::timestamptz cast.
+    # This is the exact same pattern list_all_tools / get_account_tools already
+    # use successfully for their WHERE date filters.
+    tool_date_str = (data.date or dt_date.today()).isoformat()   # "YYYY-MM-DD"
+    tool_id       = str(uuid.uuid4())
+    now_str       = _now_utc().isoformat()                       # ISO-8601 with tz
+
+    await db.execute_raw(
+        """
+        INSERT INTO pmak_tools
+            (id, account_id, date, details, debit, credit, total, created_at, updated_at)
+        VALUES ($1, $2, $3::date, $4, $5, $6, $7, $8::timestamptz, $9::timestamptz)
+        """,
+        tool_id,
+        account.id,
+        tool_date_str,   # "YYYY-MM-DD" string  →  ::date cast  → PostgreSQL DATE
+        data.details,
+        debit,
+        credit,
+        computed_total,
+        now_str,         # ISO-8601 string  →  ::timestamptz cast  → PostgreSQL TIMESTAMPTZ
+        now_str,
+    )
+
+    rows = await db.query_raw(
+        "SELECT * FROM pmak_tools WHERE id = $1",
+        tool_id,
+    )
+    return _serialize_tool_row(rows[0], account.accountName)
+
+
+async def list_all_tools(
+    db:           Prisma,
+    filters:      DateRangeFilter,
+    pagination:   PageParams,
+    account_name: Optional[str] = None,
+    search:       Optional[str] = None,
+):
+    """
+    GET /tools — Cross-account flat tools list with per-account totals.
+
+    Response shape:
+      filter     — period metadata
+      accounts   — per-account aggregates: accountId, accountName,
+                   totalDebit, totalCredit, latestTotal, entryCount
+      pagination — page, pageSize, total, totalPages
+      tools      — paginated flat rows (each includes accountName)
+
+    Filters (all combinable):
+      account_name — case-insensitive substring on account name
+      search       — case-insensitive substring on the details field
+      period / from / to / year / month — standard DateRangeFilter
+    """
+    await _ensure_schema(db)
+
+    # ── Build shared WHERE clause ─────────────────────────────────────────────
+    conditions: List[str] = []
+    params:     List     = []
+    p = 1  # PostgreSQL placeholder counter
+
+    date_meta = filters.to_prisma_filter()
+    if date_meta:
+        if "gte" in date_meta and "lte" in date_meta:
+            conditions.append(f"t.date >= ${p}::date AND t.date <= ${p+1}::date")
+            params.extend([date_meta["gte"].isoformat()[:10], date_meta["lte"].isoformat()[:10]])
+            p += 2
+        elif "gte" in date_meta:
+            conditions.append(f"t.date >= ${p}::date")
+            params.append(date_meta["gte"].isoformat()[:10])
+            p += 1
+        elif "lte" in date_meta:
+            conditions.append(f"t.date <= ${p}::date")
+            params.append(date_meta["lte"].isoformat()[:10])
+            p += 1
+
+    if account_name:
+        conditions.append(f'LOWER(a."accountName") LIKE ${p}')
+        params.append(f"%{account_name.lower()}%")
+        p += 1
+
+    if search:
+        conditions.append(f"LOWER(t.details) LIKE ${p}")
+        params.append(f"%{search.lower()}%")
+        p += 1
+
+    where_sql = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    # ── Total row count (for pagination) ──────────────────────────────────────
+    count_rows = await db.query_raw(
+        f"""
+        SELECT COUNT(*) AS cnt
+          FROM pmak_tools t
+          JOIN pmak_accounts a ON a.id = t.account_id
+         {where_sql}
+        """,
+        *params,
+    )
+    total = int(count_rows[0]["cnt"]) if count_rows else 0
+
+    # ── Per-account aggregates ─────────────────────────────────────────────────
+    # Group by account so the UI can show a "totals per account" breakdown
+    # regardless of which page of entries is currently visible.
+    #
+    # latestTotal: correlated sub-select fetches the `total` column from the
+    # chronologically last row for each account (ORDER BY created_at DESC LIMIT 1).
+    # MAX(t.total) is WRONG — it returns the highest value ever, not the current
+    # running balance (which decreases on debit entries).
+    per_account_rows = await db.query_raw(
+        f"""
+        SELECT
+            t.account_id                        AS account_id,
+            a."accountName"                     AS account_name,
+            COUNT(*)                            AS entry_count,
+            COALESCE(SUM(t.debit),  0)          AS total_debit,
+            COALESCE(SUM(t.credit), 0)          AS total_credit,
+            COALESCE(
+                (
+                  SELECT t2.total
+                    FROM pmak_tools t2
+                   WHERE t2.account_id = t.account_id
+                   ORDER BY t2.created_at DESC
+                   LIMIT 1
+                ), 0
+            )                                   AS latest_total
+          FROM pmak_tools t
+          JOIN pmak_accounts a ON a.id = t.account_id
+         {where_sql}
+         GROUP BY t.account_id, a."accountName"
+         ORDER BY a."accountName" ASC
+        """,
+        *params,
+    )
+    accounts_summary = [
+        {
+            "accountId":   r["account_id"],
+            "accountName": r["account_name"],
+            "entryCount":  int(r["entry_count"]),
+            "totalDebit":  float(r["total_debit"]),
+            "totalCredit": float(r["total_credit"]),
+            "latestTotal": float(r["latest_total"]),
+        }
+        for r in per_account_rows
+    ]
+
+    # ── Paginated flat tool rows ───────────────────────────────────────────────
+    skip = pagination.skip
+    take = pagination.take
+    rows = await db.query_raw(
+        f"""
+        SELECT t.*, a."accountName" AS account_name
+          FROM pmak_tools t
+          JOIN pmak_accounts a ON a.id = t.account_id
+         {where_sql}
+         ORDER BY t.date DESC, t.created_at DESC
+         LIMIT ${p} OFFSET ${p+1}
+        """,
+        *params,
+        take,
+        skip,
+    )
+
+    tools = []
+    for row in rows:
+        account_name_val = row.pop("account_name", "")
+        tools.append(_serialize_tool_row(row, account_name_val))
+
+    return {
+        "filter":   filters.meta(),
+        "accounts": accounts_summary,
+        "pagination": {
+            "page":       pagination.page,
+            "pageSize":   take,
+            "total":      total,
+            "totalPages": max(1, -(-total // take)),
+        },
+        "tools": tools,
+    }
+
+
+async def get_account_tools(
+    db:          Prisma,
+    account_id:  str,
+    date_filter: dict,
+    pagination:  PageParams = None,
+    search:      Optional[str] = None,
+):
+    """
+    GET /accounts/{id}/tools — Period-aware tools list for one account.
+
+    search — case-insensitive substring on details.
+    """
+    await _ensure_schema(db)
+
+    account = await db.pmakaccount.find_unique(where={"id": account_id})
+    if not account:
+        raise HTTPException(status_code=404, detail="PMAK account not found")
+
+    conditions: List[str] = ["account_id = $1"]
+    params:     List     = [account_id]
+    p = 2
+
+    if date_filter:
+        if "gte" in date_filter and "lte" in date_filter:
+            conditions.append(f"date >= ${p}::date AND date <= ${p+1}::date")
+            params.extend([date_filter["gte"].isoformat()[:10], date_filter["lte"].isoformat()[:10]])
+            p += 2
+        elif "gte" in date_filter:
+            conditions.append(f"date >= ${p}::date")
+            params.append(date_filter["gte"].isoformat()[:10])
+            p += 1
+        elif "lte" in date_filter:
+            conditions.append(f"date <= ${p}::date")
+            params.append(date_filter["lte"].isoformat()[:10])
+            p += 1
+
+    if search:
+        conditions.append(f"LOWER(details) LIKE ${p}")
+        params.append(f"%{search.lower()}%")
+        p += 1
+
+    where_sql = "WHERE " + " AND ".join(conditions)
+
+    skip = pagination.skip if pagination else 0
+    take = pagination.take if pagination else 50
+
+    count_rows = await db.query_raw(
+        f"SELECT COUNT(*) AS cnt FROM pmak_tools {where_sql}",
+        *params,
+    )
+    total = int(count_rows[0]["cnt"]) if count_rows else 0
+
+    agg_rows = await db.query_raw(
+        f"""
+        SELECT
+            COALESCE(SUM(debit),  0)                          AS total_debit,
+            COALESCE(SUM(credit), 0)                          AS total_credit,
+            COALESCE(
+                (
+                  SELECT t2.total
+                    FROM pmak_tools t2
+                   WHERE t2.account_id = $1
+                   ORDER BY t2.created_at DESC
+                   LIMIT 1
+                ), 0
+            )                                                 AS latest_total
+          FROM pmak_tools {where_sql}
+        """,
+        *params,
+    )
+    agg = agg_rows[0] if agg_rows else {}
+
+    rows = await db.query_raw(
+        f"""
+        SELECT * FROM pmak_tools {where_sql}
+         ORDER BY date DESC, created_at DESC
+         LIMIT ${p} OFFSET ${p+1}
+        """,
+        *params,
+        take,
+        skip,
+    )
+
+    ts = await _fetch_account_timestamps(db, account_id)
+
+    return {
+        "account": {
+            "id":          account.id,
+            "accountName": account.accountName,
+            "isActive":    account.isActive,
+            "createdAt":   ts["createdAt"],
+            "updatedAt":   ts["updatedAt"],
+        },
+        "totalDebit":  float(agg.get("total_debit",  0)),
+        "totalCredit": float(agg.get("total_credit", 0)),
+        "latestTotal": float(agg.get("latest_total", 0)),
+        "pagination": {
+            "page":       pagination.page if pagination else 1,
+            "pageSize":   take,
+            "total":      total,
+            "totalPages": max(1, -(-total // take)),
+        },
+        "tools": [_serialize_tool_row(r, account.accountName) for r in rows],
+    }
+
+
+async def update_tool(db: Prisma, tool_id: str, data: PmakToolUpdate):
+    """
+    PATCH /tools/{tool_id} — Partial update of any field.
+
+    Same auto-recompute logic as update_transaction for debit/credit changes.
+    """
+    await _ensure_schema(db)
+
+    rows = await db.query_raw(
+        "SELECT * FROM pmak_tools WHERE id = $1",
+        tool_id,
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="PMAK tool entry not found")
+    current = rows[0]
+
+    # Resolve new account if requested
+    new_account = None
+    if data.account_name is not None:
+        new_account = await _resolve_active_account(db, data.account_name)
+
+    # Build the field-level patch dict
+    patch: dict = {}
+
+    if new_account:
+        patch["account_id"] = new_account.id
+    if data.date is not None:
+        patch["date"] = data.date.isoformat()   # "YYYY-MM-DD" string — will be cast ::date in SET clause
+    if data.details is not None:
+        patch["details"] = data.details
+    if data.debit is not None:
+        patch["debit"] = float(data.debit)
+    if data.credit is not None:
+        patch["credit"] = float(data.credit)
+
+    # ── total resolution ─────────────────────────────────────────────────────
+    computed_total: Optional[float] = None
+
+    caller_override = (
+        data.total is not None
+        and data.total != Decimal("0")
+    )
+
+    if caller_override:
+        computed_total = float(data.total)
+        patch["total"] = computed_total
+
+    elif "debit" in patch or "credit" in patch:
+        old_total  = float(current["total"])
+        old_debit  = float(current["debit"])
+        old_credit = float(current["credit"])
+        # Reverse the stored formula to get balance before this entry
+        balance_before = old_total + old_debit - old_credit
+        new_debit  = patch.get("debit",  old_debit)
+        new_credit = patch.get("credit", old_credit)
+        computed_total = round(balance_before - new_debit + new_credit, 2)
+        patch["total"] = computed_total
+
+    # Idempotent — nothing changed
+    if not patch:
+        acct = await db.pmakaccount.find_unique(where={"id": current["account_id"]})
+        return _serialize_tool_row(current, acct.accountName if acct else "")
+
+    patch["updated_at"] = _now_utc().isoformat()  # ISO-8601 string — will be cast ::timestamptz in SET clause
+
+    # Build SET clauses with explicit type casts for date/timestamptz columns.
+    # All other columns (TEXT, NUMERIC) need no cast — bare $N is fine.
+    _DATE_CAST  = {"date": "::date", "created_at": "::timestamptz", "updated_at": "::timestamptz"}
+    set_clauses = [
+        f"{col} = ${i+2}{_DATE_CAST.get(col, '')}"
+        for i, col in enumerate(patch)
+    ]
+    sql_params  = [tool_id] + list(patch.values())
+    await db.execute_raw(
+        f"UPDATE pmak_tools SET {', '.join(set_clauses)} WHERE id = $1",
+        *sql_params,
+    )
+
+    updated_rows = await db.query_raw(
+        "SELECT * FROM pmak_tools WHERE id = $1",
+        tool_id,
+    )
+    row = updated_rows[0]
+    account_id   = new_account.id if new_account else current["account_id"]
+    acct         = await db.pmakaccount.find_unique(where={"id": account_id})
+    account_name = acct.accountName if acct else ""
+
+    serialized = _serialize_tool_row(row, account_name)
+    if computed_total is not None:
+        serialized["total"] = Decimal(str(computed_total))
+    return serialized
+
+
+async def delete_tool(db: Prisma, tool_id: str):
+    """DELETE /tools/{tool_id} — Hard delete."""
+    await _ensure_schema(db)
+    rows = await db.query_raw(
+        "SELECT id FROM pmak_tools WHERE id = $1",
+        tool_id,
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="PMAK tool entry not found")
+    await db.execute_raw("DELETE FROM pmak_tools WHERE id = $1", tool_id)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# § 8  Excel Export — single account  (3 sheets: Ledger + Inhouse + Tools)
+# ═════════════════════════════════════════════════════════════════════════════
 
 _HEADER_FILL = PatternFill("solid", fgColor="1F3864")
 _HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
@@ -682,7 +1440,7 @@ _CENTER      = Alignment(horizontal="center", vertical="center")
 _LEFT        = Alignment(horizontal="left",   vertical="center", wrap_text=True)
 
 
-def _apply_header(ws, headers: list[str], col_widths: list[int]) -> None:
+def _apply_header(ws, headers: list, col_widths: list) -> None:
     ws.row_dimensions[1].height = 22
     for idx, (h, w) in enumerate(zip(headers, col_widths), start=1):
         cell           = ws.cell(row=1, column=idx, value=h)
@@ -696,8 +1454,14 @@ async def export_account_excel(
     db:         Prisma,
     account_id: str,
     filters:    DateRangeFilter,
-) -> tuple[bytes, str]:
-    """Two-sheet workbook: Ledger + Inhouse Deals."""
+) -> tuple:
+    """
+    Three-sheet workbook:
+      Sheet 1 — Ledger Transactions
+      Sheet 2 — Inhouse Deals
+      Sheet 3 — Tools
+    """
+    await _ensure_schema(db)
     account = await db.pmakaccount.find_unique(where={"id": account_id})
     if not account:
         raise HTTPException(status_code=404, detail="PMAK account not found")
@@ -712,7 +1476,36 @@ async def export_account_excel(
     txns  = await db.pmaktransaction.find_many(where=txn_where,  order={"date": "asc"})
     deals = await db.pmakinhouse.find_many(    where=deal_where, order={"date": "asc"})
 
+    # Fetch tools for this account with optional date filter
+    tool_conditions: List[str] = ["account_id = $1"]
+    tool_params:     List     = [account_id]
+    tp = 2
+    if date_filter:
+        if "gte" in date_filter and "lte" in date_filter:
+            tool_conditions.append(f"date >= ${tp}::date AND date <= ${tp+1}::date")
+            tool_params.extend([
+                date_filter["gte"].isoformat()[:10],
+                date_filter["lte"].isoformat()[:10],
+            ])
+            tp += 2
+        elif "gte" in date_filter:
+            tool_conditions.append(f"date >= ${tp}::date")
+            tool_params.append(date_filter["gte"].isoformat()[:10])
+            tp += 1
+        elif "lte" in date_filter:
+            tool_conditions.append(f"date <= ${tp}::date")
+            tool_params.append(date_filter["lte"].isoformat()[:10])
+            tp += 1
+
+    tool_where_sql = "WHERE " + " AND ".join(tool_conditions)
+    tool_rows = await db.query_raw(
+        f"SELECT * FROM pmak_tools {tool_where_sql} ORDER BY date ASC, created_at ASC",
+        *tool_params,
+    )
+
     wb  = openpyxl.Workbook()
+
+    # ── Sheet 1: Ledger Transactions ─────────────────────────────────────────
     ws1 = wb.active
     ws1.title = "Ledger"
     _apply_header(ws1, [
@@ -739,6 +1532,7 @@ async def export_account_excel(
                 cell.fill = fill
     ws1.freeze_panes = "A2"
 
+    # ── Sheet 2: Inhouse Deals ───────────────────────────────────────────────
     ws2 = wb.create_sheet("Inhouse Deals")
     _apply_header(ws2, [
         "Date", "Buyer", "Seller", "Amount", "Status", "Details",
@@ -761,6 +1555,38 @@ async def export_account_excel(
                 cell.fill = fill
     ws2.freeze_panes = "A2"
 
+    # ── Sheet 3: Tools ───────────────────────────────────────────────────────
+    ws3 = wb.create_sheet("Tools")
+    _apply_header(ws3, [
+        "Date", "Details", "Debit", "Credit", "Total",
+    ], [12, 42, 12, 12, 14])
+
+    for row_idx, r in enumerate(tool_rows, start=2):
+        fill = _ALT_FILL if row_idx % 2 == 0 else None
+        raw_date = r.get("date")
+        if isinstance(raw_date, datetime):
+            date_str = raw_date.date().isoformat()
+        elif isinstance(raw_date, dt_date):
+            date_str = raw_date.isoformat()
+        elif isinstance(raw_date, str):
+            date_str = raw_date[:10]
+        else:
+            date_str = ""
+
+        vals = [
+            date_str,
+            r.get("details") or "",
+            float(r.get("debit",  0)),
+            float(r.get("credit", 0)),
+            float(r.get("total",  0)),
+        ]
+        for col_idx, val in enumerate(vals, start=1):
+            cell           = ws3.cell(row=row_idx, column=col_idx, value=val)
+            cell.alignment = _CENTER if col_idx in (1, 3, 4, 5) else _LEFT
+            if fill:
+                cell.fill = fill
+    ws3.freeze_panes = "A2"
+
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
@@ -771,192 +1597,103 @@ async def export_account_excel(
     return buffer.read(), filename
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Internal serialisers
-# ─────────────────────────────────────────────────────────────────────────────
 
-def _serialize_txn(txn, account_name: str) -> dict:
-    return {
-        "id":               txn.id,
-        "accountId":        txn.accountId,
-        "accountName":      account_name,
-        "date":             txn.date.date() if hasattr(txn.date, "date") else txn.date,
-        "details":          txn.details,
-        "accountFrom":      txn.accountFrom,
-        "accountTo":        txn.accountTo,
-        "debit":            txn.debit,
-        "credit":           txn.credit,
-        "remainingBalance": txn.remainingBalance,
-        "status":           txn.status if isinstance(txn.status, str) else txn.status.value,
-        "createdAt":        txn.createdAt,
-    }
-
-
-def _serialize_inhouse(deal, account_name: str) -> dict:
-    return {
-        "id":          deal.id,
-        "accountId":   deal.accountId,
-        "accountName": account_name,
-        "date":        deal.date.date() if hasattr(deal.date, "date") else deal.date,
-        "details":     deal.details,
-        "buyerName":   deal.buyerName,
-        "sellerName":  deal.sellerName,
-        "orderAmount": deal.orderAmount,
-        "orderStatus": deal.orderStatus if isinstance(deal.orderStatus, str) else deal.orderStatus.value,
-        "createdAt":   deal.createdAt,
-        "updatedAt":   deal.updatedAt,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# v5 additions — PATCH /accounts/{account_id}  &  PATCH /transactions/{id}
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def update_account(db: Prisma, account_id: str, data: PmakAccountCreate):
-    """
-    PATCH /accounts/{account_id} — rename or toggle isActive on a PMAK account.
-    Raises 404 if the account does not exist.
-    Raises 409 if the new name collides with an existing account.
-    """
-    account = await db.pmakaccount.find_unique(where={"id": account_id})
-    if not account:
-        raise HTTPException(status_code=404, detail="PMAK account not found")
-
-    if data.accountName and data.accountName != account.accountName:
-        conflict = await db.pmakaccount.find_first(
-            where={
-                "accountName": {"equals": data.accountName, "mode": "insensitive"},
-                "id":          {"not": account_id},
-            }
-        )
-        if conflict:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Account name '{data.accountName}' is already taken.",
-            )
-
-    updated = await db.pmakaccount.update(
-        where={"id": account_id},
-        data={"accountName": data.accountName},
-    )
-    return {
-        "id":          updated.id,
-        "accountName": updated.accountName,
-        "isActive":    updated.isActive,
-    }
-
-
-async def update_transaction(
-    db:             Prisma,
-    transaction_id: str,
-    data:           PmakTransactionCreate,
+async def list_all_transactions(
+    db:           Prisma,
+    filters:      DateRangeFilter,
+    pagination:   PageParams,
+    account_name: Optional[str] = None,
+    search:       Optional[str] = None,
+    status:       Optional[str] = None,
 ):
     """
-    PATCH /transactions/{transaction_id} — partial update of any transaction field.
+    GET /transactions — Cross-account flat transaction list.
 
-    remainingBalance auto-recalculation when debit/credit changes.
-
-    If the caller updates `debit` and/or `credit` but does NOT supply an
-    explicit `remaining_balance` override, the service now automatically
-    recomputes the running balance using the reverse of the ledger formula:
-
-        balance_before_this_txn = old_remainingBalance + old_debit − old_credit
-        new_remainingBalance     = balance_before_this_txn − new_debit + new_credit
-
-    This guarantees the balance stored in the DB and returned in the response
-    always reflects the actual debit/credit values on the row, regardless of
-    whether the caller remembered to supply `remaining_balance`.
-
-    The caller may still pass `remaining_balance` explicitly (non-zero, non-None)
-    to force a manual correction — that value takes precedence.
-
-    Raises 404 if the transaction does not exist.
+    Filters (all combinable):
+      account_name — case-insensitive substring on PmakAccount.accountName
+      search       — case-insensitive keyword search on PmakTransaction.details
+      status       — exact enum: PENDING | CLEARED | ON_HOLD | REJECTED
+      period / from / to / year / month — standard DateRangeFilter
     """
-    txn = await db.pmaktransaction.find_unique(where={"id": transaction_id})
-    if not txn:
-        raise HTTPException(status_code=404, detail="Transaction not found")
+    await _ensure_schema(db)
+    date_filter = filters.to_prisma_filter()
 
-    patch: dict = {}
+    where: dict = {}
 
-    if data.date is not None:
-        patch["date"] = _to_dt(data.date)
-    if data.details is not None:
-        patch["details"] = data.details
-    if data.accountFrom is not None:
-        patch["accountFrom"] = data.accountFrom
-    if data.accountTo is not None:
-        patch["accountTo"] = data.accountTo
-    if data.debit is not None:
-        patch["debit"] = data.debit
-    if data.credit is not None:
-        patch["credit"] = data.credit
+    if date_filter:
+        where["date"] = date_filter
 
-    # ── remainingBalance resolution (three-way priority) ─────────────────────
-    # Priority 1: explicit non-zero caller override → trust it as a correction
-    # Priority 2: debit or credit changed → auto-recompute from stored state
-    # Priority 3: neither → leave remainingBalance unchanged in the DB
+    if search:
+        where["details"] = {"contains": search, "mode": "insensitive"}
 
-    computed_balance: Optional[Decimal] = None
+    if status:
+        valid_statuses = {"PENDING", "CLEARED", "ON_HOLD", "REJECTED"}
+        normalised = status.upper()
+        if normalised not in valid_statuses:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status '{status}'. "
+                       f"Valid values: {', '.join(sorted(valid_statuses))}",
+            )
+        where["status"] = normalised
 
-    caller_override = (
-        data.remaining_balance is not None
-        and data.remaining_balance != Decimal("0")
+    account_filter: dict = {"isActive": True}
+    if account_name:
+        account_filter["accountName"] = {"contains": account_name, "mode": "insensitive"}
+    where["account"] = {"is": account_filter}
+
+    total = await db.pmaktransaction.count(where=where)
+
+    txns = await db.pmaktransaction.find_many(
+        where=where,
+        order={"date": "desc"},
+        skip=pagination.skip,
+        take=pagination.take,
+        include={"account": True},
     )
 
-    if caller_override:
-        # [Priority 1] Manual balance correction supplied by the caller.
-        computed_balance           = Decimal(str(data.remaining_balance))
-        patch["remainingBalance"]  = computed_balance
+    # Aggregates across the full matching set (not just this page)
+    all_txns_for_totals = await db.pmaktransaction.find_many(where=where)
+    total_debit  = sum(float(t.debit)  for t in all_txns_for_totals)
+    total_credit = sum(float(t.credit) for t in all_txns_for_totals)
 
-    elif "debit" in patch or "credit" in patch:
-        # [Priority 2] Debit or credit changed — auto-derive the new balance.
-        #
-        # Reverse the stored formula to recover the balance BEFORE this entry:
-        #   stored formula:  remainingBalance = balance_before − debit + credit
-        #   reversed:        balance_before   = remainingBalance + debit − credit
-        #
-        # Then apply the updated values:
-        #   new_remainingBalance = balance_before − new_debit + new_credit
-        old_remaining   = float(txn.remainingBalance)
-        old_debit       = float(txn.debit)
-        old_credit      = float(txn.credit)
-        balance_before  = old_remaining + old_debit - old_credit
+    def _serialize_txn_with_account(t) -> dict:
+        return {
+            "id":               t.id,
+            "accountId":        t.accountId,
+            "accountName":      t.account.accountName if t.account else "",
+            "date":             t.date.date() if hasattr(t.date, "date") else t.date,
+            "details":          t.details,
+            "accountFrom":      t.accountFrom,
+            "accountTo":        t.accountTo,
+            "debit":            t.debit,
+            "credit":           t.credit,
+            "remainingBalance": t.remainingBalance,
+            "status":           t.status if isinstance(t.status, str) else t.status.value,
+            "createdAt":        t.createdAt,
+        }
 
-        new_debit  = float(patch.get("debit",  txn.debit))
-        new_credit = float(patch.get("credit", txn.credit))
+    return {
+        "filter": filters.meta(),
+        "totals": {
+            "totalTransactions": total,
+            "totalDebit":        round(total_debit,  2),
+            "totalCredit":       round(total_credit, 2),
+        },
+        "pagination": {
+            "page":       pagination.page,
+            "pageSize":   pagination.take,
+            "total":      total,
+            "totalPages": max(1, -(-total // pagination.take)),
+        },
+        "transactions": [_serialize_txn_with_account(t) for t in txns],
+    }
 
-        computed_balance           = Decimal(str(round(
-            balance_before - new_debit + new_credit, 2
-        )))
-        patch["remainingBalance"]  = computed_balance
+# ═════════════════════════════════════════════════════════════════════════════
+# § 9  Name aliases — router uses short names; keep both sides in sync
+# ═════════════════════════════════════════════════════════════════════════════
 
-    if data.status is not None:
-        patch["status"] = data.status.value
-
-    # Idempotent — nothing changed
-    if not patch:
-        account = await db.pmakaccount.find_unique(where={"id": txn.accountId})
-        return _serialize_txn(txn, account.accountName if account else "")
-
-    updated = await db.pmaktransaction.update(
-        where={"id": transaction_id},
-        data=patch,
-    )
-    account = await db.pmakaccount.find_unique(where={"id": updated.accountId})
-
-    response = _serialize_txn(updated, account.accountName if account else "")
-
-    # ── Inject computed balance into response (belt-and-suspenders) ───────────
-    # If we auto-computed or accepted a caller override, inject it directly so
-    # the response always reflects the exact value written to the DB, regardless
-    # of any ORM Decimal coercion in the update() return object.
-    if computed_balance is not None:
-        response["remainingBalance"] = computed_balance
-
-    return response
-
-
-# ── Name aliases — router uses short names; keep both sides in sync ───────────
+list_transactions   = list_all_transactions
 add_inhouse         = create_inhouse_deal
 update_inhouse      = update_inhouse_deal
 delete_inhouse      = delete_inhouse_deal

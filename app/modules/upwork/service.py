@@ -45,6 +45,153 @@ _SNAPSHOT_FIELDS = frozenset({
     "upwork_plus",
 })
 
+# ─────────────────────────────────────────────────────────────────────────────
+# § TS  Timestamp bootstrap — adds createdAt / updatedAt to Upwork tables
+#       that are absent from schema.prisma (file cannot be touched).
+#
+#       upwork_profiles  — no timestamps at all in Prisma schema
+#       upwork_entries   — has createdAt; missing updatedAt
+#       upwork_orders    — has createdAt; missing updatedAt
+#
+#       Each ALTER is a separate execute_raw call — PostgreSQL extended-query
+#       protocol forbids multiple commands per prepared statement.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_UPWORK_TS_DDL: list[str] = [
+    # upwork_profiles — no timestamps in Prisma schema
+    """
+    DO $$ BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_name='upwork_profiles' AND column_name='created_at'
+      ) THEN
+        ALTER TABLE upwork_profiles ADD COLUMN created_at TIMESTAMPTZ DEFAULT now();
+      END IF;
+    END $$
+    """,
+    """
+    DO $$ BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_name='upwork_profiles' AND column_name='updated_at'
+      ) THEN
+        ALTER TABLE upwork_profiles ADD COLUMN updated_at TIMESTAMPTZ DEFAULT now();
+      END IF;
+    END $$
+    """,
+    # upwork_entries — Prisma has createdAt; missing updatedAt
+    """
+    DO $$ BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_name='upwork_entries' AND column_name='updated_at'
+      ) THEN
+        ALTER TABLE upwork_entries ADD COLUMN updated_at TIMESTAMPTZ DEFAULT now();
+      END IF;
+    END $$
+    """,
+    # upwork_orders — Prisma has createdAt; missing updatedAt
+    """
+    DO $$ BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_name='upwork_orders' AND column_name='updated_at'
+      ) THEN
+        ALTER TABLE upwork_orders ADD COLUMN updated_at TIMESTAMPTZ DEFAULT now();
+      END IF;
+    END $$
+    """,
+]
+
+_upwork_ts_done = False
+
+
+async def _ensure_upwork_timestamps(db: Prisma) -> None:
+    """
+    Idempotent bootstrap — runs once per process lifetime.
+
+    Adds createdAt / updatedAt columns to Upwork tables where Prisma didn't
+    generate them.  Every DDL statement is a separate execute_raw call so
+    PostgreSQL's extended-query protocol is never violated.
+    """
+    global _upwork_ts_done
+    if _upwork_ts_done:
+        return
+    for stmt in _UPWORK_TS_DDL:
+        await db.execute_raw(stmt)
+    _upwork_ts_done = True
+
+
+# ── Raw-column timestamp helpers ──────────────────────────────────────────────
+
+async def _fetch_profile_timestamps(db: Prisma, profile_id: str) -> dict:
+    """Read raw created_at / updated_at from upwork_profiles. Falls back to None."""
+    try:
+        rows = await db.query_raw(
+            "SELECT created_at, updated_at FROM upwork_profiles WHERE id = $1",
+            profile_id,
+        )
+        if rows:
+            return {
+                "createdAt": rows[0].get("created_at"),
+                "updatedAt": rows[0].get("updated_at"),
+            }
+    except Exception:
+        pass
+    return {"createdAt": None, "updatedAt": None}
+
+
+async def _fetch_entry_updated_at(db: Prisma, entry_id: str):
+    """Read raw updated_at from upwork_entries. Returns None on any error."""
+    try:
+        rows = await db.query_raw(
+            "SELECT updated_at FROM upwork_entries WHERE id = $1",
+            entry_id,
+        )
+        if rows:
+            return rows[0].get("updated_at")
+    except Exception:
+        pass
+    return None
+
+
+async def _fetch_order_updated_at(db: Prisma, order_id: str):
+    """Read raw updated_at from upwork_orders. Returns None on any error."""
+    try:
+        rows = await db.query_raw(
+            "SELECT updated_at FROM upwork_orders WHERE id = $1",
+            order_id,
+        )
+        if rows:
+            return rows[0].get("updated_at")
+    except Exception:
+        pass
+    return None
+
+
+async def _touch_entry_updated_at(db: Prisma, entry_id: str) -> None:
+    """Bump updated_at on an upwork_entries row after any write."""
+    try:
+        await db.execute_raw(
+            "UPDATE upwork_entries SET updated_at = now() WHERE id = $1",
+            entry_id,
+        )
+    except Exception:
+        pass
+
+
+async def _touch_order_updated_at(db: Prisma, order_id: str) -> None:
+    """Bump updated_at on an upwork_orders row after any write."""
+    try:
+        await db.execute_raw(
+            "UPDATE upwork_orders SET updated_at = now() WHERE id = $1",
+            order_id,
+        )
+    except Exception:
+        pass
+
+
+
 
 # ── Private helpers ───────────────────────────────────────────────────────────
 
@@ -73,12 +220,15 @@ def _revenue_from_snapshot(entry: Any) -> Decimal:
     )
 
 
-def _entry_to_dict(entry: Any, profile_name: str) -> dict:
+def _entry_to_dict(entry: Any, profile_name: str, updated_at: Any = None) -> dict:
     """
     Serialise a UpworkEntry ORM object to a plain dict.
 
     ``activeAmount`` always mirrors ``workInProgress`` (same DB column).
     ``revenueInPeriod`` = availableWithdraw + pending + inReview - withdrawn.
+    ``updated_at`` — pass the value read from the raw upwork_entries.updated_at
+    column (fetched separately via query_raw). Defaults to None when the caller
+    does not hold a DB handle, e.g. inside trash-registry snapshots.
     """
     aw  = _d(entry.availableWithdraw)
     wip = _d(entry.workInProgress)
@@ -99,10 +249,18 @@ def _entry_to_dict(entry: Any, profile_name: str) -> dict:
         "connects":                  entry.connects,
         "upworkPlus":                entry.upworkPlus,
         "createdAt":                 entry.createdAt,
+        "updatedAt":                 updated_at,
     }
 
 
-def _order_to_dict(order: Any) -> dict:
+def _order_to_dict(order: Any, updated_at: Any = None) -> dict:
+    """
+    Serialise an UpworkOrder ORM object to a plain dict.
+
+    ``updated_at`` — pass the value read from the raw upwork_orders.updated_at
+    column.  Defaults to None for list-context calls that don't need a per-row
+    round-trip.
+    """
     return {
         "id":          order.id,
         "profileId":   order.profileId,
@@ -112,6 +270,7 @@ def _order_to_dict(order: Any) -> dict:
         "amount":      float(_d(order.amount)),
         "afterUpwork": float(_d(order.afterUpwork)),
         "createdAt":   order.createdAt,
+        "updatedAt":   updated_at,
     }
 
 
@@ -233,10 +392,14 @@ async def create_profile(db: Prisma, data: UpworkProfileCreate) -> dict:
         )
         snapshot = _entry_to_dict(entry, profile.profileName)
 
+    await _ensure_upwork_timestamps(db)
+    ts = await _fetch_profile_timestamps(db, profile.id)
     return {
         "id":              profile.id,
         "profileName":     profile.profileName,
         "isActive":        profile.isActive,
+        "createdAt":       ts["createdAt"],
+        "updatedAt":       ts["updatedAt"],
         "initialSnapshot": snapshot,
     }
 
@@ -331,10 +494,21 @@ async def update_profile(
         )
         upserted_snapshot = _entry_to_dict(entry, profile.profileName)
 
+    await _ensure_upwork_timestamps(db)
+    try:
+        await db.execute_raw(
+            "UPDATE upwork_profiles SET updated_at = now() WHERE id = $1",
+            profile_id,
+        )
+    except Exception:
+        pass
+    ts = await _fetch_profile_timestamps(db, profile.id)
     return {
         "id":               profile.id,
         "profileName":      profile.profileName,
         "isActive":         profile.isActive,
+        "createdAt":        ts["createdAt"],
+        "updatedAt":        ts["updatedAt"],
         "snapshotUpserted": upserted_snapshot,
     }
 
@@ -509,7 +683,10 @@ async def create_snapshot(db: Prisma, data: UpworkSnapshotCreate) -> dict:
     updated_wip = _d(entry.workInProgress)
     rev         = _revenue_from_snapshot(entry)
 
-    snapshot_dict = _entry_to_dict(entry, profile.profileName)
+    await _ensure_upwork_timestamps(db)
+    await _touch_entry_updated_at(db, entry.id)
+    entry_upd_at  = await _fetch_entry_updated_at(db, entry.id)
+    snapshot_dict = _entry_to_dict(entry, profile.profileName, updated_at=entry_upd_at)
 
     return {
         **snapshot_dict,
@@ -570,17 +747,21 @@ async def update_snapshot(
     if "upwork_plus" in sent and data.upwork_plus is not None:
         patch["upworkPlus"] = data.upwork_plus
 
+    await _ensure_upwork_timestamps(db)
     if not patch:
         # Idempotent — return current state
-        profile = await _get_profile_or_404(db, entry.profileId)
-        return _entry_to_dict(entry, profile.profileName)
+        profile      = await _get_profile_or_404(db, entry.profileId)
+        existing_upd = await _fetch_entry_updated_at(db, entry.id)
+        return _entry_to_dict(entry, profile.profileName, updated_at=existing_upd)
 
     updated = await db.upworkentry.update(
         where={"id": snapshot_id},
         data=patch,
     )
+    await _touch_entry_updated_at(db, updated.id)
+    upd_ts  = await _fetch_entry_updated_at(db, updated.id)
     profile = await _get_profile_or_404(db, updated.profileId)
-    return _entry_to_dict(updated, profile.profileName)
+    return _entry_to_dict(updated, profile.profileName, updated_at=upd_ts)
 
 
 async def soft_delete_snapshot(db: Prisma, snapshot_id: str) -> dict:
@@ -640,11 +821,28 @@ async def get_profile_snapshots(
     if pagination:
         live_entries = live_entries[pagination.skip: pagination.skip + pagination.take]
 
+    await _ensure_upwork_timestamps(db)
+    # Batch-fetch updated_at for the page — single query, no N+1
+    upd_map: dict = {}
+    if live_entries:
+        try:
+            ids_sql  = ", ".join(f"${i+1}" for i in range(len(live_entries)))
+            upd_rows = await db.query_raw(
+                f"SELECT id, updated_at FROM upwork_entries WHERE id IN ({ids_sql})",
+                *[e.id for e in live_entries],
+            )
+            upd_map = {r["id"]: r.get("updated_at") for r in upd_rows}
+        except Exception:
+            pass
+
     return {
         "profileId":   profile_id,
         "profileName": profile.profileName,
         "pagination":  _pagination_meta(pagination, total),
-        "snapshots":   [_entry_to_dict(e, profile.profileName) for e in live_entries],
+        "snapshots":   [
+            _entry_to_dict(e, profile.profileName, updated_at=upd_map.get(e.id))
+            for e in live_entries
+        ],
     }
 
 
@@ -708,8 +906,11 @@ async def add_order(db: Prisma, data: UpworkOrderCreate) -> dict:
 
     rev = _revenue_from_snapshot(updated_entry) if updated_entry else _ZERO
 
+    await _ensure_upwork_timestamps(db)
+    await _touch_order_updated_at(db, order.id)
+    order_upd_at = await _fetch_order_updated_at(db, order.id)
     return {
-        **_order_to_dict(order),
+        **_order_to_dict(order, updated_at=order_upd_at),
         "snapshotSync": {
             "date":            str(data.date),
             "workInProgress":  float(_d(updated_entry.workInProgress)) if updated_entry else float(_d(data.amount)),
@@ -771,11 +972,15 @@ async def update_order(
         patch["amount"]      = data.amount
         patch["afterUpwork"] = _after_fee(data.amount)
 
+    await _ensure_upwork_timestamps(db)
     if not patch:
-        return _order_to_dict(order)
+        existing_upd = await _fetch_order_updated_at(db, order.id)
+        return _order_to_dict(order, updated_at=existing_upd)
 
     updated = await db.upworkorder.update(where={"id": order_id}, data=patch)
-    return _order_to_dict(updated)
+    await _touch_order_updated_at(db, updated.id)
+    upd_ts = await _fetch_order_updated_at(db, updated.id)
+    return _order_to_dict(updated, updated_at=upd_ts)
 
 
 async def get_profile_orders(
@@ -797,12 +1002,29 @@ async def get_profile_orders(
     if pagination:
         live_orders = live_orders[pagination.skip: pagination.skip + pagination.take]
 
+    await _ensure_upwork_timestamps(db)
+    # Batch-fetch updated_at for the page — single query, no N+1
+    ord_upd_map: dict = {}
+    if live_orders:
+        try:
+            ids_sql      = ", ".join(f"${i+1}" for i in range(len(live_orders)))
+            ord_upd_rows = await db.query_raw(
+                f"SELECT id, updated_at FROM upwork_orders WHERE id IN ({ids_sql})",
+                *[o.id for o in live_orders],
+            )
+            ord_upd_map = {r["id"]: r.get("updated_at") for r in ord_upd_rows}
+        except Exception:
+            pass
+
     return {
         "profileId":   profile_id,
         "profileName": profile.profileName,
         "orderCount":  total,
         "pagination":  _pagination_meta(pagination, total),
-        "orders":      [_order_to_dict(o) for o in live_orders],
+        "orders":      [
+            _order_to_dict(o, updated_at=ord_upd_map.get(o.id))
+            for o in live_orders
+        ],
     }
 
 
@@ -898,6 +1120,7 @@ async def list_profiles_summary(
 
     ``orderCount`` is dynamic — counts only live (non-trashed) orders.
     """
+    await _ensure_upwork_timestamps(db)
     date_f = filters.to_prisma_filter()
 
     where: dict = {"isActive": True}
@@ -987,10 +1210,13 @@ async def list_profiles_summary(
             "connects":                  latest.connects                  if latest else 0,
         }
 
+        p_ts = await _fetch_profile_timestamps(db, p.id)
         summaries.append({
             "id":              p.id,
             "profileName":     p.profileName,
             "isActive":        p.isActive,
+            "createdAt":       p_ts["createdAt"],
+            "updatedAt":       p_ts["updatedAt"],
             "latestSnapshot":  _entry_to_dict(latest, p.profileName) if latest else None,
             "periodTotals":    period_totals,
             "snapshotCount":   len(live_entries),

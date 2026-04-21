@@ -1,7 +1,7 @@
 """
 app/modules/pmak/schema.py
 ════════════════════════════════════════════════════════════════════════════════
-v5.0 — Enterprise Edition
+v7.0 — Enterprise Edition
 ════════════════════════════════════════════════════════════════════════════════
 """
 from datetime import date as Date, datetime
@@ -32,6 +32,8 @@ class PmakAccountResponse(BaseModel):
     id:          str
     accountName: str
     isActive:    bool
+    createdAt:   Optional[datetime] = None
+    updatedAt:   Optional[datetime] = None
 
     model_config = {"from_attributes": True}
 
@@ -253,6 +255,134 @@ class PmakInhouseResponse(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tools  (v7 — new entity stored in `pmak_tools` raw-SQL table)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PmakToolCreate(BaseModel):
+    """
+    POST /tools payload.
+
+    Only ``account_name`` is required; every other field is optional so that
+    callers can gradually fill in values without being forced to supply zeros or
+    placeholder strings.
+
+    The ``total`` field is auto-computed server-side using:
+        total = latest_total_for_account − debit + credit
+    and stored so that all future reads are O(1) without re-scanning history.
+    You may still pass ``total`` explicitly to override this (useful for manual
+    balance corrections — identical semantics to ``remaining_balance`` in the
+    Transactions entity).
+    """
+
+    account_name: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description=(
+            "PMAK account name (case-insensitive). "
+            "Resolved to an account ID server-side."
+        ),
+        examples=["PMAK Main"],
+    )
+    date: Optional[Date] = Field(
+        default=None,
+        description="Entry date (YYYY-MM-DD). Defaults to today when omitted.",
+        examples=["2026-04-15"],
+    )
+    details: Optional[str] = Field(
+        default=None,
+        description="Free-text description of this tools ledger entry.",
+        examples=["Adobe CC subscription renewal – Q2 2026"],
+    )
+    debit: Optional[Decimal] = Field(
+        default=None,
+        ge=0,
+        description="Debit amount in USD. Defaults to 0 when omitted.",
+        examples=[120.00],
+    )
+    credit: Optional[Decimal] = Field(
+        default=None,
+        ge=0,
+        description="Credit amount in USD. Defaults to 0 when omitted.",
+        examples=[0.00],
+    )
+    total: Optional[Decimal] = Field(
+        default=None,
+        description=(
+            "Running total after this entry, in USD. "
+            "Auto-computed as: latest_total − debit + credit when omitted. "
+            "Pass an explicit non-zero value to override (manual correction)."
+        ),
+        examples=[3800.00],
+    )
+
+
+class PmakToolUpdate(BaseModel):
+    """
+    PATCH /tools/{tool_id} payload — every field is optional.
+
+    Sending an empty body {} is accepted and returns the current state
+    unchanged (idempotent).  Financial field changes (debit / credit) trigger
+    automatic ``total`` recomputation using the same reverse-formula as the
+    Transactions PATCH unless an explicit ``total`` override is supplied.
+    """
+
+    account_name: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="Reassign entry to a different active PMAK account.",
+        examples=["PMAK Operations"],
+    )
+    date: Optional[Date] = Field(
+        default=None,
+        description="Updated entry date (YYYY-MM-DD).",
+        examples=["2026-05-01"],
+    )
+    details: Optional[str] = Field(
+        default=None,
+        description="Updated free-text description.",
+        examples=["Figma Teams renewal — updated ref"],
+    )
+    debit: Optional[Decimal] = Field(
+        default=None,
+        ge=0,
+        description="Updated debit amount in USD.",
+        examples=[150.00],
+    )
+    credit: Optional[Decimal] = Field(
+        default=None,
+        ge=0,
+        description="Updated credit amount in USD.",
+        examples=[0.00],
+    )
+    total: Optional[Decimal] = Field(
+        default=None,
+        description=(
+            "Manual total override in USD. "
+            "Takes priority over the auto-recomputed value."
+        ),
+        examples=[3650.00],
+    )
+
+
+class PmakToolResponse(BaseModel):
+    """Single tools-ledger row returned by all Tools endpoints."""
+    id:          str
+    accountId:   str
+    accountName: str
+    date:        Date
+    details:     Optional[str]
+    debit:       Decimal
+    credit:      Decimal
+    total:       Decimal
+    createdAt:   datetime
+    updatedAt:   datetime
+
+    model_config = {"from_attributes": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GET /inhouse — cross-account deal list
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -275,6 +405,26 @@ class PmakAllInhouseResponse(BaseModel):
     totals:     PmakInhouseTotals
     pagination: Dict[str, Any]
     deals:      List[PmakInhouseResponse]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /tools — cross-account tools list
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PmakToolsTotals(BaseModel):
+    """Aggregate totals across all matching tools entries."""
+    totalEntries: int
+    totalDebit:   float
+    totalCredit:  float
+    latestTotal:  float
+
+
+class PmakAllToolsResponse(BaseModel):
+    """Envelope returned by GET /pmak/tools."""
+    filter:     Dict[str, Any]
+    totals:     PmakToolsTotals
+    pagination: Dict[str, Any]
+    tools:      List[PmakToolResponse]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -306,12 +456,14 @@ class PmakAccountSummary(BaseModel):
     id:                      str
     accountName:             str
     isActive:                bool
+    createdAt:               Optional[datetime] = None   # v7
+    updatedAt:               Optional[datetime] = None   # v7
     currentBalance:          float
     periodCredit:            float
     periodDebit:             float
     transactionCount:        int
     inhouseCount:            int
-    totalInhouseOrderAmount: float          # ← NEW: sum of orderAmount for this account
+    totalInhouseOrderAmount: float
     inhouseByStatus:         PmakInhouseByStatus
     recentTransactions:      List[PmakTransactionResponse]
     recentInhouse:           List[PmakInhouseResponse]
@@ -346,3 +498,13 @@ class PmakAccountInhouseResponse(BaseModel):
     totalAmount:     float
     pagination:      Dict[str, Any]
     deals:           List[PmakInhouseResponse]
+
+
+class PmakAccountToolsResponse(BaseModel):
+    """Envelope for GET /accounts/{id}/tools."""
+    account:        PmakAccountResponse
+    totalDebit:     float
+    totalCredit:    float
+    latestTotal:    float
+    pagination:     Dict[str, Any]
+    tools:          List[PmakToolResponse]

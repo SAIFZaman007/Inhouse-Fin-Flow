@@ -28,6 +28,152 @@ from .schema import (
 logger = logging.getLogger(__name__)
 _ZERO = Decimal("0")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# § TS  Timestamp bootstrap
+#
+# PayoneerAccount     — no timestamps at all in Prisma schema
+# PayoneerTransaction — has createdAt; missing updatedAt
+#
+# Each ALTER is a separate execute_raw call — PostgreSQL extended-query
+# protocol forbids multiple commands in a single prepared statement.
+# A module-level flag prevents re-running after the first request.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PAYONEER_TS_DDL: list[str] = [
+    # payoneer_accounts — no timestamps in Prisma schema
+    """
+    DO $$ BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_name='payoneer_accounts' AND column_name='created_at'
+      ) THEN
+        ALTER TABLE payoneer_accounts ADD COLUMN created_at TIMESTAMPTZ DEFAULT now();
+      END IF;
+    END $$
+    """,
+    """
+    DO $$ BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_name='payoneer_accounts' AND column_name='updated_at'
+      ) THEN
+        ALTER TABLE payoneer_accounts ADD COLUMN updated_at TIMESTAMPTZ DEFAULT now();
+      END IF;
+    END $$
+    """,
+    # payoneer_transactions — Prisma has createdAt; missing updatedAt
+    """
+    DO $$ BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_name='payoneer_transactions' AND column_name='updated_at'
+      ) THEN
+        ALTER TABLE payoneer_transactions ADD COLUMN updated_at TIMESTAMPTZ DEFAULT now();
+      END IF;
+    END $$
+    """,
+]
+
+_payoneer_ts_done = False
+
+
+async def _ensure_payoneer_timestamps(db: Prisma) -> None:
+    """
+    Idempotent bootstrap — runs once per process lifetime.
+    Adds createdAt / updatedAt to Payoneer tables that Prisma didn't generate
+    them for.  One execute_raw per statement — never multiple commands per call.
+    """
+    global _payoneer_ts_done
+    if _payoneer_ts_done:
+        return
+    for stmt in _PAYONEER_TS_DDL:
+        await db.execute_raw(stmt)
+    _payoneer_ts_done = True
+
+
+async def _fetch_account_timestamps(db: Prisma, account_id: str) -> dict:
+    """Read raw created_at / updated_at from payoneer_accounts. Falls back to None."""
+    try:
+        rows = await db.query_raw(
+            "SELECT created_at, updated_at FROM payoneer_accounts WHERE id = $1",
+            account_id,
+        )
+        if rows:
+            return {
+                "createdAt": rows[0].get("created_at"),
+                "updatedAt": rows[0].get("updated_at"),
+            }
+    except Exception:
+        pass
+    return {"createdAt": None, "updatedAt": None}
+
+
+async def _fetch_accounts_timestamps_batch(db: Prisma, account_ids: list) -> dict:
+    """
+    Batch-fetch created_at / updated_at for a list of account IDs.
+    Returns {account_id: {createdAt, updatedAt}}.
+    Single query — no N+1.
+    """
+    if not account_ids:
+        return {}
+    try:
+        placeholders = ", ".join(f"${i+1}" for i in range(len(account_ids)))
+        rows = await db.query_raw(
+            f"SELECT id, created_at, updated_at FROM payoneer_accounts WHERE id IN ({placeholders})",
+            *account_ids,
+        )
+        return {
+            r["id"]: {"createdAt": r.get("created_at"), "updatedAt": r.get("updated_at")}
+            for r in rows
+        }
+    except Exception:
+        return {aid: {"createdAt": None, "updatedAt": None} for aid in account_ids}
+
+
+async def _fetch_tx_timestamps_batch(db: Prisma, tx_ids: list) -> dict:
+    """
+    Batch-fetch createdAt / updatedAt for a list of transaction IDs.
+    Returns {tx_id: {createdAt, updatedAt}}.  Single query — no N+1.
+    """
+    if not tx_ids:
+        return {}
+    try:
+        placeholders = ", ".join(f"${i+1}" for i in range(len(tx_ids)))
+        rows = await db.query_raw(
+            f"SELECT id, created_at, updated_at FROM payoneer_transactions WHERE id IN ({placeholders})",
+            *tx_ids,
+        )
+        return {
+            r["id"]: {"createdAt": r.get("created_at"), "updatedAt": r.get("updated_at")}
+            for r in rows
+        }
+    except Exception:
+        return {tid: {"createdAt": None, "updatedAt": None} for tid in tx_ids}
+
+
+async def _touch_tx_updated_at(db: Prisma, tx_id: str) -> None:
+    """Bump updated_at on a payoneer_transactions row after any write."""
+    try:
+        await db.execute_raw(
+            "UPDATE payoneer_transactions SET updated_at = now() WHERE id = $1",
+            tx_id,
+        )
+    except Exception:
+        pass
+
+
+async def _touch_account_updated_at(db: Prisma, account_id: str) -> None:
+    """Bump updated_at on a payoneer_accounts row after any write."""
+    try:
+        await db.execute_raw(
+            "UPDATE payoneer_accounts SET updated_at = now() WHERE id = $1",
+            account_id,
+        )
+    except Exception:
+        pass
+
+
+
 
 # ── Private helpers ───────────────────────────────────────────────────────────
 
@@ -35,8 +181,16 @@ def _d(v: Any) -> Decimal:
     return _ZERO if v is None else Decimal(str(v))
 
 
-def _tx_to_dict(tx: Any, account_name: str) -> dict:
-    """ORM transaction → serialisable dict with accountName injected."""
+def _tx_to_dict(tx: Any, account_name: str, created_at: Any = None, updated_at: Any = None) -> dict:
+    """
+    ORM transaction → serialisable dict with accountName injected.
+
+    ``created_at`` — read from the ORM object directly (Prisma has this column).
+    ``updated_at``  — pass the value fetched from the raw payoneer_transactions.updated_at
+    column (fetched separately via query_raw).  Defaults to None when the caller
+    does not hold a DB handle (e.g. inside list builders that already have
+    batch-fetched values).
+    """
     return {
         "id":               tx.id,
         "accountId":        tx.accountId,
@@ -48,6 +202,8 @@ def _tx_to_dict(tx: Any, account_name: str) -> dict:
         "debit":            _d(tx.debit),
         "credit":           _d(tx.credit),
         "remainingBalance": _d(tx.remainingBalance),
+        "createdAt":        created_at if created_at is not None else getattr(tx, "createdAt", None),
+        "updatedAt":        updated_at,
     }
 
 
@@ -151,10 +307,15 @@ async def create_account(db: Prisma, data: PayoneerAccountCreate) -> dict:
         )
         opening_tx = _tx_to_dict(tx, account.accountName)
 
+    await _ensure_payoneer_timestamps(db)
+    await _touch_account_updated_at(db, account.id)
+    ts = await _fetch_account_timestamps(db, account.id)
     return {
         "id":                account.id,
         "accountName":       account.accountName,
         "isActive":          account.isActive,
+        "createdAt":         ts["createdAt"],
+        "updatedAt":         ts["updatedAt"],
         "currentBalance":    float(data.initial_balance or _ZERO),
         "openingTransaction": opening_tx,
     }
@@ -240,10 +401,15 @@ async def update_account(
         )
         adjustment_tx = _tx_to_dict(tx, account.accountName)
 
+    await _ensure_payoneer_timestamps(db)
+    await _touch_account_updated_at(db, account.id)
+    ts = await _fetch_account_timestamps(db, account.id)
     return {
         "id":                    account.id,
         "accountName":           account.accountName,
         "isActive":              account.isActive,
+        "createdAt":             ts["createdAt"],
+        "updatedAt":             ts["updatedAt"],
         # Echo back description so the caller can confirm it was received,
         # even when no transaction was created.
         "description":           data.description,
@@ -258,9 +424,9 @@ async def list_accounts(
     pagination: Optional[PageParams] = None,
 ) -> dict:
     """
-    Combined totals + paginated per-account breakdown  (v6).
+    Combined totals + paginated per-account breakdown  (v8).
 
-    ``name`` performs case-insensitive partial search on accountName.
+    ``name``   — case-insensitive partial search on accountName.
 
     Totals guarantee (v6 fix)
     ─────────────────────────
@@ -271,6 +437,7 @@ async def list_accounts(
     ``_latest_balance`` results are cached per account so the same DB query
     is never issued twice in a single request.
     """
+    await _ensure_payoneer_timestamps(db)
     date_f      = filters.to_prisma_filter()
     date_f_where = {"date": date_f} if date_f else {}
 
@@ -316,22 +483,42 @@ async def list_accounts(
     else:
         page_slice = all_accounts
 
+    # Batch-fetch account timestamps for the current page — single query, no N+1
+    page_ids  = [acc.id for acc in page_slice]
+    ts_map    = await _fetch_accounts_timestamps_batch(db, page_ids)
+
+    # Batch-fetch transaction timestamps for recent-5 rows across the page
+    all_recent_ids = [
+        t.id
+        for acc in page_slice
+        for t in acc.transactions[:5]
+    ]
+    tx_ts_map = await _fetch_tx_timestamps_batch(db, all_recent_ids)
+
     summaries: list[dict] = []
     for acc in page_slice:
         bal           = account_balances[acc.id]
         period_credit = sum((_d(t.credit) for t in acc.transactions), _ZERO)
         period_debit  = sum((_d(t.debit)  for t in acc.transactions), _ZERO)
+        acc_ts        = ts_map.get(acc.id, {"createdAt": None, "updatedAt": None})
 
         summaries.append({
             "id":                acc.id,
             "accountName":       acc.accountName,
             "isActive":          acc.isActive,
+            "createdAt":         acc_ts["createdAt"],
+            "updatedAt":         acc_ts["updatedAt"],
             "currentBalance":    float(bal),
             "periodCredit":      float(period_credit),
             "periodDebit":       float(period_debit),
             "transactionCount":  len(acc.transactions),
             "recentTransactions": [
-                _tx_to_dict(t, acc.accountName) for t in acc.transactions[:5]
+                _tx_to_dict(
+                    t, acc.accountName,
+                    created_at=tx_ts_map.get(t.id, {}).get("createdAt"),
+                    updated_at=tx_ts_map.get(t.id, {}).get("updatedAt"),
+                )
+                for t in acc.transactions[:5]
             ],
         })
 
@@ -392,6 +579,7 @@ async def add_transaction(db: Prisma, data: PayoneerTransactionCreate) -> dict:
     remaining_balance = current_balance + _d(data.credit) - _d(data.debit)
 
     # ── Persist ───────────────────────────────────────────────────────────────
+    await _ensure_payoneer_timestamps(db)
     tx = await db.payoneertransaction.create(
         data={
             "accountId":        account.id,
@@ -404,7 +592,10 @@ async def add_transaction(db: Prisma, data: PayoneerTransactionCreate) -> dict:
             "remainingBalance": remaining_balance,
         }
     )
-    return _tx_to_dict(tx, account.accountName)
+    await _touch_tx_updated_at(db, tx.id)
+    tx_ts = await _fetch_tx_timestamps_batch(db, [tx.id])
+    ts    = tx_ts.get(tx.id, {"createdAt": None, "updatedAt": None})
+    return _tx_to_dict(tx, account.accountName, created_at=ts["createdAt"], updated_at=ts["updatedAt"])
 
 
 async def update_transaction(
@@ -467,8 +658,15 @@ async def get_account_transactions(
     account_id: str,
     date_filter: dict,
     pagination: Optional[PageParams] = None,
+    search: Optional[str] = None,
 ) -> dict:
-    """Paginated transaction list for one account — every row includes accountName."""
+    """
+    Paginated transaction list for one account — every row includes accountName.
+
+    ``search`` — case-insensitive keyword search on the ``details`` column.
+    When supplied, only transactions whose details contain the keyword are returned.
+    """
+    await _ensure_payoneer_timestamps(db)
     account = await db.payoneeraccount.find_unique(where={"id": account_id})
     if not account:
         raise HTTPException(status_code=404, detail="Payoneer account not found.")
@@ -476,6 +674,8 @@ async def get_account_transactions(
     where: dict = {"accountId": account_id}
     if date_filter:
         where["date"] = date_filter
+    if search:
+        where["details"] = {"contains": search, "mode": "insensitive"}
 
     total   = await db.payoneertransaction.count(where=where)
     find_kw = dict(where=where, order={"date": "desc"})
@@ -491,17 +691,33 @@ async def get_account_transactions(
     period_credit = sum((_d(t.credit) for t in transactions), _ZERO)
     period_debit  = sum((_d(t.debit)  for t in transactions), _ZERO)
 
+    # Batch-fetch timestamps for the current page — single query, no N+1
+    tx_ids    = [t.id for t in transactions]
+    tx_ts_map = await _fetch_tx_timestamps_batch(db, tx_ids)
+
+    # Fetch account timestamps
+    acc_ts = await _fetch_account_timestamps(db, account_id)
+
     return {
         "account": {
             "id":          account.id,
             "accountName": account.accountName,
             "isActive":    account.isActive,
+            "createdAt":   acc_ts["createdAt"],
+            "updatedAt":   acc_ts["updatedAt"],
         },
         "currentBalance": float(current_balance),
         "periodCredit":   float(period_credit),
         "periodDebit":    float(period_debit),
         "pagination":     _pagination_meta(pagination, total),
-        "transactions":   [_tx_to_dict(t, account.accountName) for t in transactions],
+        "transactions":   [
+            _tx_to_dict(
+                t, account.accountName,
+                created_at=tx_ts_map.get(t.id, {}).get("createdAt"),
+                updated_at=tx_ts_map.get(t.id, {}).get("updatedAt"),
+            )
+            for t in transactions
+        ],
     }
 
 
@@ -510,25 +726,30 @@ async def get_account_detail(
     account_id: str,
     filters: DateRangeFilter,
     pagination: Optional[PageParams] = None,
+    search: Optional[str] = None,
 ) -> dict:
     """
     GET /payoneer/accounts/{account_id}
     ─────────────────────────────────────
     Returns a full detail view for a single Payoneer account:
 
-    - Account metadata (id, accountName, isActive)
+    - Account metadata (id, accountName, isActive, createdAt, updatedAt)
     - currentBalance — latest remainingBalance across all time
     - periodCredit / periodDebit — sums within the selected filter window
     - Paginated transactions in the window (newest first)
 
-    Each transaction row includes accountName for client convenience.
+    ``search`` — case-insensitive keyword search on the transaction ``details`` column.
+    Each transaction row includes accountName, createdAt, and updatedAt.
     """
+    await _ensure_payoneer_timestamps(db)
+
     # ── Resolve account ───────────────────────────────────────────────────────
     account = await db.payoneeraccount.find_unique(where={"id": account_id})
     if not account:
         raise HTTPException(status_code=404, detail="Payoneer account not found.")
 
     date_f = filters.to_prisma_filter()
+    acc_ts = await _fetch_account_timestamps(db, account_id)
 
     # ── Current balance — latest transaction across all time ──────────────────
     current_balance = await _latest_balance(db, account_id)
@@ -537,6 +758,8 @@ async def get_account_detail(
     period_where: dict = {"accountId": account_id}
     if date_f:
         period_where["date"] = date_f
+    if search:
+        period_where["details"] = {"contains": search, "mode": "insensitive"}
 
     # ── Period aggregates ─────────────────────────────────────────────────────
     period_txs    = await db.payoneertransaction.find_many(where=period_where)
@@ -552,6 +775,10 @@ async def get_account_detail(
 
     transactions = await db.payoneertransaction.find_many(**find_kw)
 
+    # Batch-fetch tx timestamps for this page — single query, no N+1
+    tx_ids    = [t.id for t in transactions]
+    tx_ts_map = await _fetch_tx_timestamps_batch(db, tx_ids)
+
     tx_rows = [
         {
             "id":               t.id,
@@ -564,6 +791,8 @@ async def get_account_detail(
             "debit":            float(t.debit),
             "credit":           float(t.credit),
             "remainingBalance": float(t.remainingBalance),
+            "createdAt":        tx_ts_map.get(t.id, {}).get("createdAt"),
+            "updatedAt":        tx_ts_map.get(t.id, {}).get("updatedAt"),
         }
         for t in transactions
     ]
@@ -574,6 +803,8 @@ async def get_account_detail(
             "id":          account.id,
             "accountName": account.accountName,
             "isActive":    account.isActive,
+            "createdAt":   acc_ts["createdAt"],
+            "updatedAt":   acc_ts["updatedAt"],
         },
         "currentBalance": float(current_balance),
         "periodCredit":   period_credit,

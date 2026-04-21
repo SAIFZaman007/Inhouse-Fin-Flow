@@ -52,12 +52,121 @@ def _dt(d: dt_date) -> datetime:
     return datetime.combine(d, time.min)
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# § TS  Timestamp bootstrap
+#
+# DollarExchange has createdAt natively in schema.prisma.
+# updatedAt is absent — added via idempotent ALTER TABLE.
+# One execute_raw per statement: PostgreSQL extended-query protocol forbids
+# multiple commands per prepared statement.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DE_TS_DDL: list[str] = [
+    """
+    DO $$ BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_name='dollar_exchanges' AND column_name='updated_at'
+      ) THEN
+        ALTER TABLE dollar_exchanges ADD COLUMN updated_at TIMESTAMPTZ DEFAULT now();
+      END IF;
+    END $$
+    """,
+]
+
+_de_ts_done = False
+
+
+async def _ensure_de_timestamps(db: Prisma) -> None:
+    """
+    Idempotent bootstrap — runs once per process lifetime.
+    Adds updated_at to dollar_exchanges where Prisma didn't generate it.
+    """
+    global _de_ts_done
+    if _de_ts_done:
+        return
+    for stmt in _DE_TS_DDL:
+        await db.execute_raw(stmt)
+    _de_ts_done = True
+
+
+async def _fetch_updated_at(db: Prisma, exchange_id: str):
+    """Read raw updated_at from dollar_exchanges. Returns None on any error."""
+    try:
+        rows = await db.query_raw(
+            "SELECT updated_at FROM dollar_exchanges WHERE id = $1",
+            exchange_id,
+        )
+        if rows:
+            return rows[0].get("updated_at")
+    except Exception:
+        pass
+    return None
+
+
+async def _fetch_updated_at_batch(db: Prisma, ids: list) -> dict:
+    """
+    Batch-fetch updated_at for a list of IDs.
+    Returns {id: updated_at}.  Single query — no N+1.
+    """
+    if not ids:
+        return {}
+    try:
+        placeholders = ", ".join(f"${i+1}" for i in range(len(ids)))
+        rows = await db.query_raw(
+            f"SELECT id, updated_at FROM dollar_exchanges WHERE id IN ({placeholders})",
+            *ids,
+        )
+        return {r["id"]: r.get("updated_at") for r in rows}
+    except Exception:
+        return {}
+
+
+async def _touch_updated_at(db: Prisma, exchange_id: str) -> None:
+    """Bump updated_at on a dollar_exchanges row after any write."""
+    try:
+        await db.execute_raw(
+            "UPDATE dollar_exchanges SET updated_at = now() WHERE id = $1",
+            exchange_id,
+        )
+    except Exception:
+        pass
+
+
+# ── Serialiser ────────────────────────────────────────────────────────────────
+
+def _serialize(record, updated_at=None) -> dict:
+    """
+    ORM DollarExchange → serialisable dict.
+
+    ``createdAt`` — read directly from the ORM object (native Prisma column).
+    ``updatedAt``  — pass the value fetched from the raw updated_at column.
+                     Defaults to None when called without a DB handle (e.g. in
+                     the Excel export path where we don't need timestamps).
+    """
+    return {
+        "id":            record.id,
+        "date":          record.date.date() if isinstance(record.date, datetime) else record.date,
+        "details":       record.details,
+        "accountFrom":   record.accountFrom,
+        "accountTo":     record.accountTo,
+        "debit":         record.debit,
+        "credit":        record.credit,
+        "rate":          record.rate,
+        "totalBdt":      record.totalBdt,
+        "paymentStatus": record.paymentStatus if isinstance(record.paymentStatus, str) else record.paymentStatus.value,
+        "createdAt":     record.createdAt,
+        "updatedAt":     updated_at,
+    }
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CRUD
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def create_exchange(db: Prisma, data: DollarExchangeCreate):
-    return await db.dollarexchange.create(
+    await _ensure_de_timestamps(db)
+    record = await db.dollarexchange.create(
         data={
             "date":          _dt(data.date),   # ← datetime.combine(date, time.min)
             "details":       data.details,
@@ -70,6 +179,9 @@ async def create_exchange(db: Prisma, data: DollarExchangeCreate):
             "paymentStatus": data.payment_status.value,
         }
     )
+    await _touch_updated_at(db, record.id)
+    upd_at = await _fetch_updated_at(db, record.id)
+    return _serialize(record, updated_at=upd_at)
 
 
 async def list_exchanges(
@@ -77,6 +189,8 @@ async def list_exchanges(
     date_filter:    dict,
     payment_status: Optional[str] = None,
     account_from:   Optional[str] = None,
+    account_name:   Optional[str] = None,
+    search:         Optional[str] = None,
 ):
     """
     List dollar exchange records with optional filters.
@@ -84,8 +198,12 @@ async def list_exchanges(
     Filters (all combinable):
       date_filter    — Prisma-compatible dict from DateRangeFilter.to_prisma_filter()
       payment_status — "RECEIVED" | "DUE" (also accepts legacy "RCV" alias)
-      account_from   — case-insensitive substring search on accountFrom
+      account_from   — case-insensitive substring search on accountFrom (legacy param)
+      account_name   — case-insensitive OR search on accountFrom AND accountTo
+                       simultaneously (matches either side of the exchange)
+      search         — case-insensitive keyword search on the details column
     """
+    await _ensure_de_timestamps(db)
     where: dict = {}
 
     if date_filter:
@@ -99,21 +217,45 @@ async def list_exchanges(
         )
         where["paymentStatus"] = status
 
+    # Legacy param — exact accountFrom search (kept for backward compatibility)
     if account_from:
         where["accountFrom"] = {"contains": account_from, "mode": "insensitive"}
 
-    return await db.dollarexchange.find_many(where=where, order={"date": "desc"})
+    # New param — OR search across both accountFrom and accountTo
+    if account_name:
+        where["OR"] = [
+            {"accountFrom": {"contains": account_name, "mode": "insensitive"}},
+            {"accountTo":   {"contains": account_name, "mode": "insensitive"}},
+        ]
+
+    # Details keyword search
+    if search:
+        where["details"] = {"contains": search, "mode": "insensitive"}
+
+    records = await db.dollarexchange.find_many(where=where, order={"date": "desc"})
+
+    # Batch-fetch updated_at for all returned rows — single query, no N+1
+    ids    = [r.id for r in records]
+    upd_map = await _fetch_updated_at_batch(db, ids)
+
+    return [_serialize(r, updated_at=upd_map.get(r.id)) for r in records]
 
 
 async def get_exchange(db: Prisma, exchange_id: str):
+    await _ensure_de_timestamps(db)
     record = await db.dollarexchange.find_unique(where={"id": exchange_id})
     if not record:
         raise HTTPException(status_code=404, detail="Exchange record not found")
-    return record
+    upd_at = await _fetch_updated_at(db, record.id)
+    return _serialize(record, updated_at=upd_at)
 
 
 async def update_exchange(db: Prisma, exchange_id: str, data: DollarExchangeUpdate):
-    existing = await get_exchange(db, exchange_id)
+    await _ensure_de_timestamps(db)
+    # Fetch raw ORM object for field access during patch computation
+    existing_orm = await db.dollarexchange.find_unique(where={"id": exchange_id})
+    if not existing_orm:
+        raise HTTPException(status_code=404, detail="Exchange record not found")
 
     update_data: dict = {}
 
@@ -132,45 +274,70 @@ async def update_exchange(db: Prisma, exchange_id: str, data: DollarExchangeUpda
     if data.rate is not None:
         new_rate = float(data.rate)
         exchange_amount = float(
-            existing.credit
-            if (existing.credit and existing.credit > 0)
-            else existing.debit or Decimal("0")
+            existing_orm.credit
+            if (existing_orm.credit and existing_orm.credit > 0)
+            else existing_orm.debit or Decimal("0")
         )
         update_data["rate"]     = new_rate
         update_data["totalBdt"] = exchange_amount * new_rate
 
+    # Idempotent — nothing changed
     if not update_data:
-        return existing
+        upd_at = await _fetch_updated_at(db, existing_orm.id)
+        return _serialize(existing_orm, updated_at=upd_at)
 
-    return await db.dollarexchange.update(
+    updated = await db.dollarexchange.update(
         where={"id": exchange_id},
         data=update_data,
     )
+    await _touch_updated_at(db, updated.id)
+    upd_at = await _fetch_updated_at(db, updated.id)
+    return _serialize(updated, updated_at=upd_at)
 
 
 async def delete_exchange(db: Prisma, exchange_id: str) -> None:
-    await get_exchange(db, exchange_id)
+    record = await db.dollarexchange.find_unique(where={"id": exchange_id})
+    if not record:
+        raise HTTPException(status_code=404, detail="Exchange record not found")
     await db.dollarexchange.delete(where={"id": exchange_id})
 
 
-async def get_total_bdt(db: Prisma) -> dict:
+async def get_total_bdt(
+    db:             Prisma,
+    date_filter:    Optional[dict] = None,
+    payment_status: Optional[str]  = None,
+    account_name:   Optional[str]  = None,
+    search:         Optional[str]  = None,
+) -> dict:
     """
-    Return total BDT split by payment status (query_raw — no .aggregate() in prisma-client-py).
+    Return total BDT split by payment status.
+
+    Supports all the same filters as list_exchanges so the totals widget
+    always reflects the currently active filter state in the UI.
+
+    Uses query_raw — prisma-client-py does not expose .aggregate().
     """
-    rows = await db.query_raw(
-        """
-        SELECT
-            COALESCE(SUM("totalBdt"), 0)                                                  AS total,
-            COALESCE(SUM(CASE WHEN "paymentStatus" = 'RECEIVED' THEN "totalBdt" END), 0) AS received,
-            COALESCE(SUM(CASE WHEN "paymentStatus" = 'DUE'      THEN "totalBdt" END), 0) AS due
-        FROM dollar_exchanges
-        """
+    await _ensure_de_timestamps(db)
+
+    # Build a matching Prisma WHERE clause — reuse list_exchanges logic to
+    # get the filtered set, then aggregate from Python (simpler than raw SQL
+    # with dynamic filters).
+    records = await list_exchanges(
+        db,
+        date_filter=date_filter or {},
+        payment_status=payment_status,
+        account_name=account_name,
+        search=search,
     )
-    r = rows[0] if rows else {}
+
+    total    = sum(float(r["totalBdt"]) for r in records)
+    received = sum(float(r["totalBdt"]) for r in records if r.get("paymentStatus") == "RECEIVED")
+    due      = sum(float(r["totalBdt"]) for r in records if r.get("paymentStatus") == "DUE")
+
     return {
-        "total":    float(r.get("total",    0) or 0),
-        "received": float(r.get("received", 0) or 0),
-        "due":      float(r.get("due",      0) or 0),
+        "total":    round(total,    2),
+        "received": round(received, 2),
+        "due":      round(due,      2),
     }
 
 
@@ -210,13 +377,22 @@ async def export_exchanges(
     date_filter:    dict,
     payment_status: Optional[str] = None,
     account_from:   Optional[str] = None,
+    account_name:   Optional[str] = None,
+    search:         Optional[str] = None,
     label:          str = "dollar_exchange",
 ) -> tuple[bytes, str]:
     """
     Build and return (xlsx_bytes, filename) for the filtered exchange records.
     DUE rows are highlighted in light red for quick identification.
+    Supports all the same filters as list_exchanges.
     """
-    rows = await list_exchanges(db, date_filter, payment_status, account_from)
+    rows = await list_exchanges(
+        db, date_filter,
+        payment_status=payment_status,
+        account_from=account_from,
+        account_name=account_name,
+        search=search,
+    )
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -233,19 +409,20 @@ async def export_exchanges(
 
     # ── Data rows ─────────────────────────────────────────────────────────────
     for row_idx, exc in enumerate(rows, start=2):
-        is_due   = str(getattr(exc, "paymentStatus", "")).upper() == "DUE"
+        # rows are now dicts from _serialize() — access via []
+        is_due   = str(exc.get("paymentStatus", "")).upper() == "DUE"
         row_fill = _DUE_FILL if is_due else (_ALT_ROW_FILL if row_idx % 2 == 0 else None)
 
         values = [
-            _fmt(exc.date),
-            _fmt(exc.details),
-            _fmt(exc.accountFrom),
-            _fmt(exc.accountTo),
-            float(exc.debit),
-            float(exc.credit),
-            float(exc.rate),
-            float(exc.totalBdt),
-            str(exc.paymentStatus),
+            _fmt(exc.get("date")),
+            _fmt(exc.get("details")),
+            _fmt(exc.get("accountFrom")),
+            _fmt(exc.get("accountTo")),
+            float(exc.get("debit",    0) or 0),
+            float(exc.get("credit",   0) or 0),
+            float(exc.get("rate",     0) or 0),
+            float(exc.get("totalBdt", 0) or 0),
+            str(exc.get("paymentStatus", "")),
         ]
         for col_idx, value in enumerate(values, start=1):
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
@@ -257,9 +434,9 @@ async def export_exchanges(
     if rows:
         s = len(rows) + 2
         ws.cell(row=s, column=7,  value="TOTAL").font = Font(bold=True)
-        ws.cell(row=s, column=5,  value=sum(float(r.debit)    for r in rows)).font = Font(bold=True)
-        ws.cell(row=s, column=6,  value=sum(float(r.credit)   for r in rows)).font = Font(bold=True)
-        ws.cell(row=s, column=8,  value=sum(float(r.totalBdt) for r in rows)).font = Font(bold=True)
+        ws.cell(row=s, column=5,  value=sum(float(r.get("debit",    0) or 0) for r in rows)).font = Font(bold=True)
+        ws.cell(row=s, column=6,  value=sum(float(r.get("credit",   0) or 0) for r in rows)).font = Font(bold=True)
+        ws.cell(row=s, column=8,  value=sum(float(r.get("totalBdt", 0) or 0) for r in rows)).font = Font(bold=True)
 
     ws.freeze_panes = "A2"
 

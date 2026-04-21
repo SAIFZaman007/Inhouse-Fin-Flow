@@ -1,7 +1,7 @@
 """
 app/modules/card_sharing/service.py
 ================================================================================
-v7 — Simplified input surface
+v8 — Multi-column OR keyword search
 ================================================================================
 """
 import io
@@ -64,8 +64,6 @@ async def _resolve_or_create_account(db: Prisma, card_name: str) -> str:
         return account.id
 
     # Auto-create a PayoneerAccount to back the free-form label.
-    # This is intentionally lightweight — the account exists solely to
-    # satisfy the FK constraint and carry the name string.
     new_account = await db.payoneeraccount.create(
         data={"accountName": card_name}
     )
@@ -94,7 +92,6 @@ def _serialize_card(card, include_sensitive: bool = False) -> dict:
         card_details = []
 
     # Read the card's display name through the account relation.
-    # Graceful fallback to empty string if the relation was somehow not loaded.
     card_name = card.account.accountName if card.account else ""
 
     return {
@@ -102,10 +99,10 @@ def _serialize_card(card, include_sensitive: bool = False) -> dict:
         "serialNo":            card.serialNo,
         "date":                card.date,
         "details":             card.details,
-        "cardName":            card_name,                      # via account relation
-        "cardNo":              decrypt_value(card.cardNo),     # always decrypted
+        "cardName":            card_name,
+        "cardNo":              decrypt_value(card.cardNo),
         "cardExpire":          card.cardExpire,
-        "cardCvc":             decrypt_value(card.cardCvc),    # always decrypted
+        "cardCvc":             decrypt_value(card.cardCvc),
         "cardDetails":         card_details,
         "cardVendor":          card.cardVendor,
         "cardLimit":           card.cardLimit,
@@ -115,6 +112,60 @@ def _serialize_card(card, include_sensitive: bool = False) -> dict:
         "createdAt":           card.createdAt,
         "updatedAt":           card.updatedAt,
     }
+
+
+# ── Where-clause builder ──────────────────────────────────────────────────────
+
+def _build_where(
+    date_filter:  Optional[dict],
+    serial_no:    Optional[str],
+    account_name: Optional[str],
+    search:       Optional[str] = None,
+) -> dict:
+    """
+    Build the Prisma ``where`` clause from all active filter parameters.
+
+    ``serial_no``    — case-insensitive substring match on ``serialNo``.
+    ``account_name`` — case-insensitive substring match on card label
+                       (``PayoneerAccount.accountName`` via relation).
+    ``search``       — case-insensitive OR match across FIVE columns:
+                         • details          (direct column, String?)
+                         • cardName         (via account.accountName relation)
+                         • cardReceiveBank  (direct column, String)
+                         • mailDetails      (direct column, String?)
+                         • cardVendor       (direct column, String)
+                       A single keyword matches any of these columns.
+                       This is implemented as a single Prisma OR list —
+                       one DB query, no post-processing.
+    """
+    where: dict = {}
+
+    if date_filter:
+        where["date"] = date_filter
+
+    if serial_no:
+        where["serialNo"] = {"contains": serial_no, "mode": "insensitive"}
+
+    if account_name:
+        # Filter via the relation — CardSharing has no direct name column
+        where["account"] = {
+            "accountName": {"contains": account_name, "mode": "insensitive"}
+        }
+
+    if search:
+        # OR search across all 5 searchable text columns in a single query.
+        # ``cardName`` is resolved through the PayoneerAccount relation.
+        # All four direct columns (details, cardReceiveBank, mailDetails,
+        # cardVendor) use standard Prisma contains filters.
+        where["OR"] = [
+            {"details":         {"contains": search, "mode": "insensitive"}},
+            {"cardVendor":      {"contains": search, "mode": "insensitive"}},
+            {"cardReceiveBank": {"contains": search, "mode": "insensitive"}},
+            {"mailDetails":     {"contains": search, "mode": "insensitive"}},
+            {"account": {"accountName": {"contains": search, "mode": "insensitive"}}},
+        ]
+
+    return where
 
 
 # ── CRUD ──────────────────────────────────────────────────────────────────────
@@ -139,17 +190,10 @@ async def create_card(db: Prisma, data: CardSharingCreate) -> dict:
     - ``mail_details``→ ``None``
     - ``card_details``→ ``[]`` (screenshots added via dedicated endpoint)
 
-    ``card_name`` is resolved to a ``PayoneerAccount.id`` (FK) via
-    ``_resolve_or_create_account``.  From the caller's perspective the card
-    is fully self-contained — no manual account setup is required.
-
-    ``cardNo`` and ``cardCvc`` are encrypted before being persisted.
     Raises HTTP 409 if ``serial_no`` already exists.
     """
-    # Resolve serial_no — auto-generate if not supplied
     serial_no = data.serial_no or str(uuid.uuid4())
 
-    # Guard duplicate serial_no
     existing = await db.cardsharing.find_unique(where={"serialNo": serial_no})
     if existing:
         raise HTTPException(
@@ -159,7 +203,6 @@ async def create_card(db: Prisma, data: CardSharingCreate) -> dict:
 
     account_id = await _resolve_or_create_account(db, data.card_name)
 
-    # Apply safe defaults for every optional field
     card_no     = data.card_no     or _EMPTY_STR
     card_expire = data.card_expire or _EMPTY_STR
     card_cvc    = data.card_cvc    or _EMPTY_STR
@@ -175,20 +218,20 @@ async def create_card(db: Prisma, data: CardSharingCreate) -> dict:
     card = await db.cardsharing.create(
         data={
             "serialNo":           serial_no,
-            "date":               _now_datetime(),             # server-side default
+            "date":               _now_datetime(),
             "details":            data.details,
-            "accountId":          account_id,                  # FK to PayoneerAccount
+            "accountId":          account_id,
             "cardNo":             encrypt_value(card_no),
             "cardExpire":         card_expire,
             "cardCvc":            encrypt_value(card_cvc),
-            "cardDetails":        _EMPTY_JSON,                 # managed via screenshot endpoints
+            "cardDetails":        _EMPTY_JSON,
             "cardVendor":         card_vendor,
             "cardLimit":          card_limit,
             "cardPaymentReceive": card_payment_received,
             "cardReceiveBank":    card_receiver_bank,
             "mailDetails":        data.mail_details,
         },
-        include={"account": True},                             # required for _serialize_card
+        include={"account": True},
     )
     return _serialize_card(card)
 
@@ -197,36 +240,33 @@ async def list_cards(
     db:                Prisma,
     include_sensitive: bool = False,
     serial_no:         Optional[str] = None,
-    account_name:      Optional[str] = None,   # preserved for call-site compatibility
+    account_name:      Optional[str] = None,
     date_filter:       Optional[dict] = None,
+    search:            Optional[str] = None,
 ) -> list[dict]:
     """
     Return all card records, with optional filters.
 
-    ``account_name``
-        Preserved parameter name for backward-compatible call sites.
-        Filters case-insensitively on ``PayoneerAccount.accountName``
-        through the relation (``account: { accountName: { contains: ... } }``).
+    ``serial_no``    — case-insensitive substring match on serial number.
+    ``account_name`` — case-insensitive substring match on card label
+                       (``PayoneerAccount.accountName`` via relation).
+    ``search``       — case-insensitive OR keyword search across FIVE
+                       columns simultaneously:
+                         details | cardName | cardReceiveBank |
+                         mailDetails | cardVendor
+                       A single keyword matches any of these columns.
+    ``date_filter``  — Prisma-compatible date range dict.
 
+    All filters are combinable.
     All returned records include decrypted ``cardNo`` and ``cardCvc``.
     All returned records include ``cardName`` sourced from the account relation.
     """
-    where: dict = {}
-
-    if date_filter:
-        where["date"] = date_filter
-    if serial_no:
-        where["serialNo"] = {"contains": serial_no, "mode": "insensitive"}
-    if account_name:
-        # Filter via the relation — no direct column on CardSharing
-        where["account"] = {
-            "accountName": {"contains": account_name, "mode": "insensitive"}
-        }
+    where = _build_where(date_filter, serial_no, account_name, search)
 
     cards = await db.cardsharing.find_many(
         where=where,
         order={"date": "desc"},
-        include={"account": True},   # required for _serialize_card
+        include={"account": True},
     )
     return [_serialize_card(c) for c in cards]
 
@@ -244,7 +284,7 @@ async def get_card(
     """
     card = await db.cardsharing.find_unique(
         where={"id": card_id},
-        include={"account": True},   # required for _serialize_card
+        include={"account": True},
     )
     if not card:
         raise HTTPException(status_code=404, detail="Card not found.")
@@ -259,74 +299,75 @@ async def update_card(db: Prisma, card_id: str, data: CardSharingUpdate) -> dict
     When ``card_name`` is supplied, a matching ``PayoneerAccount`` is
     resolved (or created) and ``accountId`` is updated on the card.
     ``cardNo`` and ``cardCvc`` are re-encrypted whenever they are supplied.
-
-    ``card_details`` is intentionally excluded from the update payload —
-    the screenshot gallery is managed via the dedicated screenshot endpoints.
-
-    Raises HTTP 404 if the card does not exist.
-    Raises HTTP 400 if the payload is empty.
     """
-    existing = await db.cardsharing.find_unique(where={"id": card_id})
-    if not existing:
+    card = await db.cardsharing.find_unique(
+        where={"id": card_id},
+        include={"account": True},
+    )
+    if not card:
         raise HTTPException(status_code=404, detail="Card not found.")
 
-    raw = data.model_dump(exclude_none=True)
-    if not raw:
-        raise HTTPException(status_code=400, detail="No fields provided for update.")
+    patch: dict = {}
 
-    # Pydantic snake_case → Prisma DB column names
-    # ``card_name`` and ``card_details`` are handled separately below.
-    _FIELD_MAP: dict[str, str] = {
-        "serial_no":             "serialNo",
-        "card_no":               "cardNo",
-        "card_expire":           "cardExpire",
-        "card_cvc":              "cardCvc",
-        "card_vendor":           "cardVendor",
-        "card_limit":            "cardLimit",
-        "card_payment_received": "cardPaymentReceive",
-        "card_receiver_bank":    "cardReceiveBank",
-        "mail_details":          "mailDetails",
-    }
-
-    mapped: dict = {}
-
-    # Resolve card_name → accountId before building the rest of the patch
     if data.card_name is not None:
-        mapped["accountId"] = await _resolve_or_create_account(db, data.card_name)
+        patch["accountId"] = await _resolve_or_create_account(db, data.card_name)
 
-    for k, v in raw.items():
-        if k == "card_name":
-            continue  # already handled above
-        prisma_key = _FIELD_MAP.get(k, k)
-        if prisma_key in {"cardNo", "cardCvc"}:
-            v = encrypt_value(v)                               # re-encrypt on update
-        mapped[prisma_key] = v
+    if data.serial_no is not None:
+        existing = await db.cardsharing.find_unique(where={"serialNo": data.serial_no})
+        if existing and existing.id != card_id:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Serial number '{data.serial_no}' already exists.",
+            )
+        patch["serialNo"] = data.serial_no
+
+    if data.card_no is not None:
+        patch["cardNo"] = encrypt_value(data.card_no)
+
+    if data.card_expire is not None:
+        patch["cardExpire"] = data.card_expire
+
+    if data.card_cvc is not None:
+        patch["cardCvc"] = encrypt_value(data.card_cvc)
+
+    if data.card_vendor is not None:
+        patch["cardVendor"] = data.card_vendor
+
+    if data.card_limit is not None:
+        patch["cardLimit"] = data.card_limit
+
+    if data.card_payment_received is not None:
+        patch["cardPaymentReceive"] = data.card_payment_received
+
+    if data.card_receiver_bank is not None:
+        patch["cardReceiveBank"] = data.card_receiver_bank
+
+    if data.details is not None:
+        patch["details"] = data.details
+
+    if data.mail_details is not None:
+        patch["mailDetails"] = data.mail_details
+
+    if not patch:
+        return _serialize_card(card)
 
     updated = await db.cardsharing.update(
         where={"id": card_id},
-        data=mapped,
-        include={"account": True},                             # required for _serialize_card
+        data=patch,
+        include={"account": True},
     )
     return _serialize_card(updated)
 
 
 async def delete_card(db: Prisma, card_id: str) -> None:
-    """
-    Hard-delete a card record.
-
-    Raises HTTP 404 if the card does not exist.
-    """
-    existing = await db.cardsharing.find_unique(where={"id": card_id})
-    if not existing:
+    """Hard-delete a card record and all associated data."""
+    card = await db.cardsharing.find_unique(where={"id": card_id})
+    if not card:
         raise HTTPException(status_code=404, detail="Card not found.")
     await db.cardsharing.delete(where={"id": card_id})
 
 
 # ── Screenshot management ─────────────────────────────────────────────────────
-# These functions are unchanged — the dedicated screenshot endpoints remain
-# fully operational.  Screenshots are intentionally decoupled from card
-# creation and update; callers use these endpoints to manage the gallery.
-# ─────────────────────────────────────────────────────────────────────────────
 
 async def add_screenshot(db: Prisma, card_id: str, file: UploadFile) -> dict:
     """
@@ -454,24 +495,25 @@ async def export_cards(
     db:           Prisma,
     date_filter:  Optional[dict] = None,
     serial_no:    Optional[str]  = None,
-    account_name: Optional[str]  = None,   # preserved for call-site compatibility
+    account_name: Optional[str]  = None,
+    search:       Optional[str]  = None,
     label:        str            = "card_sharing",
 ) -> tuple[bytes, str]:
     """
     Build and return ``(xlsx_bytes, filename)``.
 
-    ``account_name`` filters case-insensitively on ``PayoneerAccount.accountName``
-    through the relation for backward-compatible callers.
+    Accepts the same ``search`` param as ``list_cards`` — the five-column
+    OR search is applied consistently via ``_build_where``.
 
     cardNo and cardCvc are intentionally excluded from the workbook —
     sensitive PAN / CVC data must never appear in downloadable files.
     """
-    where = _build_where(date_filter, serial_no, account_name)
+    where = _build_where(date_filter, serial_no, account_name, search)
 
     cards_raw = await db.cardsharing.find_many(
         where=where,
         order={"date": "desc"},
-        include={"account": True},   # needed to read accountName for "Card Name" column
+        include={"account": True},
     )
 
     wb = openpyxl.Workbook()
@@ -496,13 +538,13 @@ async def export_cards(
         values = [
             _fmt(card.date),
             _fmt(card.serialNo),
-            _fmt(card_name),              
+            _fmt(card_name),
             _fmt(card.cardVendor),
             _fmt(card.cardExpire),
             float(card.cardLimit),
             float(card.cardPaymentReceive),
             _fmt(card.cardReceiveBank),
-            len(details_list),           
+            len(details_list),
             _fmt(card.details),
             _fmt(card.mailDetails),
         ]
@@ -519,24 +561,3 @@ async def export_cards(
     buffer.seek(0)
 
     return buffer.read(), f"{label}.xlsx"
-
-
-def _build_where(
-    date_filter:  Optional[dict],
-    serial_no:    Optional[str],
-    account_name: Optional[str],   
-) -> dict:
-    """Build the Prisma ``where`` clause from the supplied filter arguments."""
-    where: dict = {}
-
-    if date_filter:
-        where["date"] = date_filter
-    if serial_no:
-        where["serialNo"] = {"contains": serial_no, "mode": "insensitive"}
-    if account_name:
-        # Filter through the relation — CardSharing has no direct name column
-        where["account"] = {
-            "accountName": {"contains": account_name, "mode": "insensitive"}
-        }
-
-    return where

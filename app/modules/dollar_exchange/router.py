@@ -6,14 +6,14 @@ v4 — Access control tightened to CEO & DIRECTOR only:
   • GET    /dollar-exchange            → CEO_DIRECTOR
   • POST   /dollar-exchange            → CEO_DIRECTOR
   • PATCH  /dollar-exchange/{id}       → CEO_DIRECTOR
-  • DELETE /dollar-exchange/{id}       → CEO_DIRECTOR  (structured response body)
+  • DELETE /dollar-exchange/{id}       → CEO_DIRECTOR  
   • GET    /dollar-exchange/export     → CEO_DIRECTOR
   • GET    /dollar-exchange/total-bdt  → CEO_DIRECTOR
 
   HR and BDEV roles have no access to any dollar exchange endpoint.
 ================================================================================
 """
-from typing import Optional
+from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import Response
@@ -46,8 +46,26 @@ async def get_exchanges(
     ),
     account_from: Optional[str] = Query(
         default=None,
-        description="Partial / case-insensitive match on accountFrom",
+        description="Partial / case-insensitive match on accountFrom (legacy — use account_name for OR search).",
     ),
+    account_name: Annotated[
+        Optional[str],
+        Query(
+            description=(
+                "Case-insensitive partial search across BOTH accountFrom AND accountTo "
+                "(OR logic — matches either side of the exchange)."
+            )
+        ),
+    ] = None,
+    search: Annotated[
+        Optional[str],
+        Query(
+            description=(
+                "Case-insensitive keyword search on the details field. "
+                "e.g. ?search=Adobe returns all rows whose details mention 'Adobe'."
+            )
+        ),
+    ] = None,
     filters: DateRangeFilter = Depends(),
     db:      Prisma = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
@@ -59,14 +77,20 @@ async def get_exchanges(
 
     Filters (all combinable):
     - `payment_status` — RECEIVED | DUE
-    - `account_from`   — case-insensitive substring search
+    - `account_from`   — legacy exact-side search on accountFrom
+    - `account_name`   — OR search across both accountFrom and accountTo
+    - `search`         — keyword search on the details field
     - Date filters     — period (daily/weekly/monthly/yearly) or explicit from/to
+
+    Each row includes `createdAt` and `updatedAt`.
     """
     return await list_exchanges(
         db,
         date_filter=filters.to_prisma_filter(),
         payment_status=payment_status,
         account_from=account_from,
+        account_name=account_name,
+        search=search,
     )
 
 
@@ -80,6 +104,14 @@ async def get_exchanges(
 async def export_exchanges_endpoint(
     payment_status: Optional[str] = Query(default=None, description="Filter: RECEIVED | DUE"),
     account_from:   Optional[str] = Query(default=None, description="Partial match on accountFrom"),
+    account_name: Annotated[
+        Optional[str],
+        Query(description="OR search across accountFrom AND accountTo."),
+    ] = None,
+    search: Annotated[
+        Optional[str],
+        Query(description="Case-insensitive keyword search on the details field."),
+    ] = None,
     filters:        DateRangeFilter = Depends(),
     db:             Prisma = Depends(get_db),
     _=Depends(CEO_DIRECTOR),
@@ -100,6 +132,8 @@ async def export_exchanges_endpoint(
         date_filter=filters.to_prisma_filter(),
         payment_status=payment_status,
         account_from=account_from,
+        account_name=account_name,
+        search=search,
         label=label,
     )
     return Response(
@@ -112,13 +146,38 @@ async def export_exchanges_endpoint(
 # ── Totals ────────────────────────────────────────────────────────────────────
 
 @router.get("/total-bdt")
-async def total_bdt(db: Prisma = Depends(get_db), _=Depends(CEO_DIRECTOR)):
+async def total_bdt(
+    payment_status: Annotated[
+        Optional[str],
+        Query(description="Filter totals by status: RECEIVED | DUE"),
+    ] = None,
+    account_name: Annotated[
+        Optional[str],
+        Query(description="Case-insensitive partial search across accountFrom AND accountTo."),
+    ] = None,
+    search: Annotated[
+        Optional[str],
+        Query(description="Case-insensitive keyword search on the details field."),
+    ] = None,
+    filters: DateRangeFilter = Depends(),
+    db:      Prisma = Depends(get_db),
+    _=Depends(CEO_DIRECTOR),
+):
     """
-    Return the aggregate BDT total across all exchange records.
+    Return aggregate BDT totals (total, received, due).
+
+    Supports all the same filters as GET /dollar-exchange so the totals
+    always reflect the currently active filter state.
 
     Accessible by: CEO, DIRECTOR only.
     """
-    return {"total_bdt": await get_total_bdt(db)}
+    return await get_total_bdt(
+        db,
+        date_filter=filters.to_prisma_filter(),
+        payment_status=payment_status,
+        account_name=account_name,
+        search=search,
+    )
 
 
 # ── Create ────────────────────────────────────────────────────────────────────

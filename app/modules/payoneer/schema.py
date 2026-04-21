@@ -89,6 +89,8 @@ class PayoneerAccountResponse(BaseModel):
     id:          str
     accountName: str
     isActive:    bool
+    createdAt:   Optional[datetime] = None   # raw column — None before bootstrap
+    updatedAt:   Optional[datetime] = None   # raw column — None before bootstrap
 
     class Config:
         from_attributes = True
@@ -168,6 +170,8 @@ class PayoneerTransactionResponse(BaseModel):
     debit:            Decimal
     credit:           Decimal
     remainingBalance: Decimal
+    createdAt:        Optional[datetime] = None   # Prisma column — populated by ORM
+    updatedAt:        Optional[datetime] = None   # raw column — None before bootstrap
 
     class Config:
         from_attributes = True
@@ -191,6 +195,8 @@ class PayoneerAccountSummary(BaseModel):
     id:                  str
     accountName:         str
     isActive:            bool
+    createdAt:           Optional[datetime] = None   # raw column
+    updatedAt:           Optional[datetime] = None   # raw column
     currentBalance:      float   # latest remainingBalance
     periodCredit:        float
     periodDebit:         float
